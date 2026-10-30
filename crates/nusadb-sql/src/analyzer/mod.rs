@@ -506,6 +506,27 @@ pub(crate) fn analyze_index_key_expr(
     analyze_expr(&expr, &single_table_scope(table), catalog, None)
 }
 
+/// The types whose value is written as a string and has no literal syntax of its own: `BYTEA`,
+/// the bit strings, `INET`, `CIDR`, ranges, arrays, `VECTOR`, the geometric types, `TSVECTOR`,
+/// `TSQUERY` and `XML`.
+pub(crate) const fn written_as_string(ty: ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Bytes
+            | ColumnType::Bit(_)
+            | ColumnType::VarBit(_)
+            | ColumnType::Inet
+            | ColumnType::Cidr
+            | ColumnType::Range(_)
+            | ColumnType::Array(_)
+            | ColumnType::Vector(_)
+            | ColumnType::Geometry(_)
+            | ColumnType::Tsvector
+            | ColumnType::Tsquery
+            | ColumnType::Xml
+    )
+}
+
 /// Re-parse and type-check a stored column `DEFAULT` expression to the target type. The text
 /// comes from the column-default catalog; it was validated subquery-free and assignable at `CREATE`
 /// time, so it is analyzed against an empty scope (a default references no column) and `catalog` is

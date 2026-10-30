@@ -1,0 +1,193 @@
+# Inside a trigger, NEW.col and OLD.col have the column's type also when they are NULL, and also
+# when an INSERT wrote the value as a string: arrays, ranges, INET, CIDR, BIT, BIT VARYING, BYTEA,
+# geometric types, TSVECTOR, TSQUERY and XML. A NULL makes each expression NULL instead of an error.
+
+statement ok
+CREATE TABLE tn (id BIGINT PRIMARY KEY, ar BIGINT[], ta TEXT[], r TSTZRANGE, ir INT4RANGE, nr NUMRANGE, dr DATERANGE, ip INET, cd CIDR, b BIT(3), vb BIT VARYING(5), bt BYTEA, p POINT, tv TSVECTOR, tq TSQUERY, x XML)
+
+statement ok
+CREATE TABLE tlog (op TEXT, id BIGINT, n INT, v TEXT)
+
+statement ok
+CREATE FUNCTION tn_fn() RETURNS trigger LANGUAGE nusascript AS $$ BEGIN INSERT INTO tlog VALUES (TG_OP, NEW.id, 0, coalesce((cardinality(NEW.ar))::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 1, coalesce((NEW.ar @> ARRAY[1::bigint])::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 2, coalesce((9 = ANY(NEW.ar))::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 3, coalesce((array_length(NEW.ta, 1))::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 4, coalesce((NEW.r && OLD.r)::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 5, coalesce((NEW.r @> now())::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 6, coalesce((upper(NEW.r))::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 7, coalesce((isempty(NEW.r))::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 8, coalesce((NEW.ir @> 3)::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 9, coalesce((NEW.ir = OLD.ir)::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 10, coalesce((lower(NEW.nr))::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 11, coalesce((NEW.dr @> current_date)::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 12, coalesce((masklen(NEW.ip))::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 13, coalesce((NEW.ip << '10.0.0.0/8'::inet)::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 14, coalesce((family(NEW.ip))::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 15, coalesce((masklen(NEW.cd))::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 16, coalesce((NEW.b & B'101')::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 17, coalesce((length(NEW.b))::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 18, coalesce((length(NEW.vb))::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 19, coalesce((NEW.vb || B'1')::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 20, coalesce((length(NEW.bt))::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 21, coalesce((NEW.bt || '\x01'::bytea)::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 22, coalesce((NEW.p <-> '(0,0)'::point)::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 23, coalesce((NEW.tv @@ 'a'::tsquery)::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 24, coalesce((length(NEW.tv))::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 25, coalesce(('a b'::tsvector @@ NEW.tq)::TEXT, 'null')); INSERT INTO tlog VALUES (TG_OP, NEW.id, 26, coalesce((NEW.x::text)::TEXT, 'null')); RETURN NEW; END $$
+
+statement ok
+CREATE TRIGGER tn_trg BEFORE INSERT OR UPDATE ON tn FOR EACH ROW EXECUTE FUNCTION tn_fn()
+
+statement ok
+INSERT INTO tn (id) VALUES (1)
+
+statement ok
+UPDATE tn SET id = 1 WHERE id = 1
+
+statement ok
+INSERT INTO tn VALUES (2, '{1,2}', '{a}', '[2000-01-01,2100-01-01)', '[1,5)', '[1.5,2.5)', '[2000-01-01,2100-01-01)', '10.1.0.0/16', '10.0.0.0/8', '101', '11', '\x0203', '(3,4)', 'a b', 'a & b', '<a/>')
+
+statement ok
+UPDATE tn SET id = 2 WHERE id = 2
+
+query TIIT
+SELECT op, id, n, v FROM tlog ORDER BY op, id, n
+----
+INSERT 1 0 null
+INSERT 1 1 null
+INSERT 1 2 null
+INSERT 1 3 null
+INSERT 1 4 null
+INSERT 1 5 null
+INSERT 1 6 null
+INSERT 1 7 null
+INSERT 1 8 null
+INSERT 1 9 null
+INSERT 1 10 null
+INSERT 1 11 null
+INSERT 1 12 null
+INSERT 1 13 null
+INSERT 1 14 null
+INSERT 1 15 null
+INSERT 1 16 null
+INSERT 1 17 null
+INSERT 1 18 null
+INSERT 1 19 null
+INSERT 1 20 null
+INSERT 1 21 null
+INSERT 1 22 null
+INSERT 1 23 null
+INSERT 1 24 null
+INSERT 1 25 null
+INSERT 1 26 null
+INSERT 2 0 2
+INSERT 2 1 true
+INSERT 2 2 false
+INSERT 2 3 1
+INSERT 2 4 null
+INSERT 2 5 true
+INSERT 2 6 2100-01-01 00:00:00+00
+INSERT 2 7 false
+INSERT 2 8 true
+INSERT 2 9 null
+INSERT 2 10 1.5
+INSERT 2 11 true
+INSERT 2 12 16
+INSERT 2 13 true
+INSERT 2 14 4
+INSERT 2 15 8
+INSERT 2 16 101
+INSERT 2 17 3
+INSERT 2 18 2
+INSERT 2 19 111
+INSERT 2 20 2
+INSERT 2 21 \x020301
+INSERT 2 22 5
+INSERT 2 23 true
+INSERT 2 24 2
+INSERT 2 25 true
+INSERT 2 26 <a/>
+UPDATE 1 0 null
+UPDATE 1 1 null
+UPDATE 1 2 null
+UPDATE 1 3 null
+UPDATE 1 4 null
+UPDATE 1 5 null
+UPDATE 1 6 null
+UPDATE 1 7 null
+UPDATE 1 8 null
+UPDATE 1 9 null
+UPDATE 1 10 null
+UPDATE 1 11 null
+UPDATE 1 12 null
+UPDATE 1 13 null
+UPDATE 1 14 null
+UPDATE 1 15 null
+UPDATE 1 16 null
+UPDATE 1 17 null
+UPDATE 1 18 null
+UPDATE 1 19 null
+UPDATE 1 20 null
+UPDATE 1 21 null
+UPDATE 1 22 null
+UPDATE 1 23 null
+UPDATE 1 24 null
+UPDATE 1 25 null
+UPDATE 1 26 null
+UPDATE 2 0 2
+UPDATE 2 1 true
+UPDATE 2 2 false
+UPDATE 2 3 1
+UPDATE 2 4 true
+UPDATE 2 5 true
+UPDATE 2 6 2100-01-01 00:00:00+00
+UPDATE 2 7 false
+UPDATE 2 8 true
+UPDATE 2 9 true
+UPDATE 2 10 1.5
+UPDATE 2 11 true
+UPDATE 2 12 16
+UPDATE 2 13 true
+UPDATE 2 14 4
+UPDATE 2 15 8
+UPDATE 2 16 101
+UPDATE 2 17 3
+UPDATE 2 18 2
+UPDATE 2 19 111
+UPDATE 2 20 2
+UPDATE 2 21 \x020301
+UPDATE 2 22 5
+UPDATE 2 23 true
+UPDATE 2 24 2
+UPDATE 2 25 true
+UPDATE 2 26 <a/>
+
+# Outside triggers too: a value of these types stored into a TEXT column becomes its text form, and
+# a string literal compared with an array takes the array's type.
+statement ok
+CREATE TABLE tt (v TEXT)
+
+statement ok
+INSERT INTO tt VALUES ('10.0.0.1'::INET), ('[1,5)'::INT4RANGE), ('{a}'::TEXT[]), ('(1,2)'::POINT), ('<a/>'::XML)
+
+query T
+SELECT v FROM tt ORDER BY v
+----
+(1,2)
+10.0.0.1/32
+<a/>
+[1,5)
+{a}
+
+statement ok
+CREATE TABLE ca (ta TEXT[], ia INT[])
+
+statement ok
+INSERT INTO ca VALUES ('{a,b}', '{1,2}')
+
+query TTTT
+SELECT (ta = '{a,b}')::TEXT, (ia = '{1,2}')::TEXT, ('{1,2}' = ia)::TEXT, (ia <> '{1}')::TEXT FROM ca
+----
+true true true true
+
+# ADD COLUMN backfills such a default, or a generated value of such a type, into a TEXT column as
+# its text form.
+statement ok
+CREATE TABLE d6 (id INT, ar INT[])
+
+statement ok
+INSERT INTO d6 VALUES (1, ARRAY[1,2])
+
+statement ok
+ALTER TABLE d6 ADD COLUMN t2 TEXT DEFAULT '{1,2}'::INT[]
+
+statement ok
+ALTER TABLE d6 ADD COLUMN t3 TEXT DEFAULT '[1,5]'::INT4RANGE
+
+statement ok
+ALTER TABLE d6 ADD COLUMN g TEXT GENERATED ALWAYS AS (ar) STORED
+
+statement ok
+INSERT INTO d6 (id, ar) VALUES (2, ARRAY[3])
+
+query ITTT
+SELECT id, t2, t3, g FROM d6 ORDER BY id
+----
+1 {1,2} [1,6) {1,2}
+2 {1,2} [1,6) {3}

@@ -260,11 +260,11 @@ SELECT id, src, CAST(b AS TEXT), CAST(eq AS TEXT), CAST(cs AS TEXT), CAST(ab AS 
 2 vc NULL NULL 0 NULL
 2 when NULL NULL NULL NULL
 
-# A NULL is never stricter than the column's non-NULL values. In an INSERT, NEW carries the value as
-# written, so a string written for an INET, range, array, XML or POINT column is still a string
-# literal, and those columns keep a bare NULL. An integer column's NULL is an INT, the type its values
-# have, whatever the declared width. Each statement below runs for a row of values and a row of
-# NULLs, and behaves the same way as for the values.
+# A NULL is never stricter than the column's non-NULL values. A value written as a string for an
+# INET, range, array, XML or POINT column has the column's type in NEW, even in an INSERT, and so has
+# its NULL; stored into a TEXT column it becomes its text form. An integer column's NULL is an INT,
+# the type its values have, whatever the declared width. Each statement below runs for a row of
+# values and a row of NULLs, and behaves the same way as for the values.
 statement ok
 CREATE TABLE rq (id INT PRIMARY KEY, ip INET, ir INT4RANGE, ta TEXT[], x XML, pt POINT, tx TEXT, bi BIGINT, si SMALLINT, nm NUMERIC(5,2), bo BOOLEAN, tz TIMESTAMPTZ)
 
@@ -292,10 +292,10 @@ INSERT INTO rq VALUES (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 
 query ITT
 SELECT id, src, v FROM rq_text ORDER BY id, src
 ----
-1 act_ip 10.0.0.1
+1 act_ip 10.0.0.1/32
 1 bi ef
 1 bo true
-1 ip 10.0.0.1
+1 ip 10.0.0.1/32
 1 ir [1,5)
 1 nm 2.50
 1 pt (1,2)
@@ -333,9 +333,9 @@ SELECT id, src, v FROM rq_text ORDER BY id
 1 old efaa
 2 old NULL
 
-# A bit-string value written as a string reaches NEW as a string literal, so its NULL is untyped
-# too: concatenating it with text, and LIKE in a WHEN guard, accept the NULL row as they accept
-# the value.
+# A bit-string value written as a string reaches NEW as a bit string, and so does its NULL:
+# concatenating it with a bit string, and LIKE on its text form in a WHEN guard, accept the NULL row
+# as they accept the value.
 statement ok
 CREATE TABLE rb (id INT PRIMARY KEY, c BIT(3), v VARBIT(8))
 
@@ -343,10 +343,10 @@ statement ok
 CREATE TABLE rb_log (id INT, s TEXT)
 
 statement ok
-CREATE TRIGGER rb_cat AFTER INSERT ON rb FOR EACH ROW INSERT INTO rb_log VALUES (NEW.id, NEW.c || 'x')
+CREATE TRIGGER rb_cat AFTER INSERT ON rb FOR EACH ROW INSERT INTO rb_log VALUES (NEW.id, NEW.c || B'1')
 
 statement ok
-CREATE TRIGGER rb_like AFTER INSERT ON rb FOR EACH ROW WHEN (NEW.v LIKE '1%') INSERT INTO rb_log VALUES (NEW.id, 'like')
+CREATE TRIGGER rb_like AFTER INSERT ON rb FOR EACH ROW WHEN (NEW.v::TEXT LIKE '1%') INSERT INTO rb_log VALUES (NEW.id, 'like')
 
 statement ok
 INSERT INTO rb VALUES (1, '101', '10')
@@ -357,6 +357,6 @@ INSERT INTO rb VALUES (2, NULL, NULL)
 query IT
 SELECT id, s FROM rb_log ORDER BY id, s
 ----
-1 101x
+1 1011
 1 like
 2 NULL

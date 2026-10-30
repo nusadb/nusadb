@@ -4006,7 +4006,10 @@ pub(super) fn rewrite_add_column(
         let index_targets = dml::secondary_index_targets(table, engine)?;
         for (tid, mut row) in scan_table(table, engine, txn)? {
             row.push(ast::Value::Null);
-            let value = eval::eval(&expr, &row)?;
+            let mut value = eval::eval(&expr, &row)?;
+            // Stored as the column's type, as a write stores it (an array into a TEXT column is
+            // its text form).
+            row::adopt_column_type(&mut value, column.ty)?;
             if !column.nullable && matches!(value, ast::Value::Null) {
                 return Err(Error::NotNullViolation {
                     column: column.name.clone(),
@@ -4030,7 +4033,11 @@ pub(super) fn rewrite_add_column(
         Some(sql) => {
             let typed =
                 crate::analyzer::analyze_default_expr(sql, column.ty, &super::dml::EmptyCatalog)?;
-            eval::eval(&typed, &Vec::new())?
+            let mut value = eval::eval(&typed, &Vec::new())?;
+            // Stored as the column's type, as an `INSERT` taking the default stores it (an array
+            // into a TEXT column is its text form).
+            row::adopt_column_type(&mut value, column.ty)?;
+            value
         },
         None => ast::Value::Null,
     };

@@ -1350,3 +1350,13 @@ fn slt_p10_array_element_widths() {
 fn slt_p10_array_element_storage() {
     run_slt("tests/slt/p10_types/array_element_storage.slt");
 }
+
+#[test]
+fn slt_p1_trigger_typed_row_refs() {
+    run_slt("tests/slt/p1_ddl/trigger_typed_row_refs.slt");
+}
+
+#[test]
+fn slt_p5_generated_from_string_types() {
+    run_slt("tests/slt/p5_advanced/generated_from_string_types.slt");
+}

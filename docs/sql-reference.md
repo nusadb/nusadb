@@ -286,6 +286,11 @@ out of range is refused with `22003`, and in a `NUMERIC(p, s)[]` column each ele
 checks the existing elements the same way. An array column created by an earlier release, and the
 length of a `VARCHAR(n)[]` element, are not checked.
 
+A string literal compared with an array takes the array's type, so `tags = '{a,b}'` compares two
+arrays. An array, like any value of a type written as a string (a range, `INET`, `XML`, a geometric
+type and the others listed under [Triggers](#triggers)), may be stored into a `TEXT` column, which
+keeps its text form. Other non-text values (a number, a date) still need an explicit cast to `TEXT`.
+
 ### Ranges
 
 `INT4RANGE`, `INT8RANGE`, `NUMRANGE`, `DATERANGE`, `TSRANGE`, `TSTZRANGE`.
@@ -527,7 +532,10 @@ the rows a foreign key action rewrites), including against keys written by earli
 [Indexes over CHAR columns from earlier releases](#indexes-over-char-columns-from-earlier-releases)).
 `CHECK` constraints, generated columns, triggers and `RETURNING` see the stored value, without
 the blanks.
-Generated columns are `STORED`. A unique form that treats NULLs as equal:
+Generated columns are `STORED`. A generated column is computed from the values as they are stored,
+on every write path: a range written as `'[1,5]'` is read as `[1,6)`, an `INET` host as
+`10.0.0.1/32` once cast to `TEXT`, and `cardinality(tags)` counts the elements of an array written
+as `'{a,b}'`. A unique form that treats NULLs as equal:
 
 ```sql
 CREATE TABLE nnd (a INT, b TEXT, UNIQUE NULLS NOT DISTINCT (a));
@@ -1876,15 +1884,18 @@ $$;
 ### Triggers
 
 A trigger runs one SQL statement when a table is written. `NEW.col` and `OLD.col` refer to the
-affected row. A `NULL` there is never stricter than the column's values. For a date/time,
-interval, boolean, numeric, floating-point, `UUID`, enum, `JSON`/`JSONB` or MAC address
-column, and a domain over one, the `NULL` has the type the values have, so `NEW.a + INTERVAL '1
-day'` on a `TIMESTAMPTZ` column is a `NULL` timestamp when `a` is `NULL`, not a type error. An
-integer column's `NULL` is an `INT` whatever its declared width, as its values are. Any other
-column gives an untyped `NULL`, which takes the type it meets: a `TEXT`, `VARCHAR` or `CHAR` value
-is a string literal that does the same (`NEW.code = 1`, or inserting it into a `BIGINT` column), and
-so, in an `INSERT`, is a value written as a string for a column such as `INET`, a range or an
-array.
+affected row, with the column's type, and a `NULL` there is never stricter than the column's
+values. For a date/time, interval, boolean, numeric, floating-point, `UUID`, enum, `JSON`/`JSONB`
+or MAC address column, and a domain over one, the `NULL` has the type the values have, so `NEW.a +
+INTERVAL '1 day'` on a `TIMESTAMPTZ` column is a `NULL` timestamp when `a` is `NULL`, not a type
+error. An integer column's `NULL` is an `INT` whatever its declared width, as its values are. A
+column of a type written as a string (an array, a range, `INET`, `CIDR`, `BIT`, `BIT VARYING`,
+`BYTEA`, `VECTOR`, a geometric type, `TSVECTOR`, `TSQUERY` or `XML`) has its own type, value and
+`NULL` alike, also in an `INSERT` that wrote the value as a string: `cardinality(NEW.tags)`,
+`NEW.during && OLD.during` and `NEW.during @> now()` are `NULL` when the column is. Such a value
+stored into a `TEXT` column becomes its text form (`10.0.0.1/32` for an `INET` host). A `TEXT`,
+`VARCHAR` or `CHAR` column gives an untyped `NULL`, which takes the type it meets, as its values
+do: they are string literals (`NEW.code = 1`, or inserting it into a `BIGINT` column).
 
 ```sql
 CREATE TABLE stock (sku TEXT PRIMARY KEY, qty INT);

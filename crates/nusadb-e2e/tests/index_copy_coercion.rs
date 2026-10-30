@@ -115,6 +115,38 @@ fn copy_loaded_numeric_rows_are_found_through_the_index() {
     assert_eq!(via_index, via_seq, "index and sequential scan must agree");
 }
 
+/// A generated column computed from a column of a type written as a string sees the value as it is
+/// stored when the row is loaded by `COPY`: a range as its canonical form, an `INET` host with its
+/// prefix length.
+#[test]
+fn copy_computes_generated_columns_from_stored_values() {
+    let engine = BtreeEngine::new();
+    let mut session = Session::new(&engine);
+    exec(
+        &mut session,
+        &engine,
+        "CREATE TABLE g (id INT, r INT4RANGE, ip INET, \
+         t TEXT GENERATED ALWAYS AS (r) STORED, u TEXT GENERATED ALWAYS AS (ip) STORED)",
+    );
+    let Statement::Copy(copy) = parse("COPY g (id, r, ip) FROM STDIN").expect("parse copy") else {
+        panic!("expected COPY");
+    };
+    let n = copy_from(&engine, &copy, "1\t[1,5]\t10.0.0.1\n").expect("copy");
+    assert_eq!(n, 1);
+    let stmt = parse("SELECT t, u FROM g").expect("parse");
+    let logical = analyze(stmt, &EngineCatalog(&engine)).expect("analyze");
+    match session.execute(plan(logical)).expect("execute") {
+        ExecutionResult::Rows { rows, .. } => assert_eq!(
+            rows,
+            vec![vec![
+                Value::Text("[1,6)".to_owned()),
+                Value::Text("10.0.0.1/32".to_owned()),
+            ]]
+        ),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
 /// `COPY` stores an array column's elements as the declared element type: a `NUMERIC(5, 2)[]`
 /// element is rounded to two places, and an `INTEGER[]` element out of range refuses the load.
 #[test]

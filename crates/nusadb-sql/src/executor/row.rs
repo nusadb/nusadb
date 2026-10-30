@@ -136,6 +136,23 @@ pub(crate) fn adopt_column_type(value: &mut ast::Value, ty: ColumnType) -> Resul
                 *value = coerced;
             }
         },
+        // A value of a type written as a string (an INET, a range, an array, ...) written to a
+        // text column is stored as its text form, the one a cast to TEXT gives.
+        (
+            V::Inet(_)
+            | V::Range(_)
+            | V::Array(_)
+            | V::Bit(_)
+            | V::Bytes(_)
+            | V::Vector(_)
+            | V::Geometry(_)
+            | V::Tsvector(_)
+            | V::Tsquery(_)
+            | V::Xml(_),
+            T::Text,
+        ) => {
+            *value = super::eval::cast_value(value.clone(), T::Text)?;
+        },
         _ => {},
     }
     Ok(())

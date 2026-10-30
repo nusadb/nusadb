@@ -1,0 +1,65 @@
+# A generated column computed from a column of a type written as a string (a range, INET, an array,
+# a bit string) sees the value as it is stored, not the text it was written as, on every write path.
+
+statement ok
+CREATE TABLE g7 (id INT PRIMARY KEY, r INT4RANGE, ip INET, tags TEXT[], t TEXT GENERATED ALWAYS AS (r) STORED, u TEXT GENERATED ALWAYS AS (ip) STORED, n INT GENERATED ALWAYS AS (cardinality(tags)) STORED, w INT GENERATED ALWAYS AS (upper(r)) STORED)
+
+statement ok
+INSERT INTO g7 (id, r, ip, tags) VALUES (1, '[1,5]', '10.0.0.1', '{a,b}')
+
+statement ok
+INSERT INTO g7 (id, r, ip, tags) SELECT 2, '[2,4]', '10.0.0.2', '{a}'
+
+statement ok
+INSERT INTO g7 (id, r, ip, tags) VALUES (3, '(0,3]', '10.1.0.0/16', '{}')
+
+statement ok
+UPDATE g7 SET r = '[7,9]', ip = '10.0.0.9' WHERE id = 3
+
+statement ok
+INSERT INTO g7 (id, r, ip, tags) VALUES (1, '[0,0]', '10.0.0.0', '{x}') ON CONFLICT (id) DO UPDATE SET r = '[3,3]', tags = '{p,q,r}'
+
+statement ok
+INSERT INTO g7 (id, r, ip, tags) VALUES (4, '[4,4]', '10.0.0.4', '{z}') ON CONFLICT (id) DO NOTHING
+
+statement ok
+MERGE INTO g7 USING (SELECT 2 AS id) s ON g7.id = s.id WHEN MATCHED THEN UPDATE SET r = '[20,21]'
+
+statement ok
+MERGE INTO g7 USING (SELECT 5 AS id) s ON g7.id = s.id WHEN NOT MATCHED THEN INSERT (id, r, ip, tags) VALUES (5, '[5,6]', '10.0.0.5', '{m,n}')
+
+query TTTTTTT
+SELECT id, r::TEXT, ip::TEXT, t, u, n, w FROM g7 ORDER BY id
+----
+1 [3,4) 10.0.0.1/32 [3,4) 10.0.0.1/32 3 4
+2 [20,22) 10.0.0.2/32 [20,22) 10.0.0.2/32 1 22
+3 [7,10) 10.0.0.9/32 [7,10) 10.0.0.9/32 0 10
+4 [4,5) 10.0.0.4/32 [4,5) 10.0.0.4/32 1 5
+5 [5,7) 10.0.0.5/32 [5,7) 10.0.0.5/32 2 7
+
+statement ok
+UPDATE g7 SET id = id + 10
+
+query TTTTT
+SELECT id, t, u, n, w FROM g7 ORDER BY id
+----
+11 [3,4) 10.0.0.1/32 3 4
+12 [20,22) 10.0.0.2/32 1 22
+13 [7,10) 10.0.0.9/32 0 10
+14 [4,5) 10.0.0.4/32 1 5
+15 [5,7) 10.0.0.5/32 2 7
+
+statement ok
+CREATE TABLE gb (b BIT(3), s TEXT GENERATED ALWAYS AS (b) STORED)
+
+# Refused: bit string length 4 does not match type bit(3)
+statement error
+INSERT INTO gb (b) VALUES ('1010')
+
+statement ok
+INSERT INTO gb (b) VALUES ('101')
+
+query TT
+SELECT b::TEXT, s FROM gb
+----
+101 101

@@ -27,6 +27,9 @@ pub(super) fn check_assignable(column: &ColumnDef, value: &TypedExpr) -> Result<
 /// column; its length is checked against the column's width when the row is encoded.)
 pub(super) fn assignable_to_column(target: ColumnType, source: ColumnType) -> bool {
     assignable(target, source)
+        // A value of a type written as a string stores its text form in a text column
+        // (`row::adopt_column_type`).
+        || (target.physical() == ColumnType::Text && written_as_string(source))
         || matches!(
             (target.physical(), source.physical()),
             (

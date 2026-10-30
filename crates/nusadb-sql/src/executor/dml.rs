@@ -651,6 +651,7 @@ fn apply_column_fills(
     full: &mut Row,
     fills: &[Option<super::coldefault::ColumnFill>],
     covered: &HashSet<usize>,
+    types: &[ColumnType],
     engine: &dyn StorageEngine,
 ) -> Result<(), Error> {
     let empty_row: Row = Vec::new();
@@ -673,7 +674,11 @@ fn apply_column_fills(
     }
     // Pass 2: compute every GENERATED column against the now-populated row. Always applied
     // (an explicit value was rejected earlier); the generation expression references only non-generated
-    // columns, so the order among generated columns does not matter.
+    // columns, so the order among generated columns does not matter. It reads the values as they
+    // will be stored.
+    if has_generated(fills) {
+        store_string_written(full, types.iter().copied())?;
+    }
     for (index, fill) in fills.iter().enumerate() {
         let Some(super::coldefault::ColumnFill::Generated(expr)) = fill else {
             continue;
@@ -801,6 +806,9 @@ fn finalize_updated_row(
 ) -> Result<Row, Error> {
     // Generated columns are computed from the values as they will be stored.
     strip_char_blanks(&mut row, table.columns.iter().map(|c| c.ty));
+    if has_generated(fills) {
+        store_string_written(&mut row, table.columns.iter().map(|c| c.ty))?;
+    }
     for (index, fill) in fills.iter().enumerate() {
         let Some(super::coldefault::ColumnFill::Generated(expr)) = fill else {
             continue;
@@ -1633,9 +1641,7 @@ fn prepare_insert_rows(
     let complete_in_order = matches!(source, RowSource::Complete)
         && columns.len() == table.columns.len()
         && columns.iter().enumerate().all(|(i, &c)| i == c);
-    let has_generated = fills
-        .iter()
-        .any(|f| matches!(f, Some(super::coldefault::ColumnFill::Generated(_))));
+    let generated = has_generated(&fills);
     let mut rows: Vec<Row> = Vec::with_capacity(value_rows.len());
     for values in value_rows {
         if values.len() != columns.len() {
@@ -1651,8 +1657,8 @@ fn prepare_insert_rows(
                 .map(|v| v.unwrap_or(ast::Value::Null))
                 .collect();
             strip_char_blanks(&mut full, schema.iter().copied());
-            if has_generated {
-                apply_column_fills(&mut full, &fills, &explicit, engine)?;
+            if generated {
+                apply_column_fills(&mut full, &fills, &explicit, &schema, engine)?;
             }
             full
         } else {
@@ -1668,7 +1674,7 @@ fn prepare_insert_rows(
             }
             // Generated columns are computed from the values as they will be stored.
             strip_char_blanks(&mut full, schema.iter().copied());
-            apply_column_fills(&mut full, &fills, &row_covered, engine)?;
+            apply_column_fills(&mut full, &fills, &row_covered, &schema, engine)?;
             full
         };
         // A `timestamptz` written to a `timestamp` column (or the reverse) adopts the column's own
@@ -1870,6 +1876,34 @@ fn enforce_not_null<'r>(
                 return Err(Error::NotNullViolation {
                     column: column.name.clone(),
                 });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether any of `fills` computes a generated column.
+fn has_generated(fills: &[Option<super::coldefault::ColumnFill>]) -> bool {
+    fills
+        .iter()
+        .any(|f| matches!(f, Some(super::coldefault::ColumnFill::Generated(_))))
+}
+
+/// Replace each value of `cells` that is still the text it was written as, in a column of a type
+/// written as a string (an array, a range, `INET`, ...; `types` are the column types), with the value
+/// storage keeps for it: the value encoded and decoded as its column, so it fails as the write would
+/// (a malformed literal, a `BIT(n)` of the wrong length) and canonicalizes as stored (`[1,5]` as
+/// `[1,6)`). A generated column computed from such a value then sees what a later read returns.
+fn store_string_written(
+    cells: &mut [ast::Value],
+    types: impl IntoIterator<Item = ColumnType>,
+) -> Result<(), Error> {
+    for (value, ty) in cells.iter_mut().zip(types) {
+        if crate::analyzer::written_as_string(ty) && matches!(value, ast::Value::Text(_)) {
+            let schema = [ty];
+            let stored = row::decode(&row::encode(std::slice::from_ref(value), &schema)?, &schema)?;
+            if let Some(typed) = stored.into_iter().next() {
+                *value = typed;
             }
         }
     }

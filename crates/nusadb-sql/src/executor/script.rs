@@ -53,9 +53,8 @@ impl Flow {
 /// The variable environment: declared name → current value, plus the column type of each variable
 /// that stands for a table column (a trigger function's `NEW.col` fields).
 ///
-/// The type matters only while the value is `NULL`. A non-null value is bound as a literal, and a
-/// `NULL` of a typed variable is bound the way [`column_null`] binds it for that column type, so it
-/// is never stricter than the column's non-null values (see [`Env::bound`]).
+/// A typed variable is bound the way [`column_value`] binds a value of its column (see
+/// [`Env::bound`]); any other variable is bound as its value's literal.
 #[derive(Debug, Default)]
 pub(super) struct Env {
     values: HashMap<String, ast::Value>,
@@ -80,21 +79,21 @@ impl Env {
 
     /// Set variable `name`, which stands for a column of type `ty`, to `value`.
     pub(super) fn insert_typed(&mut self, name: String, value: ast::Value, ty: ColumnType) {
-        // A column whose NULL stays bare (see `column_null`) binds like an untyped variable, so its
-        // type need not be kept.
-        if null_type(ty).is_some() {
+        // A column whose values and NULL are bound as bare literals (see `column_value`) binds like
+        // an untyped variable, so its type need not be kept.
+        if null_type(ty).is_some() || cast_bound(ty) {
             self.types.insert(name.clone(), ty);
         }
         self.values.insert(name, value);
     }
 
     /// The expression variable `name` is bound to, or `None` if no such variable is in scope: its
-    /// value as a literal, except that a `NULL` in a typed variable is bound by [`column_null`].
+    /// value as a literal, except that a typed variable is bound by [`column_value`].
     fn bound(&self, name: &str) -> Option<ast::Expr> {
         let value = self.values.get(name)?;
-        Some(match (value, self.types.get(name)) {
-            (ast::Value::Null, Some(&ty)) => column_null(ty),
-            (value, _) => ast::Expr::Literal(value.clone()),
+        Some(match self.types.get(name) {
+            Some(&ty) => column_value(value, ty),
+            None => ast::Expr::Literal(value.clone()),
         })
     }
 }
@@ -108,16 +107,40 @@ impl<const N: usize> From<[(String, ast::Value); N]> for Env {
     }
 }
 
-/// The expression a `NULL` in a column of type `ty` is bound as. The rule is that a `NULL` must never
-/// type-check more strictly than the column's non-null values, which are bound as literals.
+/// The expression a value of a column of type `ty` (a trigger's `NEW.col` / `OLD.col`) is bound as.
+/// A `NULL` must never type-check more strictly than the column's non-null values.
 ///
-/// A bare `NULL` has no type, so it cannot take part in an operator chosen by operand type
-/// (`NULL + INTERVAL '1 day'`, `NULL - NULL`). For a column whose non-null value is always bound as a
-/// literal of one fixed type, the `NULL` is bound as `CAST(NULL AS t)` with that same type `t`
-/// ([`null_type`]). Every other column keeps a bare `NULL`, as before.
+/// A non-null value is bound as its literal, except for a column of a type written as a string
+/// ([`cast_bound`]): in an `INSERT`, `NEW` carries such a value as the text it was written as, so it
+/// is bound as `CAST(value AS ty)` and has the column's type whether it arrived as text or was read
+/// from a stored row. A `NULL` is bound by [`column_null`].
+pub(super) fn column_value(value: &ast::Value, ty: ColumnType) -> ast::Expr {
+    match value {
+        ast::Value::Null => column_null(ty),
+        value if cast_bound(ty) => ast::Expr::Cast {
+            expr: Box::new(ast::Expr::Literal(value.clone())),
+            target: ty,
+            try_cast: false,
+        },
+        value => ast::Expr::Literal(value.clone()),
+    }
+}
+
+/// The expression a `NULL` in a column of type `ty` is bound as.
+///
+/// A bare `NULL` has no type, so it cannot take part in an operator or function chosen by operand
+/// type (`NULL + INTERVAL '1 day'`, `cardinality(NULL)`, `NULL @> now()`). A column whose non-null
+/// value is bound as a value of one fixed type has its `NULL` bound as `CAST(NULL AS t)` with that
+/// same type `t`: the type of its literal ([`null_type`]), or the column's own type for a type
+/// written as a string ([`cast_bound`]). A `TEXT`, `VARCHAR` or `CHAR` column keeps a bare `NULL`.
 pub(super) fn column_null(ty: ColumnType) -> ast::Expr {
     let null = ast::Expr::Literal(ast::Value::Null);
-    match null_type(ty) {
+    let target = if cast_bound(ty) {
+        Some(ty)
+    } else {
+        null_type(ty)
+    };
+    match target {
         Some(target) => ast::Expr::Cast {
             expr: Box::new(null),
             target,
@@ -125,6 +148,13 @@ pub(super) fn column_null(ty: ColumnType) -> ast::Expr {
         },
         None => null,
     }
+}
+
+/// Whether a value of a column of type `ty` is bound as `CAST(value AS ty)` (see [`column_value`]):
+/// the types whose value is written as a string. In an `INSERT`, `NEW` carries such a value before
+/// it is converted to the column's type, so binding it as a bare literal would leave it `TEXT`.
+const fn cast_bound(ty: ColumnType) -> bool {
+    crate::analyzer::written_as_string(ty)
 }
 
 /// The type a `NULL` in a column of type `ty` is cast to, or `None` to bind it as a bare `NULL`.
@@ -135,11 +165,9 @@ pub(super) fn column_null(ty: ColumnType) -> ast::Expr {
 /// `INT`, `BIGINT`) gives `INT`, not its declared width; `REAL` gives `FLOAT` and `JSONB` gives
 /// `JSON`; a `NUMERIC(p, s)` gives an unconstrained `NUMERIC`.
 ///
-/// The rest stay bare. A `TEXT`/`VARCHAR`/`CHAR` value (and a composite, stored as text) is a string
-/// literal that takes the type it meets (`'123'` into a `BIGINT` column, `= 1`). So, in an `INSERT`,
-/// is the value of a type written as a string (`INET`, `CIDR`, ranges, arrays, `POINT`, `VECTOR`,
-/// `TSVECTOR`, `TSQUERY`, `XML`, `BYTEA`, `BIT`, `BIT VARYING`), since `NEW` there carries the value before it is converted
-/// to the column's type. A typed `NULL` for those would be stricter than their values.
+/// The rest are `None`. A `TEXT`/`VARCHAR`/`CHAR` value (and a composite, stored as text) is a string
+/// literal that takes the type it meets (`'123'` into a `BIGINT` column, `= 1`), so its `NULL` stays
+/// bare. A type written as a string is bound by casting to the column's type instead ([`cast_bound`]).
 const fn null_type(ty: ColumnType) -> Option<ColumnType> {
     match ty {
         ColumnType::Int | ColumnType::SmallInt | ColumnType::BigInt => Some(ColumnType::Int),

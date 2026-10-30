@@ -1334,14 +1334,11 @@ impl RowRefs<'_> {
             // Bound when the body runs, to the field's current value (typed even when NULL).
             return Ok(Some(ast::Expr::Column(new_field(column))));
         }
-        // A value is bound as its literal; a NULL as `column_null` binds it for the column's type,
-        // never more strictly than the column's non-null values: typed where those always are
-        // (`NEW.a + INTERVAL '1 day'` on a TIMESTAMPTZ column), bare otherwise (`NEW.tx = 1`).
+        // Bound by `column_value`: typed by the column wherever its values are, so a NULL is never
+        // stricter than them (`NEW.a + INTERVAL '1 day'` on a TIMESTAMPTZ column, `cardinality(NEW.ar)`
+        // on an array column), bare for a text column (`NEW.tx = 1`).
         let value = row.get(index).ok_or_else(|| internal_index(index))?;
-        Ok(Some(match value {
-            ast::Value::Null => super::script::column_null(def.ty),
-            value => ast::Expr::Literal(value.clone()),
-        }))
+        Ok(Some(super::script::column_value(value, def.ty)))
     }
 }
 
