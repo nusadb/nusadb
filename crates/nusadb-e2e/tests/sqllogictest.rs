@@ -1375,3 +1375,8 @@ fn slt_p12_routine_transaction_control() {
 fn slt_p10_numeric_field_overflow() {
     run_slt("tests/slt/p10_types/numeric_field_overflow.slt");
 }
+
+#[test]
+fn slt_p10_json_array_literal_operands() {
+    run_slt("tests/slt/p10_types/json_array_literal_operands.slt");
+}

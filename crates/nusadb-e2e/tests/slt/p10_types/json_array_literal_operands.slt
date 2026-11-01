@@ -1,0 +1,159 @@
+# p10_types/json_array_literal_operands: a bare string literal beside a JSON document or an array.
+#
+# The containment operators @> and <@, array &&, and the JSON-only operators ?, ?&, ?|, #-, @? and
+# - read a bare string literal as the document or array the other operand needs, on either side
+# and in either containment direction. `j <@ '...'` therefore behaves exactly as `j @> '...'`.
+
+statement ok
+CREATE TABLE docs (id INT, j JSONB, tags INT[], labels TEXT[])
+
+statement ok
+INSERT INTO docs VALUES
+  (1, '{"a":1}', '{1,2}', '{x,y}'),
+  (2, '{"a":1,"b":2}', '{3}', '{z}'),
+  (3, NULL, NULL, NULL)
+
+# JSON containment, the literal on the right.
+query T
+SELECT '{"a":1}'::jsonb <@ '{"a":1,"b":2}'
+----
+1
+
+query T
+SELECT '{"a":1,"b":2}'::jsonb @> '{"a":1}'
+----
+1
+
+query I
+SELECT id FROM docs WHERE j <@ '{"a":1,"b":2}' ORDER BY id
+----
+1
+2
+
+query I
+SELECT id FROM docs WHERE j @> '{"b":2}' ORDER BY id
+----
+2
+
+# The literal on the left.
+query T
+SELECT '{"a":1,"b":2}' @> '{"a":1}'::jsonb
+----
+1
+
+query T
+SELECT '{"a":1}' <@ '{"a":1,"b":2}'::jsonb
+----
+1
+
+query I
+SELECT id FROM docs WHERE '{"a":1,"b":2}' @> j ORDER BY id
+----
+1
+2
+
+# A scalar or array document, a function result, dollar-quoted and escape-string literals.
+query TT
+SELECT '[1,2]'::jsonb @> '1', '1' <@ '[1,2]'::jsonb
+----
+1 1
+
+query T
+SELECT jsonb_build_object('a', 1) <@ '{"a":1}'
+----
+1
+
+query TT
+SELECT '{"a":1}'::jsonb <@ $${"a":1}$$, '{"a":1}'::jsonb <@ E'{"a":1}'
+----
+1 1
+
+# NULL stays NULL; a literal that is not JSON is refused in both directions.
+query T
+SELECT '{"a":1}'::jsonb <@ NULL
+----
+NULL
+
+statement error invalid Json value: "notjson"
+SELECT '{"a":1}'::jsonb <@ 'notjson'
+
+statement error invalid Json value: "notjson"
+SELECT '{"a":1}'::jsonb @> 'notjson'
+
+# Two bare literals name no type, so there is nothing to read them as.
+statement error type mismatch
+SELECT '{"a":1}' @> '{"a":1}'
+
+# The JSON-only operators with the literal on the left.
+query TTT
+SELECT '{"a":1}' ? 'a', '{"a":1}' ?& '{a}', '{"a":1}' ?| ARRAY['a', 'b']
+----
+1 1 1
+
+query TTT
+SELECT '{"a":1}' #- '{a}', '{"a":1,"b":2}' - 'a'::text, '{"a":1}' @? '$.a'
+----
+{} {"b": 2} 1
+
+# With the document typed, the key operators still take a bare literal on the right.
+query TTTT
+SELECT '{"a":1}'::jsonb ? 'a', '{"a":1}'::jsonb ?| '{a,b}', '{"a":1}'::jsonb ?& '{a,b}', '{"a":1}'::jsonb || '{"b":2}'
+----
+1 1 0 {"a": 1, "b": 2}
+
+query TTT
+SELECT '{"a":1,"b":2}'::jsonb - 'a', '{"a":{"b":1}}'::jsonb #> '{a,b}', '{"a":{"b":1}}'::jsonb #>> '{a,b}'
+----
+{"b": 2} 1 1
+
+query TT
+SELECT '{"a":1}'::jsonb @? '$.a', '{"a":1}'::jsonb @@ '$.a == 1'
+----
+1 1
+
+# Arrays: @>, <@ and && read the literal as an array of the other side's element type.
+query TTTT
+SELECT ARRAY[1,2] @> '{1}', ARRAY[1] <@ '{1,2}', '{1}' <@ ARRAY[1,2], '{1,2}' @> ARRAY[1]
+----
+1 1 1 1
+
+query TT
+SELECT ARRAY[1,2] && '{2,3}', '{2,3}' && ARRAY[1,2]
+----
+1 1
+
+query TTT
+SELECT ARRAY['a','b'] <@ '{a,b,c}', ARRAY[1.5,2] @> '{1.5}', ARRAY['a']::text[] && '{a}'
+----
+1 1 1
+
+query I
+SELECT id FROM docs WHERE tags && '{2,3}' ORDER BY id
+----
+1
+2
+
+query I
+SELECT id FROM docs WHERE '{x,y,w}' @> labels ORDER BY id
+----
+1
+
+query T
+SELECT ARRAY[1,2] <@ NULL
+----
+NULL
+
+statement error invalid Int value: "x"
+SELECT ARRAY[1,2] @> '{1,x}'
+
+statement error invalid Int value: "x"
+SELECT ARRAY[1,2] && '{x}'
+
+# A prepared statement with the literal in either position.
+statement ok
+PREPARE contained AS SELECT id FROM docs WHERE j <@ '{"a":1,"b":2}' AND id = $1
+
+query I
+EXECUTE contained(2)
+----
+2

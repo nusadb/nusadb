@@ -2649,6 +2649,17 @@ A bare `NULL` operand takes the type of the other operand. When the operator has
 values of that type, it takes the type that makes the operator resolve instead: `ts + NULL` is a
 `NULL` timestamp (`timestamp + interval`), and `INTERVAL '1 day' * NULL` a `NULL` interval.
 
+A bare string literal beside a JSON document or an array is the document or array it spells, on
+either side of `@>`, `<@` and array `&&`: `j <@ '{"a":1,"b":2}'` reads the literal exactly as
+`j @> '{"a":1}'` does, and `'{1}' <@ ARRAY[1,2]` as `ARRAY[1] <@ '{1,2}'`. On the left of the
+JSON-only operators `?`, `?&`, `#-` and `@?` it is the JSON document (`'{"a":1}' ? 'a'`); on the
+left of `?|` and `-`, only when the right operand is a typed key (`'{"a":1}' ?| ARRAY['a']`,
+`'{"a":1}' - 'a'::text`). A literal that is not valid JSON, or not a valid array of the element
+type, is refused with `22P02`. With a bare literal on both sides, `?`, `?&`, `#-` and `@?` still
+read the left one as the JSON document (`'{"a":1}' ? 'a'` is true, `'{"a":{"b":1}}' #- '{a,b}'` is
+`{"a": {}}`), and `||` concatenates the two as text. The other pairs are refused (`42804`): `@>`,
+`<@`, `&&`, `?|`, `-`, `->`, `->>`, `#>` and `#>>` give no type to read either literal as.
+
 ---
 
 ## Access control

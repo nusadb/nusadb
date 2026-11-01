@@ -5333,6 +5333,53 @@ pub(super) fn analyze_binary(
             left_typed = coerce_unknown_literal(left_typed, right_typed.ty);
         }
     }
+    // Array `&&` and the containment operators `@>` / `<@` over JSON documents and arrays have no
+    // form that takes a string, so a bare string literal beside a JSON document or an array is the
+    // document or array it spells. This holds on either side and for both containment directions:
+    // `j <@ '{"a":1}'` reads the literal exactly as `j @> '{"a":1}'` does, and `'{1}' <@ ARRAY[1, 2]`
+    // as `ARRAY[1] <@ '{1, 2}'`. A malformed literal then fails as the type's own input error.
+    if matches!(
+        op,
+        ast::BinaryOp::ArrayOverlap | ast::BinaryOp::JsonContains | ast::BinaryOp::JsonContainedBy
+    ) {
+        let spells_a_value = |ty: ColumnType| {
+            matches!(ty, ColumnType::Array(_))
+                || (op != ast::BinaryOp::ArrayOverlap && ty.physical() == ColumnType::Json)
+        };
+        if spells_a_value(left_typed.ty) {
+            right_typed = coerce_unknown_literal(right_typed, left_typed.ty);
+        }
+        if spells_a_value(right_typed.ty) {
+            left_typed = coerce_unknown_literal(left_typed, right_typed.ty);
+        }
+    }
+    // The JSON-only operators: `?`, `?&`, `#-` and `@?` take a JSON document on the left and exist
+    // for no other type, so a bare string literal there is that document (`'{"a":1}' ? 'a'`). `?|`
+    // also names a geometric operator, and `-` is arithmetic too, so their left literal is read as
+    // JSON only when the right operand is a typed key (`'{"a":1}' ?| ARRAY['a']`,
+    // `'{"a":1}' - 'a'::text`); with two bare literals they stay ambiguous.
+    let right_is_literal = matches!(
+        &right_typed.kind,
+        TypedExprKind::Literal(ast::Value::Text(_))
+    );
+    let json_left = match op {
+        ast::BinaryOp::JsonExists
+        | ast::BinaryOp::JsonExistsAll
+        | ast::BinaryOp::JsonDeletePath
+        | ast::BinaryOp::JsonPathExists => true,
+        ast::BinaryOp::JsonExistsAny => !right_is_literal,
+        ast::BinaryOp::Minus => {
+            !right_is_literal
+                && matches!(
+                    right_typed.ty,
+                    ColumnType::Text | ColumnType::Array(nusadb_core::engine::ArrayElem::Text)
+                )
+        },
+        _ => false,
+    };
+    if json_left {
+        left_typed = coerce_unknown_literal(left_typed, ColumnType::Json);
+    }
     // The JSON key operators take a key, not a second document, so a bare `NULL` on their right
     // must not be typed from the JSON document on their left ([`analyze_operands`] types it from the
     // sibling by default). Re-type it as the key type the operator actually wants, so `j - NULL` and
