@@ -567,11 +567,13 @@ fn encode_value(value: &ast::Value, ty: ColumnType, out: &mut Vec<u8>) -> Result
             encode_numeric(crate::numeric::Decimal::from_i64(*i), precision, scale, out)?;
         },
         (ast::Value::Float(f), ColumnType::Numeric { precision, scale }) => {
-            let d = crate::numeric::from_f64_text(*f).ok_or_else(|| invalid(ty, &f.to_string()))?;
+            let d = crate::numeric::from_f64_input(*f)
+                .map_err(|e| Error::numeric_input(e, precision, scale, &f.to_string()))?;
             encode_numeric(d, precision, scale, out)?;
         },
         (ast::Value::Text(s), ColumnType::Numeric { precision, scale }) => {
-            let d = crate::numeric::Decimal::parse(s).ok_or_else(|| invalid(ty, s))?;
+            let d = crate::numeric::parse_input(s)
+                .map_err(|e| Error::numeric_input(e, precision, scale, s))?;
             encode_numeric(d, precision, scale, out)?;
         },
         // JSON: length-prefixed canonical text. A `Value::Json` is already canonical; a text
@@ -914,15 +916,16 @@ fn encode_numeric(
     scale: u8,
     out: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    let ty = ColumnType::Numeric { precision, scale };
     let d = if precision == 0 {
         value
     } else {
+        // A number that parses but does not fit is out of range (`22003`), as for the cast: the
+        // text was a valid number, so it is not an invalid representation.
         let rescaled = value
             .rescale(scale)
-            .ok_or_else(|| invalid(ty, &value.format()))?;
+            .ok_or_else(|| Error::numeric_field_overflow(precision, scale))?;
         if rescaled.required_precision() > u32::from(precision) {
-            return Err(invalid(ty, &value.format()));
+            return Err(Error::numeric_field_overflow(precision, scale));
         }
         rescaled
     };
@@ -1670,9 +1673,14 @@ mod tests {
             precision: 4,
             scale: 2,
         }];
-        // 123.45 has 5 significant digits > precision 4.
+        // 123.45 has 5 significant digits > precision 4: out of range (22003), not malformed text.
         let result = encode(&[Value::Text("123.45".to_owned())], &schema);
-        assert!(matches!(result, Err(Error::InvalidValue { .. })));
+        assert!(matches!(result, Err(Error::NumericOutOfRange(_))));
+        let err = result.expect_err("does not fit");
+        assert_eq!(err.sqlstate(), "22003");
+        // Text that is not a number at all stays an invalid representation.
+        let malformed = encode(&[Value::Text("abc".to_owned())], &schema);
+        assert!(matches!(malformed, Err(Error::InvalidValue { .. })));
     }
 
     #[test]

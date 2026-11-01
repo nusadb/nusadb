@@ -1,0 +1,274 @@
+# p10_types/numeric_field_overflow: a number too large for NUMERIC(p, s).
+#
+# A value that parses as a number but, rounded to s digits, needs more than p digits is out of
+# range (22003, "numeric field overflow"), on every path that stores into or casts to the type.
+# Text that is not a number at all stays an invalid representation (22P02). The SQLSTATEs are
+# asserted in tests/numeric_field_overflow.rs.
+
+statement ok
+CREATE TABLE tn (v NUMERIC(6,2))
+
+statement error numeric field overflow: value exceeds NUMERIC\(6, 2\)
+INSERT INTO tn VALUES (12345.6)
+
+statement error numeric field overflow: value exceeds NUMERIC\(6, 2\)
+INSERT INTO tn VALUES ('12345.6')
+
+statement error numeric field overflow: value exceeds NUMERIC\(6, 2\)
+INSERT INTO tn VALUES (12345)
+
+# Rounding to the scale can carry a value over the limit.
+statement error numeric field overflow: value exceeds NUMERIC\(6, 2\)
+INSERT INTO tn VALUES (9999.995)
+
+statement ok
+INSERT INTO tn VALUES (9999.994)
+
+statement error numeric field overflow: value exceeds NUMERIC\(6, 2\)
+UPDATE tn SET v = v * 1000
+
+statement error numeric field overflow: value exceeds NUMERIC\(6, 2\)
+INSERT INTO tn SELECT 123456
+
+statement error numeric field overflow: value exceeds NUMERIC\(6, 2\)
+MERGE INTO tn USING (SELECT 1 AS k) s ON false WHEN NOT MATCHED THEN INSERT VALUES (123456)
+
+query R
+SELECT v FROM tn
+----
+9999.99
+
+# The cast reports the same condition.
+statement error numeric field overflow: value exceeds NUMERIC\(6, 2\)
+SELECT 12345.6::NUMERIC(6,2)
+
+statement error numeric field overflow: value exceeds NUMERIC\(2, 2\)
+SELECT 0.995::NUMERIC(2,2)
+
+query R
+SELECT 0.994::NUMERIC(2,2)
+----
+0.99
+
+# Text that is not a number is an invalid representation, named without the precision and scale.
+statement error invalid input syntax for type numeric: "abc"
+INSERT INTO tn VALUES ('abc')
+
+statement error invalid input syntax for type numeric: "abc"
+SELECT 'abc'::NUMERIC(6,2)
+
+statement error invalid input syntax for type numeric: "abc"
+SELECT 'abc'::NUMERIC
+
+# A NUMERIC(p, s)[] element is held to the same limit.
+statement ok
+CREATE TABLE tna (a NUMERIC(5,2)[])
+
+statement error numeric field overflow: value exceeds NUMERIC\(5, 2\)
+INSERT INTO tna VALUES (ARRAY[1234.5])
+
+statement error numeric field overflow: value exceeds NUMERIC\(5, 2\)
+INSERT INTO tna VALUES ('{1234.5}')
+
+# A default, a generated column, a domain, a partition, a trigger's NEW and a function's result.
+statement ok
+CREATE TABLE tnd (v NUMERIC(3,1) DEFAULT 123.4, k INT)
+
+statement error numeric field overflow: value exceeds NUMERIC\(3, 1\)
+INSERT INTO tnd (k) VALUES (1)
+
+statement ok
+CREATE TABLE tng (a NUMERIC, b NUMERIC(4,1) GENERATED ALWAYS AS (a * 1000) STORED)
+
+statement error numeric field overflow: value exceeds NUMERIC\(4, 1\)
+INSERT INTO tng (a) VALUES (5)
+
+statement ok
+CREATE DOMAIN small_amount AS NUMERIC(4,1)
+
+statement ok
+CREATE TABLE tnm (v small_amount)
+
+statement error numeric field overflow: value exceeds NUMERIC\(4, 1\)
+INSERT INTO tnm VALUES (12345)
+
+statement ok
+CREATE TABLE tnp (k INT, v NUMERIC(4,1)) PARTITION BY RANGE (k)
+
+statement ok
+CREATE TABLE tnp1 PARTITION OF tnp FOR VALUES FROM (0) TO (10)
+
+statement error numeric field overflow: value exceeds NUMERIC\(4, 1\)
+INSERT INTO tnp VALUES (1, 12345)
+
+statement ok
+CREATE FUNCTION tn_widen() RETURNS trigger LANGUAGE nusascript AS $$
+BEGIN
+  NEW.v := 99999;
+  RETURN NEW;
+END
+$$
+
+statement ok
+CREATE TABLE tnt (v NUMERIC(4,1))
+
+statement ok
+CREATE TRIGGER tn_widen_row BEFORE INSERT ON tnt FOR EACH ROW EXECUTE FUNCTION tn_widen()
+
+statement error numeric field overflow: value exceeds NUMERIC\(4, 1\)
+INSERT INTO tnt VALUES (1)
+
+statement ok
+CREATE TABLE tnu (v NUMERIC(6,2) UNIQUE)
+
+statement ok
+INSERT INTO tnu VALUES (1)
+
+statement error numeric field overflow: value exceeds NUMERIC\(6, 2\)
+INSERT INTO tnu VALUES (1) ON CONFLICT (v) DO UPDATE SET v = tnu.v * 100000
+
+# Narrowing a column refuses a stored value that no longer fits.
+statement ok
+CREATE TABLE tnc (v NUMERIC(10,2))
+
+statement ok
+INSERT INTO tnc VALUES (123456.78)
+
+statement error numeric field overflow: value exceeds NUMERIC\(5, 2\)
+ALTER TABLE tnc ALTER COLUMN v TYPE NUMERIC(5,2)
+
+query R
+SELECT v FROM tnc
+----
+123456.78
+
+# A float, or a number written with an exponent, is a well-formed number: too large for the target
+# it is 22003, never an invalid representation.
+statement error numeric field overflow: value exceeds NUMERIC\(5, 2\)
+SELECT 1e300::FLOAT8::NUMERIC(5,2)
+
+statement error numeric field overflow: value exceeds NUMERIC\(5, 2\)
+SELECT 1e20::FLOAT8::NUMERIC(5,2)
+
+statement error numeric field overflow: value exceeds NUMERIC\(5, 2\)
+SELECT '1e100'::NUMERIC(5,2)
+
+# A NUMERIC holds magnitudes below about 1.7e38; a larger number is out of range for any NUMERIC.
+statement error value overflows numeric format
+SELECT '1e100'::NUMERIC
+
+statement error value overflows numeric format
+SELECT 1e300::FLOAT8::NUMERIC
+
+query RR
+SELECT '1.5e3'::NUMERIC, '25e-2'::NUMERIC(4,2)
+----
+1500 0.25
+
+query R
+SELECT 1e-300::FLOAT8::NUMERIC(5,2)
+----
+0.00
+
+# NaN carries over; an infinity has no NUMERIC form.
+query T
+SELECT 'NaN'::FLOAT8::NUMERIC(5,2)
+----
+NaN
+
+statement error numeric field overflow: NUMERIC\(5, 2\) cannot hold an infinite value
+SELECT 'Infinity'::FLOAT8::NUMERIC(5,2)
+
+statement error numeric field overflow: NUMERIC\(5, 2\) cannot hold an infinite value
+SELECT '-Infinity'::NUMERIC(5,2)
+
+statement error NUMERIC cannot hold an infinite value
+SELECT 'Infinity'::FLOAT8::NUMERIC
+
+statement error invalid input syntax for type numeric: "1e"
+SELECT '1e'::NUMERIC
+
+# The same on the write paths.
+statement ok
+CREATE TABLE tnf (v NUMERIC(5,2), a NUMERIC(5,2)[])
+
+statement error numeric field overflow: value exceeds NUMERIC\(5, 2\)
+INSERT INTO tnf (v) VALUES (1e300::FLOAT8)
+
+statement error numeric field overflow: value exceeds NUMERIC\(5, 2\)
+INSERT INTO tnf (v) VALUES ('1e100')
+
+statement error numeric field overflow: NUMERIC\(5, 2\) cannot hold an infinite value
+INSERT INTO tnf (v) VALUES ('Infinity'::FLOAT8)
+
+statement error value overflows numeric format
+INSERT INTO tnf (a) VALUES ('{1e100}')
+
+statement ok
+INSERT INTO tnf (v, a) VALUES ('NaN'::FLOAT8, '{1.5e1}')
+
+statement ok
+INSERT INTO tnf (v) VALUES ('1.5e1')
+
+statement error numeric field overflow: value exceeds NUMERIC\(5, 2\)
+UPDATE tnf SET v = 1e300::FLOAT8
+
+query TT rowsort
+SELECT v, a FROM tnf
+----
+15.00 NULL
+NaN {15.00}
+
+# An exponent of any size is read without fault. A value written with more than 16383 fractional
+# places once its exponent is applied is out of range, however small; within that, a value too
+# small for NUMERIC's 38 places rounds to zero.
+statement error value overflows numeric format
+SELECT '1e-9223372036854775807'::NUMERIC
+
+statement error value overflows numeric format
+SELECT '1e-99999999999999999999'::NUMERIC
+
+statement error value overflows numeric format
+SELECT '1e9223372036854775807'::NUMERIC
+
+# A written form past what any numeric value may take overflows the format itself, whatever the
+# declared precision; a number merely too large for the precision is a field overflow.
+statement error value overflows numeric format
+SELECT '1e99999999999999999999'::NUMERIC(5,2)
+
+statement error value overflows numeric format
+SELECT '1e-9223372036854775807'::NUMERIC(12,2)
+
+statement error value overflows numeric format
+SELECT '1e-16384'::NUMERIC(12,2)
+
+statement error value overflows numeric format
+SELECT '1e131072'::NUMERIC(5,2)
+
+statement error numeric field overflow: value exceeds NUMERIC\(5, 2\)
+SELECT '1e131071'::NUMERIC(5,2)
+
+query R
+SELECT '1e-1000'::NUMERIC(5,2)
+----
+0.00
+
+statement ok
+CREATE TABLE tnx (v NUMERIC)
+
+statement error value overflows numeric format
+INSERT INTO tnx VALUES ('1e-9223372036854775790')
+
+statement error value overflows numeric format
+INSERT INTO tnx VALUES ('1e+9223372036854775807')
+
+statement ok
+CREATE TABLE tnx12 (v NUMERIC(12,2))
+
+statement error value overflows numeric format
+INSERT INTO tnx12 VALUES ('1e-9223372036854775807')
+
+query I
+SELECT count(*) FROM tnx
+----
+0

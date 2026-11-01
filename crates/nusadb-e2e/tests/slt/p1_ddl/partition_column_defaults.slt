@@ -543,7 +543,7 @@ INSERT INTO pt1 (d, vc) VALUES (1, 'abcd')
 statement error value too long for type CHAR\(3\)
 INSERT INTO pt (d, ch) VALUES (1, 'abcd')
 
-statement error invalid Numeric
+statement error numeric field overflow: value exceeds NUMERIC\(5, 2\)
 INSERT INTO pt1 (d, n) VALUES (1, 12345.6)
 
 statement error invalid Date value

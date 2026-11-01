@@ -527,6 +527,177 @@ pub fn from_f64_text(value: f64) -> Option<Decimal> {
     Decimal::parse(&value.to_string())
 }
 
+/// The most fractional places a `NUMERIC` input may be written with once its exponent is applied
+/// (`'1e-16383'` is the smallest such power of ten): past it the input is out of range, as the
+/// standard numeric type's display scale limit has it.
+const MAX_INPUT_SCALE: i128 = 16_383;
+
+/// The most digits a `NUMERIC` input may have before the point once its exponent is applied: past
+/// it the written form overflows, rather than merely not fitting a declared precision.
+const MAX_INPUT_WEIGHT: i128 = 131_072;
+
+/// Why a value could not become a [`Decimal`] in [`parse_input`] or [`from_f64_input`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputError {
+    /// The text is not a number at all (`'abc'`, `'1e'`): an invalid representation.
+    Malformed,
+    /// A well-formed number whose integer part needs more than the 38 digits a `NUMERIC` holds.
+    OutOfRange,
+    /// A number whose written form is past what any numeric value may be written with: more than
+    /// 16383 places after the point or 131072 digits before it once its exponent is applied,
+    /// however small or large it is. It overflows the format itself, whatever the target's declared
+    /// precision.
+    FormatOverflow,
+    /// An infinity, which a `NUMERIC` has no form for.
+    Infinite,
+}
+
+/// Split a number's text at its exponent: the mantissa text and the exponent's value, `0` when it
+/// has none. An exponent past an `i64` saturates at `i64::MAX` in magnitude, which is past any
+/// representable value either way; the result is an `i128` so callers can add string lengths to it
+/// without overflow.
+fn split_exponent(body: &str) -> Result<(&str, i128), InputError> {
+    let Some(at) = body.find(['e', 'E']) else {
+        return Ok((body, 0));
+    };
+    let exp_text = body.get(at + 1..).unwrap_or("");
+    let exp_digits = exp_text.strip_prefix(['+', '-']).unwrap_or(exp_text);
+    if exp_digits.is_empty() || !exp_digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(InputError::Malformed);
+    }
+    let magnitude = exp_digits
+        .parse::<i128>()
+        .unwrap_or_else(|_| i128::from(i64::MAX))
+        .min(i128::from(i64::MAX));
+    let exponent = if exp_text.starts_with('-') {
+        -magnitude
+    } else {
+        magnitude
+    };
+    Ok((body.get(..at).unwrap_or(""), exponent))
+}
+
+/// Read `s` as a `NUMERIC` input value, telling malformed text from an out-of-range number.
+///
+/// Beside the plain decimal form [`Decimal::parse`] reads, this takes an exponent (`'1.5e3'`) and
+/// `Infinity`. Fractional digits past [`MAX_SCALE`], or past what fits in 38 significant digits,
+/// are rounded half away from zero; an integer part too wide for the significand is
+/// [`InputError::OutOfRange`].
+///
+/// # Errors
+/// [`InputError`] as described.
+pub fn parse_input(s: &str) -> Result<Decimal, InputError> {
+    if let Some(d) = Decimal::parse(s) {
+        return Ok(d);
+    }
+    let t = s.trim();
+    let (neg, body) = match t.as_bytes().first() {
+        Some(b'-') => (true, t.get(1..).unwrap_or("")),
+        Some(b'+') => (false, t.get(1..).unwrap_or("")),
+        _ => (false, t),
+    };
+    if body.eq_ignore_ascii_case("inf") || body.eq_ignore_ascii_case("infinity") {
+        return Err(InputError::Infinite);
+    }
+    // All position arithmetic below is in i128: the exponent is at most an i64 in magnitude and the
+    // digit counts are string lengths, so no sum or difference of them can overflow, however absurd
+    // the input. An exponent past any representable value saturates, and the written form then
+    // overflows (more places before or after the point than a numeric value may be written with).
+    let (mantissa_text, exponent) = split_exponent(body)?;
+    let (int_part, frac_part) = mantissa_text.split_once('.').unwrap_or((mantissa_text, ""));
+    if (int_part.is_empty() && frac_part.is_empty())
+        || !int_part
+            .bytes()
+            .chain(frac_part.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return Err(InputError::Malformed);
+    }
+    // The significant digits, and how many of them sit after the point once the exponent moved it.
+    let digits = format!("{int_part}{frac_part}");
+    let digits = digits.trim_start_matches('0');
+    let as_wide = |n: usize| i128::try_from(n).unwrap_or(i128::MAX / 4);
+    let mut scale: i128 = as_wide(frac_part.len()) - exponent;
+    // More fractional places than a numeric value may be written with is out of range, however
+    // small the value: the input form, not the rounded result, is what overflows.
+    if scale > MAX_INPUT_SCALE {
+        return Err(InputError::FormatOverflow);
+    }
+    let max_scale = i128::from(MAX_SCALE);
+    if digits.is_empty() {
+        return Ok(Decimal {
+            mantissa: 0,
+            scale: u8::try_from(scale.clamp(0, max_scale)).unwrap_or(0),
+        });
+    }
+    let len = as_wide(digits.len());
+    let integer_digits = len - scale;
+    if integer_digits > MAX_INPUT_WEIGHT {
+        return Err(InputError::FormatOverflow);
+    }
+    if integer_digits > 39 {
+        return Err(InputError::OutOfRange);
+    }
+    // Keep at most MAX_SCALE fractional digits, and no more than leave 38 significant digits in
+    // all; round the rest away. Integer digits are never dropped: a value whose integer part does
+    // not fit the 128-bit significand is out of range below.
+    let keep_frac = if scale <= 0 {
+        scale
+    } else {
+        scale.min(max_scale).min((38 - integer_digits).max(0))
+    };
+    let drop = scale - keep_frac;
+    let rounds_up = |at: usize| digits.as_bytes().get(at).is_some_and(|d| *d >= b'5');
+    let (kept, round_up) = if drop <= 0 {
+        (digits, false)
+    } else if drop >= len {
+        // Every significant digit falls past the kept places: the value rounds to 0 or one unit.
+        ("", drop == len && rounds_up(0))
+    } else {
+        let cut = usize::try_from(len - drop).map_err(|_| InputError::OutOfRange)?;
+        (digits.get(..cut).unwrap_or(""), rounds_up(cut))
+    };
+    scale = keep_frac;
+    let mut mantissa: i128 = if kept.is_empty() {
+        0
+    } else {
+        kept.parse().map_err(|_| InputError::OutOfRange)?
+    };
+    if round_up {
+        mantissa = mantissa.checked_add(1).ok_or(InputError::OutOfRange)?;
+    }
+    if scale < 0 {
+        let factor = u32::try_from(-scale)
+            .ok()
+            .and_then(pow10)
+            .ok_or(InputError::OutOfRange)?;
+        mantissa = mantissa.checked_mul(factor).ok_or(InputError::OutOfRange)?;
+        scale = 0;
+    }
+    if neg {
+        mantissa = -mantissa;
+    }
+    Ok(Decimal {
+        mantissa,
+        scale: u8::try_from(scale).map_err(|_| InputError::OutOfRange)?,
+    })
+}
+
+/// Build a decimal from an `f64` for a `NUMERIC` input: [`from_f64_text`]'s conversion, with an
+/// infinity or a magnitude past 38 integer digits reported as [`InputError`] rather than lost.
+///
+/// # Errors
+/// [`InputError::Infinite`] or [`InputError::OutOfRange`].
+pub fn from_f64_input(value: f64) -> Result<Decimal, InputError> {
+    if value.is_nan() {
+        return Ok(Decimal::nan());
+    }
+    if value.is_infinite() {
+        return Err(InputError::Infinite);
+    }
+    parse_input(&value.to_string())
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -537,6 +708,121 @@ mod tests {
 
     fn d(s: &str) -> Decimal {
         Decimal::parse(s).unwrap()
+    }
+
+    #[test]
+    fn numeric_input_reads_an_exponent_of_any_size_without_fault() {
+        let ok = |s: &str| parse_input(s).unwrap().format();
+        // Absurd exponents and digit strings never panic. A value written with more than 16383
+        // fractional places is out of range; within that, a tiny value rounds to zero.
+        for exp in [
+            "-9223372036854775807",
+            "-9223372036854775808",
+            "-1000000000000000000",
+            "-99999999999999999999",
+            "-16384",
+        ] {
+            for mantissa in [
+                "1".to_owned(),
+                "9".repeat(10_000),
+                format!("0.{}", "5".repeat(10_000)),
+            ] {
+                assert_eq!(
+                    parse_input(&format!("{mantissa}e{exp}")),
+                    Err(InputError::FormatOverflow),
+                    "{exp}"
+                );
+            }
+        }
+        assert_eq!(parse_input("1e-16383").unwrap().mantissa, 0);
+        assert_eq!(parse_input("5e-39").unwrap().mantissa, 1);
+        assert_eq!(
+            parse_input(&format!("0.{}", "1".repeat(16_384))),
+            Err(InputError::FormatOverflow)
+        );
+        // Past 131072 digits before the point the form overflows; below it, a number past the
+        // 128-bit significand is merely out of range.
+        assert_eq!(parse_input("1e131071"), Err(InputError::OutOfRange));
+        assert_eq!(parse_input("1e131072"), Err(InputError::FormatOverflow));
+        for exp in [
+            "9223372036854775807",
+            "+9223372036854775807",
+            "9223372036854775808",
+            "1000000000000000000",
+            "99999999999999999999",
+        ] {
+            assert_eq!(
+                parse_input(&format!("1e{exp}")),
+                Err(InputError::FormatOverflow),
+                "{exp}"
+            );
+            assert_eq!(
+                parse_input(&format!("0.{}1e{exp}", "0".repeat(10_000))),
+                Err(InputError::FormatOverflow),
+                "{exp}"
+            );
+        }
+        assert_eq!(
+            parse_input(&format!("1{}", "0".repeat(10_000))),
+            Err(InputError::OutOfRange)
+        );
+        assert_eq!(
+            ok(&format!("{}e-9999", "1".repeat(10_000))),
+            "1.1111111111111111111111111111111111111"
+        );
+        assert_eq!(
+            ok(&format!("0.{}5e1", "0".repeat(10_000))),
+            "0.00000000000000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn numeric_input_tells_malformed_from_out_of_range() {
+        let ok = |s: &str| parse_input(s).unwrap().format();
+        assert_eq!(ok("19.99"), "19.99");
+        assert_eq!(ok("1.5e3"), "1500");
+        assert_eq!(ok("-1.5E+3"), "-1500");
+        assert_eq!(ok("25e-2"), "0.25");
+        assert_eq!(ok("0e5"), "0");
+        // Fractional digits past what NUMERIC carries are rounded away.
+        assert_eq!(ok("1e-300"), "0.00000000000000000000000000000000000000");
+        assert_eq!(
+            ok("0.123456789012345678901234567890123456789"),
+            "0.12345678901234567890123456789012345679"
+        );
+        assert_eq!(
+            ok("12345678901234567890.123456789012345678901"),
+            "12345678901234567890.123456789012345679"
+        );
+        for s in [
+            "1e100",
+            "1e39",
+            "1234567890123456789012345678901234567890",
+            "999999999999999999999999999999999999999",
+        ] {
+            assert_eq!(parse_input(s), Err(InputError::OutOfRange), "{s}");
+        }
+        assert_eq!(
+            parse_input("1e9999999999999999999"),
+            Err(InputError::FormatOverflow)
+        );
+        assert_eq!(
+            ok("99999999999999999999999999999999999999"),
+            "99999999999999999999999999999999999999"
+        );
+        for s in ["inf", "-Infinity", "+INFINITY"] {
+            assert_eq!(parse_input(s), Err(InputError::Infinite), "{s}");
+        }
+        for s in ["abc", "1e", "e5", "1e+", "1.2.3", "", ".", "1e5.5", "--1"] {
+            assert_eq!(parse_input(s), Err(InputError::Malformed), "{s}");
+        }
+        assert_eq!(from_f64_input(1e300), Err(InputError::OutOfRange));
+        assert_eq!(from_f64_input(f64::MAX), Err(InputError::OutOfRange));
+        assert_eq!(from_f64_input(f64::MIN_POSITIVE).unwrap().mantissa, 0);
+        assert_eq!(from_f64_input(-5e-324).unwrap().mantissa, 0);
+        assert_eq!(from_f64_input(f64::INFINITY), Err(InputError::Infinite));
+        assert!(from_f64_input(f64::NAN).unwrap().is_nan());
+        assert_eq!(from_f64_input(1.5).unwrap().format(), "1.5");
     }
 
     #[test]

@@ -5012,12 +5012,13 @@ pub(crate) fn cast_value(value: ast::Value, target: ColumnType) -> Result<ast::V
             cast_to_numeric(crate::numeric::Decimal::from_i64(*i), precision, scale)?,
         )),
         (ast::Value::Float(f), ColumnType::Numeric { precision, scale }) => {
-            let d = crate::numeric::from_f64_text(*f)
-                .ok_or_else(|| invalid_cast(&f.to_string(), target))?;
+            let d = crate::numeric::from_f64_input(*f)
+                .map_err(|e| Error::numeric_input(e, precision, scale, &f.to_string()))?;
             Ok(ast::Value::Numeric(cast_to_numeric(d, precision, scale)?))
         },
         (ast::Value::Text(s), ColumnType::Numeric { precision, scale }) => {
-            let d = crate::numeric::Decimal::parse(s).ok_or_else(|| invalid_cast(s, target))?;
+            let d = crate::numeric::parse_input(s)
+                .map_err(|e| Error::numeric_input(e, precision, scale, s))?;
             Ok(ast::Value::Numeric(cast_to_numeric(d, precision, scale)?))
         },
         // SQL `CAST(numeric AS integer)` rounds half-away-from-zero (`2.6 -> 3`, `-2.5 -> -3`),
@@ -5242,10 +5243,7 @@ fn cast_to_numeric(
     }
     // A value that parses but does not fit the declared precision/scale is *out of range*, not an
     // invalid representation — the standard numeric-range code, matching arithmetic overflow.
-    let overflow = || Error::Coded {
-        message: format!("numeric field overflow: value exceeds NUMERIC({precision}, {scale})"),
-        sqlstate: "22003", // numeric_value_out_of_range
-    };
+    let overflow = || Error::numeric_field_overflow(precision, scale);
     let rescaled = d.rescale(scale).ok_or_else(overflow)?;
     if rescaled.required_precision() > u32::from(precision) {
         return Err(overflow());

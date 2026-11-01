@@ -479,7 +479,7 @@ pub enum Error {
 
     /// A literal string could not be parsed as the target type (e.g. a malformed
     /// `DATE`/`TIME`/`TIMESTAMP`/`UUID` value)
-    #[error("invalid {ty:?} value: {value:?}")]
+    #[error("{}", invalid_value_message(*ty, value))]
     InvalidValue {
         /// The type the value was expected to parse as.
         ty: ColumnType,
@@ -532,6 +532,48 @@ pub enum Error {
 }
 
 impl Error {
+    /// The `22003` error for a number that does not fit `NUMERIC(precision, scale)`: after
+    /// rounding to `scale` digits it needs more than `precision` digits. Shared by the cast and by
+    /// every write into a column of that type, so both report the same condition the same way.
+    #[must_use]
+    pub fn numeric_field_overflow(precision: u8, scale: u8) -> Self {
+        Self::NumericOutOfRange(format!(
+            "numeric field overflow: value exceeds NUMERIC({precision}, {scale})"
+        ))
+    }
+
+    /// The error for `input` that could not become a value of `NUMERIC(precision, scale)`
+    /// (`precision` 0 for an unconstrained `NUMERIC`): `22P02` for text that is not a number, and
+    /// `22003` for a well-formed number too large for the type or for any `NUMERIC`, or an infinity.
+    pub(crate) fn numeric_input(
+        error: crate::numeric::InputError,
+        precision: u8,
+        scale: u8,
+        input: &str,
+    ) -> Self {
+        use crate::numeric::InputError;
+        match error {
+            InputError::Malformed => Self::InvalidValue {
+                ty: ColumnType::Numeric { precision, scale },
+                value: input.to_owned(),
+            },
+            InputError::OutOfRange if precision > 0 => {
+                Self::numeric_field_overflow(precision, scale)
+            },
+            InputError::OutOfRange | InputError::FormatOverflow => Self::NumericOutOfRange(
+                "value overflows numeric format: a NUMERIC holds magnitudes below 1.7e38, written \
+                 with at most 16383 places after the point"
+                    .to_owned(),
+            ),
+            InputError::Infinite if precision > 0 => Self::NumericOutOfRange(format!(
+                "numeric field overflow: NUMERIC({precision}, {scale}) cannot hold an infinite value"
+            )),
+            InputError::Infinite => {
+                Self::NumericOutOfRange("NUMERIC cannot hold an infinite value".to_owned())
+            },
+        }
+    }
+
     /// The 5-character SQLSTATE the wire protocol reports for this error.
     ///
     /// The class is the part a client acts on: a driver, pool or migration tool reads it to decide
@@ -660,6 +702,15 @@ impl Error {
             | Self::Decryption(_)
             | Self::UdfFailed { .. } => INTERNAL_ERROR,
         }
+    }
+}
+
+/// The message of [`Error::InvalidValue`]. A `NUMERIC` target is named by its SQL name, without
+/// its declared precision and scale, which play no part in whether the text parses.
+fn invalid_value_message(ty: ColumnType, value: &str) -> String {
+    match ty {
+        ColumnType::Numeric { .. } => format!("invalid input syntax for type numeric: {value:?}"),
+        _ => format!("invalid {ty:?} value: {value:?}"),
     }
 }
 

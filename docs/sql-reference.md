@@ -82,7 +82,25 @@ SELECT qty * price AS total FROM amounts;
 ```
 
 Integer arithmetic that overflows is an error (`22003`), not a silent wrap. Division by zero is
-`22012`. Date and time arithmetic that leaves the representable range (a timestamp or date plus an
+`22012`. A value stored into or cast to `NUMERIC(p, s)` is rounded to `s` places; when it then needs
+more than `p` digits it is refused with `22003` (`numeric field overflow: value exceeds NUMERIC(6,
+2)`). That holds for an integer, a `NUMERIC`, a floating-point value and text, written with or
+without an exponent (`'1.5e3'`), on every write path (`INSERT`, `UPDATE`, `COPY`, `MERGE`,
+`ON CONFLICT`, an array element) and in a column default, a generated column, a domain or a
+trigger's `NEW`. An array stored into a `NUMERIC(p, s)[]` column is checked element by element the
+same way, but a cast of an array to `NUMERIC(p, s)[]` (`CAST(ARRAY[1234.5] AS NUMERIC(5,2)[])`) does
+not check or round its elements.
+
+A `NUMERIC` holds 38 significant digits and magnitudes below about 1.7e38: a larger number is
+`22003` (`value overflows numeric format`) even for an unconstrained `NUMERIC`, and fractional
+digits past what fits are rounded. A number written with more than 16383 places after the point,
+or more than 131072 digits before it, once its exponent is applied (`'1e-16384'`, `'1e131072'`)
+overflows the format itself: it is `22003` (`value overflows numeric format`) whatever the declared
+precision, however small or large it is. An exponent of any size is read without fault. A float
+`NaN` becomes the numeric `NaN`; an infinity has no `NUMERIC` form and is `22003`. Text that is not
+a number at all is `22P02` (`invalid input syntax for type numeric: "abc"`).
+
+Date and time arithmetic that leaves the representable range (a timestamp or date plus an
 interval, an interval sum or product whose months, days or time no longer fit) is an error too
 (`22008`), never a clamped or wrapped value.
 
@@ -2778,7 +2796,7 @@ on the message text.
 | `0A000` | feature not supported | the statement is recognised but not built; see [Not accepted](#not-accepted). Also `COMMIT`, `ROLLBACK`, a savepoint or a connection statement inside a procedure, function, trigger or `DO` block |
 | `22001` | string too long for `VARCHAR(n)`, or a bit string too long for `BIT VARYING(n)` | shorten the value or widen the column |
 | `22026` | a bit string whose length does not match `BIT(n)` | give exactly `n` bits, or cast explicitly |
-| `22003` | numeric value out of range | integer overflow, a value outside a function's domain, or a `setval` outside the sequence's bounds |
+| `22003` | numeric value out of range | integer overflow, a number too large for `NUMERIC(p, s)`, a value outside a function's domain, or a `setval` outside the sequence's bounds |
 | `22007` | invalid date/time format | fix the literal |
 | `22008` | date/time value out of range | a timestamp, date or interval result past the representable range |
 | `22012` | division by zero | |
