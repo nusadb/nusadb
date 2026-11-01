@@ -1380,3 +1380,8 @@ fn slt_p10_numeric_field_overflow() {
 fn slt_p10_json_array_literal_operands() {
     run_slt("tests/slt/p10_types/json_array_literal_operands.slt");
 }
+
+#[test]
+fn slt_p13_real_function_results() {
+    run_slt("tests/slt/p13_functions/real_function_results.slt");
+}

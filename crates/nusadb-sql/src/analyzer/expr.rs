@@ -809,7 +809,7 @@ fn analyze_udf_call(
             args: typed,
             arg_types,
         },
-        ty: return_type,
+        ty: super::expr_type(return_type),
     })
 }
 
@@ -1008,7 +1008,9 @@ fn analyze_sql_function(
                     return_type: func.return_type,
                 }),
             },
-            ty: func.return_type,
+            // The value is coerced to the declared return type; the expression takes its physical
+            // type, as for a built-in function.
+            ty: super::expr_type(func.return_type),
         });
     }
     if args.len() != func.param_count {
@@ -1994,7 +1996,10 @@ pub(super) fn analyze_scalar_function(
             func,
             args: typed_args,
         },
-        ty: result,
+        // The declared result type (a `REAL` for `ts_rank`) carries no runtime distinction, so the
+        // expression takes its physical type, as a column or a cast of that type does: otherwise
+        // the result would not meet an integer or numeric operand the way a `REAL` column does.
+        ty: super::expr_type(result),
     })
 }
 

@@ -1761,7 +1761,9 @@ and ANDs them; `phraseto_tsquery` takes plain words and chains them into a phras
 mirror the word positions (`phraseto_tsquery('the cat and the rat')` is `'cat' <3> 'rat'`).
 `tsquery_phrase(a, b [, distance])` and `a <-> b` join two queries into a phrase. Phrase matching
 is position-accurate: `to_tsvector('a b c') @@ 'a <2> c'` holds, `'a <-> c'` does not, and a
-`strip()`-ed vector never matches a phrase. Ranking: `ts_rank`, `ts_rank_cd`;
+`strip()`-ed vector never matches a phrase. Ranking: `ts_rank`, `ts_rank_cd`, each a `REAL` that
+compares and computes with integers and numerics like any `REAL` (`ts_rank(v, q) > 0`,
+`ORDER BY ts_rank(v, q) * 2`).
 `setweight(vector, 'A')` marks lexemes, `strip(vector)` drops positions. Other configurations
 and prefix matching are refused with a clear error rather than approximated.
 For hybrid search over a vector index and a text match, `rrf_score(rank [, k])` fuses two rankings.
@@ -1776,7 +1778,8 @@ A function is `LANGUAGE SQL` (the default) or NusaScript (`LANGUAGE nusascript`;
 accepted as an alias). A SQL body is a single `SELECT <expression>` without `FROM`, inlined at
 each call site. A NusaScript body is a `BEGIN ... END` block whose `RETURN <expr>` produces the
 value, coerced to the declared `RETURNS` type; it may run several statements, branch, loop, and
-recurse. Parameters are available by name and as `$1..$n`.
+recurse. In an expression the result behaves as a column of that type would: a `REAL` result
+meets an integer (`f() > 0`), a `CHAR(n)` result a text literal. Parameters are available by name and as `$1..$n`.
 
 ```sql
 CREATE FUNCTION with_tax(amount NUMERIC) RETURNS NUMERIC

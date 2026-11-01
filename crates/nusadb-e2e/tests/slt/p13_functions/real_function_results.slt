@@ -1,0 +1,83 @@
+# p13_functions/real_function_results: a function whose result is declared REAL (ts_rank,
+# ts_rank_cd, a NusaScript function RETURNS REAL) meets an integer or numeric operand the way a
+# REAL column or a ::REAL cast does, in comparisons, arithmetic, BETWEEN, IN, GREATEST, COALESCE,
+# WHERE and ORDER BY. The same holds for a function declared CHAR(n) beside a text literal.
+
+query T
+SELECT ts_rank(to_tsvector('english', 'cat cat dog'), to_tsquery('english', 'cat')) > 0
+----
+1
+
+query TTT
+SELECT ts_rank(to_tsvector('english', 'cat cat dog'), to_tsquery('english', 'cat')) = 0,
+       ts_rank(to_tsvector('english', 'cat cat dog'), to_tsquery('english', 'cat')) BETWEEN 0 AND 1,
+       0 < ts_rank(to_tsvector('english', 'cat'), to_tsquery('english', 'cat'))
+----
+0 1 1
+
+query TTT
+SELECT ts_rank(to_tsvector('english', 'cat cat dog'), to_tsquery('english', 'cat')) * 2 > 0,
+       ts_rank(to_tsvector('english', 'cat cat dog'), to_tsquery('english', 'cat')) + 1 > 1,
+       ts_rank_cd(to_tsvector('english', 'cat cat dog'), to_tsquery('english', 'cat')) > 0
+----
+1 1 1
+
+query TTT
+SELECT ts_rank(to_tsvector('english', 'cat'), to_tsquery('english', 'cat')) > 0.05,
+       ts_rank(to_tsvector('english', 'cat'), to_tsquery('english', 'cat')) > CAST(0 AS BIGINT),
+       ts_rank(to_tsvector('english', 'cat'), to_tsquery('english', 'cat')) IN (0, 1)
+----
+1 1 0
+
+query TT
+SELECT greatest(ts_rank(to_tsvector('english', 'cat'), to_tsquery('english', 'cat')), 0) > 0,
+       coalesce(ts_rank(to_tsvector('english', 'cat'), to_tsquery('english', 'cat')), 0) > 0
+----
+1 1
+
+statement ok
+CREATE TABLE notes (id INT, body TEXT)
+
+statement ok
+INSERT INTO notes VALUES (1, 'cat cat dog'), (2, 'dog only'), (3, 'cat')
+
+query I
+SELECT id FROM notes
+WHERE ts_rank(to_tsvector('english', body), to_tsquery('english', 'cat')) > 0
+ORDER BY ts_rank(to_tsvector('english', body), to_tsquery('english', 'cat')) * 2 DESC, id
+----
+1
+3
+
+query I
+SELECT id FROM notes
+WHERE ts_rank_cd(to_tsvector('english', body), to_tsquery('english', 'cat')) BETWEEN 0.05 AND 1
+ORDER BY id
+----
+1
+3
+
+# A NusaScript function declared REAL or CHAR(n).
+statement ok
+CREATE FUNCTION half_up() RETURNS REAL LANGUAGE nusascript AS $$
+BEGIN
+  RETURN 1.5;
+END
+$$
+
+query TRR
+SELECT half_up() > 0, half_up() * 2, half_up() + 1
+----
+1 3.000 2.500
+
+statement ok
+CREATE FUNCTION code5() RETURNS CHAR(5) LANGUAGE nusascript AS $$
+BEGIN
+  RETURN 'ab';
+END
+$$
+
+query T
+SELECT code5() = 'ab'
+----
+1
