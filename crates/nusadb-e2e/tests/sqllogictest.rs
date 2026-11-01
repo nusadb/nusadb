@@ -1360,3 +1360,8 @@ fn slt_p1_trigger_typed_row_refs() {
 fn slt_p5_generated_from_string_types() {
     run_slt("tests/slt/p5_advanced/generated_from_string_types.slt");
 }
+
+#[test]
+fn slt_p5_sequence_limits() {
+    run_slt("tests/slt/p5_advanced/sequence_limits.slt");
+}

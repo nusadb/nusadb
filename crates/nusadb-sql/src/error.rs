@@ -188,6 +188,18 @@ pub enum Error {
     #[error("{0}")]
     DatetimeOverflow(String),
 
+    /// A value lies outside the range its target accepts, with a message naming both: a number
+    /// that does not fit a column's declared precision, a `setval` target outside the sequence's
+    /// bounds. `22003`, as for an integer overflow, but carrying its own wording.
+    #[error("{0}")]
+    NumericOutOfRange(String),
+
+    /// `nextval` was called on a sequence that has handed out its last value and does not cycle.
+    /// `2200H` (`sequence_generator_limit_exceeded`): the sequence must be altered or restarted, the
+    /// statement itself was not malformed.
+    #[error("{0}")]
+    SequenceExhausted(String),
+
     // --- Analyzer -------------------------------------------------------
     /// A referenced table is not present in the catalog.
     #[error("table not found: {name}")]
@@ -625,7 +637,11 @@ impl Error {
             // Class 22 — data exception: a runtime value error, not an internal fault.
             Self::DivisionByZero => "22012", // division_by_zero
             // numeric_value_out_of_range — an overflow or a value outside a function's domain.
-            Self::IntegerOutOfRange | Self::ArgumentOutOfDomain(_) => "22003",
+            Self::IntegerOutOfRange | Self::ArgumentOutOfDomain(_) | Self::NumericOutOfRange(_) => {
+                "22003"
+            },
+            // sequence_generator_limit_exceeded: the sequence has no value left to hand out.
+            Self::SequenceExhausted(_) => "2200H",
             // A text value that does not parse as its target type: a bad date/time is
             // invalid_datetime_format (22007), everything else is invalid_text_representation (22P02).
             Self::InvalidValue { ty, .. } if is_datetime(*ty) => "22007",
@@ -751,6 +767,14 @@ mod tests {
             ),
             (Error::UnknownFunction("nosuchfn".to_owned()), "42883"),
             (Error::Raised("custom".to_owned()), "P0001"),
+            (
+                Error::SequenceExhausted("reached maximum value".to_owned()),
+                "2200H",
+            ),
+            (
+                Error::NumericOutOfRange("value is out of bounds".to_owned()),
+                "22003",
+            ),
         ];
         for (error, want) in cases {
             assert_eq!(

@@ -90,7 +90,28 @@ interval, an interval sum or product whose months, days or time no longer fit) i
 
 `SERIAL`, `BIGSERIAL`, `SMALLSERIAL` and the standard `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY`
 all create a column backed by its own sequence (`<table>_<column>_seq`). An omitted value takes the
-next number; the column is implicitly `NOT NULL`.
+next number; the column is implicitly `NOT NULL`. An identity column declared `SMALLINT` or `INT`
+takes values up to that type's maximum (32767 or 2147483647): past it, an omitted value is refused
+with `2200H` (`nextval: reached maximum value of sequence "t_id_seq" (2147483647)`) rather than a
+value the column cannot hold, and the sequence does not move. The bound follows the column's type,
+so `ALTER TABLE ... ALTER COLUMN id TYPE BIGINT` lifts it (the next row takes the next number) and
+a rolled-back `ALTER` leaves it in place. Narrowing the type is refused with `22023` while the
+sequence has already handed out a value the new type cannot hold. That holds for a `SERIAL` column
+too: once narrowed it stops at its new type's maximum like an identity column, so the change is
+refused at the `ALTER` rather than at the next insert. A sequence altered to `CYCLE` at a bound inside the type's range wraps there, in
+either direction; one whose bound lies past the type's range stops at the type's maximum or
+minimum instead (`2200H`). The increment and `CYCLE` this check uses are the sequence's recorded
+definition, the one `information_schema.sequences` shows, read only once the column's last value
+sits at an edge of the type's range. A sequence whose increment is larger than one can jump from
+inside the range past its edge: that draw is refused after it was taken, so its value is skipped.
+After a rolled-back `ALTER SEQUENCE` (see below) the recorded definition can differ from what the
+sequence does, and a value past the type's range is then also refused after it was drawn. The
+bound applies to values the column draws; a `nextval` called directly on the sequence is held only by the sequence's own
+`MAXVALUE`. `SERIAL`, `BIGSERIAL` and `SMALLSERIAL` columns all hold 64-bit values (see
+[`SERIAL` columns are `integer`](#serial-columns-are-integer)), and so do their sequences, so a
+`SMALLSERIAL` goes past 32767. A single identity sequence option in parentheses (`(START WITH 10)`,
+`(MAXVALUE 5)`) is accepted and ignored; two or more (`(START WITH 10 INCREMENT BY 5)`) are a
+syntax error (`42601`). Set them with `ALTER SEQUENCE` after the table is created.
 
 ```sql
 CREATE TABLE tickets (
@@ -1034,6 +1055,9 @@ transaction ends, another transaction creating a sequence of the same name is re
 widening `SMALLINT` to `INTEGER` or `BIGINT`, or `VARCHAR(10)` to `VARCHAR(50)` or `TEXT`, lifts
 the old bound. Narrowing checks the rows already there, and a value the new type cannot hold
 refuses the change (`22003` for an integer out of range, `22001` for a string that is too long).
+A column filled from a sequence (`SERIAL`, `BIGSERIAL`, `SMALLSERIAL` or identity) is also refused
+narrowing (`22023`) while its sequence has already handed out a value the new type cannot hold,
+since every later row would be refused; reset the sequence with `setval` first.
 
 `RENAME COLUMN` carries everything the table records under the column's name to the new name: its
 `DEFAULT` (including a `SERIAL` or identity sentinel; the backing sequence keeps its name), its
@@ -1257,9 +1281,23 @@ incrementally is refused rather than silently downgraded.
 `ALTER SEQUENCE` takes any mix of `INCREMENT [BY]`, `MINVALUE` / `NO MINVALUE`, `MAXVALUE` /
 `NO MAXVALUE`, `START [WITH]`, `RESTART [[WITH] n]`, `CACHE n` (accepted, no effect) and
 `CYCLE` / `NO CYCLE`, validates the merged definition, and `IF EXISTS` makes a missing sequence a
-no-op. `information_schema.sequences` lists every sequence with its bounds (a sequence created on
+no-op. The change takes effect at once and a rollback of its transaction does not undo it, although
+`information_schema.sequences` goes back to showing the old definition. `information_schema.sequences` lists every sequence with its bounds (a sequence created on
 an older release appears there after its first `ALTER SEQUENCE`). Sequence functions take the sequence name as a text literal and may only appear where they
-are evaluated exactly once: a `SELECT` without `FROM`, a `VALUES` row, or a column default.
+are evaluated exactly once: a `SELECT` without `FROM` or a `VALUES` row. A column `DEFAULT
+nextval('s')` is accepted when the table is created, but a row that takes that default is refused
+with `0A000`; use a `SERIAL` or identity column instead.
+
+A sequence without `CYCLE` that has handed out its last value refuses the next `nextval` with
+`2200H`, and so does every write that draws from it (an `INSERT`, `COPY`, `UPDATE ... SET col =
+DEFAULT`, `MERGE` or `ON CONFLICT` filling a `SERIAL` or identity column). The message names the
+sequence and the bound: `nextval: reached maximum value of sequence "invoice_no" (100000)`, or
+`minimum` for a descending one. Whether the sequence has run out is decided by the sequence
+itself; when its recorded definition does not match where it stopped, the message names the
+sequence without a bound (`nextval: reached the limit of sequence "invoice_no"`). The failed call
+does not move the sequence. With `CYCLE` it wraps to the opposite bound instead. `setval` with a value outside `MINVALUE .. MAXVALUE` is refused with
+`22003` (`setval: value 0 is out of bounds for sequence "invoice_no" (1..100000)`) and leaves the
+sequence where it was.
 
 `CREATE DOMAIN` accepts a base type and a `CHECK`; a `DEFAULT` or `COLLATE` on a domain is not
 accepted yet. A domain's `CHECK` follows the same [volatility](#volatility) rule as a table's.
@@ -2730,12 +2768,13 @@ on the message text.
 | `0A000` | feature not supported | the statement is recognised but not built; see [Not accepted](#not-accepted) |
 | `22001` | string too long for `VARCHAR(n)`, or a bit string too long for `BIT VARYING(n)` | shorten the value or widen the column |
 | `22026` | a bit string whose length does not match `BIT(n)` | give exactly `n` bits, or cast explicitly |
-| `22003` | numeric value out of range | integer overflow or a value outside a function's domain |
+| `22003` | numeric value out of range | integer overflow, a value outside a function's domain, or a `setval` outside the sequence's bounds |
 | `22007` | invalid date/time format | fix the literal |
 | `22008` | date/time value out of range | a timestamp, date or interval result past the representable range |
 | `22012` | division by zero | |
 | `22023` | invalid parameter value | for example a bad `SET` value |
 | `22P02` | invalid text representation | the text does not parse as the target type |
+| `2200H` | sequence generator limit exceeded | the sequence has handed out its last value: raise its `MAXVALUE` (or lower `MINVALUE`), `RESTART` it, or make it `CYCLE` |
 | `23502` | not-null violation | |
 | `23503` | foreign-key violation | |
 | `23505` | unique violation | |

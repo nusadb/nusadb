@@ -141,12 +141,110 @@ pub(super) enum ColumnFill {
     /// column, which rejects an explicit value (#9a).
     Serial {
         id: nusadb_core::SequenceId,
+        /// The backing sequence's name, for the error that reports it exhausted.
+        name: String,
+        /// What bounds each draw, resolved once per statement: the column's declared integer
+        /// range and the sequence's recorded definition.
+        limits: super::seqcatalog::DrawLimits,
         always: bool,
     },
     /// Evaluate this `GENERATED ALWAYS AS (<expr>) STORED` expression against the fully-populated row
     /// (it references the row's other columns), in a second pass after every other column is filled.
     /// Always applied; an explicit value for the column is rejected at INSERT/UPDATE.
     Generated(crate::planner::TypedExpr),
+}
+
+/// The value ranges of the integer types narrower than the 64-bit storage, exactly as their
+/// synthetic range checks spell them: `TINYINT`, `SMALLINT`, `MEDIUMINT` and `INT`.
+const NARROW_INTEGER_RANGES: [(i64, i64); 4] = [
+    (i8::MIN as i64, i8::MAX as i64),
+    (i16::MIN as i64, i16::MAX as i64),
+    (-(1 << 23), (1 << 23) - 1),
+    (i32::MIN as i64, i32::MAX as i64),
+];
+
+/// The range of `column`'s declared integer type when it is narrower than the 64-bit storage, read
+/// from the column's synthetic range check (`"col" BETWEEN lo AND hi`, which the declared type adds
+/// and `ALTER COLUMN ... TYPE` replaces or drops in the same transaction), or `None` when the column
+/// has no such check (`BIGINT`, and `SERIAL`, which is 64-bit). A check is taken for the type's only
+/// when its bounds are exactly one of the narrow integer ranges, so a user constraint that happens
+/// to carry the synthetic name is never read as the column's type.
+pub(super) fn declared_type_range(
+    table: &TableSchema,
+    column: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Option<(i64, i64)>, Error> {
+    let check_name = format!("{}{column}", crate::SYNTHETIC_TYPE_CHECK_PREFIX);
+    let int_literal = |expr: &ast::Expr| match expr {
+        ast::Expr::Literal(ast::Value::Int(v)) => Some(*v),
+        ast::Expr::Unary {
+            op: ast::UnaryOp::Negate,
+            expr,
+        } => match expr.as_ref() {
+            ast::Expr::Literal(ast::Value::Int(v)) => v.checked_neg(),
+            _ => None,
+        },
+        _ => None,
+    };
+    for constraint in engine.list_constraints_as_of(txn, table.id)? {
+        if constraint.name != check_name {
+            continue;
+        }
+        let Some(sql) = constraint
+            .expr
+            .as_deref()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        else {
+            continue;
+        };
+        if let Ok(ast::Expr::Between {
+            low,
+            high,
+            negated: false,
+            ..
+        }) = crate::parser::parse_expression(sql)
+            && let (Some(lo), Some(hi)) = (int_literal(&low), int_literal(&high))
+            && NARROW_INTEGER_RANGES.contains(&(lo, hi))
+        {
+            return Ok(Some((lo, hi)));
+        }
+    }
+    Ok(None)
+}
+
+/// Refuse to narrow `column` of `table` (already altered in this transaction) when its sequence has
+/// handed out a value the column's new type cannot hold: the next row would be refused anyway, and
+/// the sequence could only go on past the bound. `22023`, as for any sequence setting that leaves
+/// its current value outside its bounds. A column without a sequence, or a sequence that has handed
+/// out nothing yet, passes.
+pub(super) fn check_sequence_fits_type(
+    table: &TableSchema,
+    column: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let Some((_, type_max)) = declared_type_range(table, column, engine, txn)? else {
+        return Ok(());
+    };
+    let stored = load_defaults(&catalog_key(&table.schema, &table.name), engine, txn)?;
+    let Some(seq) = stored
+        .iter()
+        .find(|(col, _)| col == column)
+        .and_then(|(_, sql)| serial_sequence(sql))
+    else {
+        return Ok(());
+    };
+    let Some(id) = engine.lookup_sequence(seq)? else {
+        return Ok(());
+    };
+    match engine.sequence_current(id) {
+        Ok(current) if current > type_max => Err(Error::InvalidParameterValue(format!(
+            "sequence \"{seq}\" has already handed out {current}, more than the new type of \
+             column \"{column}\" holds (maximum {type_max})"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// The catalog row that records that every default in [`DEFAULT_CATALOG`] is filed under its
@@ -460,6 +558,11 @@ pub(super) fn column_fills(
             })?;
             ColumnFill::Serial {
                 id,
+                name: seq.to_owned(),
+                limits: super::seqcatalog::DrawLimits::resolve(
+                    declared_type_range(table, column.as_str(), engine, txn)?,
+                    txn,
+                ),
                 always: sql.starts_with(IDENTITY_ALWAYS_PREFIX),
             }
         } else {

@@ -1040,7 +1040,7 @@ fn eval_sequence_call(
         .lookup_sequence(&name)?
         .ok_or_else(|| Error::ObjectNotFound(format!("sequence \"{name}\" does not exist")))?;
     match func {
-        ast::ScalarFunc::SequenceNext => Ok(engine.sequence_next(id)?),
+        ast::ScalarFunc::SequenceNext => super::seqcatalog::next_value(engine, id, &name),
         ast::ScalarFunc::SequenceCurrent => Ok(engine.sequence_current(id)?),
         ast::ScalarFunc::SequenceSet => {
             let value = match args.get(1).map(|a| eval::eval(a, &empty)).transpose()? {
@@ -1082,6 +1082,7 @@ fn eval_sequence_call(
                     },
                 }
             }
+            super::seqcatalog::check_set_value(engine, &name, value)?;
             engine.sequence_set(id, value)?;
             Ok(value)
         },

@@ -663,9 +663,11 @@ fn apply_column_fills(
         }
         let value = match fill {
             Some(super::coldefault::ColumnFill::Expr(expr)) => eval::eval(expr, &empty_row)?,
-            Some(super::coldefault::ColumnFill::Serial { id, .. }) => {
-                ast::Value::Int(engine.sequence_next(*id)?)
-            },
+            Some(super::coldefault::ColumnFill::Serial {
+                id, name, limits, ..
+            }) => ast::Value::Int(super::seqcatalog::next_value_within(
+                engine, *id, name, limits,
+            )?),
             // No default/serial: the column stays NULL. A generated column is computed in pass 2
             // below, once the columns it references are populated.
             None | Some(super::coldefault::ColumnFill::Generated(_)) => continue,
@@ -2646,6 +2648,9 @@ pub(super) fn run_copy_from(
     // A column DEFAULT such as `now()` reads the statement clock, which COPY pins like any
     // statement (it runs outside `dispatch`).
     let _clock = super::clock::enter_statement(txn);
+    // Pin the transaction too, as `dispatch` does, so a sequence a column draws from can name its
+    // bound when it runs out.
+    let _exec_ctx = super::eval::bind_exec_context(engine, txn);
     // The load is one statement: the keys it writes under a unique key enforced across
     // partitions are checked once, when it ends.
     super::global_unique::new_statement();
@@ -7489,9 +7494,11 @@ fn apply_default_assignments(
     for assignment in assignments.iter().filter(|a| a.default) {
         let value = match defaults.get(assignment.column).and_then(Option::as_ref) {
             Some(super::coldefault::ColumnFill::Expr(expr)) => eval::eval(expr, &Vec::new())?,
-            Some(super::coldefault::ColumnFill::Serial { id, .. }) => {
-                ast::Value::Int(engine.sequence_next(*id)?)
-            },
+            Some(super::coldefault::ColumnFill::Serial {
+                id, name, limits, ..
+            }) => ast::Value::Int(super::seqcatalog::next_value_within(
+                engine, *id, name, limits,
+            )?),
             Some(super::coldefault::ColumnFill::Generated(_)) => continue,
             None => ast::Value::Null,
         };

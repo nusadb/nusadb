@@ -3496,6 +3496,10 @@ fn apply_column_op(
                 },
             )?;
             add_type_checks(table, &column, checks, engine, txn)?;
+            // A sequence-backed column follows its type: its sequence stops at the new type's
+            // maximum (read from the range check just added), so a narrower type is refused when
+            // the sequence has already gone past it.
+            super::coldefault::check_sequence_fits_type(table, &column, engine, txn)?;
             // The new type can make distinct values equal (`1.4` and `1.2` as `int`, `'ab'` and
             // `'ac'` as `char(1)`), so the exclusion constraints are checked again over the
             // rewritten rows (the caller holds the table and reads fresh): 23P01 refuses the change.

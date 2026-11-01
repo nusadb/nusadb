@@ -91,6 +91,13 @@ pub(crate) fn bind_exec_context(engine: &dyn StorageEngine, txn: TxnId) -> ExecC
     ExecContextGuard(prev)
 }
 
+/// The transaction of the statement executing on this thread, as pinned by [`bind_exec_context`],
+/// or `None` outside statement execution. Lets a path that is handed only the engine (a sequence
+/// call resolved inside an expression) read the catalog under the statement's own snapshot.
+pub(crate) fn exec_txn() -> Option<TxnId> {
+    EXEC_CONTEXT.with(Cell::get).map(|ctx| ctx.txn)
+}
+
 /// Restores the execution context pinned by [`bind_exec_context`] on drop.
 pub(crate) struct ExecContextGuard(Option<ExecContext>);
 
