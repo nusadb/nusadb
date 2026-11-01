@@ -1849,6 +1849,16 @@ DROP PROCEDURE countdown;
 `CALL loud(-1)` on a body without a handler reports `P0001: raised exception: negative input` and
 the caller's statement fails.
 
+A routine body (a procedure, a `DO` block, a NusaScript function or a trigger function) runs in the
+transaction of the statement that invoked it, so it cannot end or nest that transaction: `COMMIT`,
+`ROLLBACK`, `BEGIN` / `START TRANSACTION`, `SAVEPOINT`, `RELEASE SAVEPOINT`, `ROLLBACK TO
+SAVEPOINT` and the two-phase commands are refused with `0A000` when the body reaches them. So are
+the statements that work on the connection's own state: `SET`, `SHOW`, `PREPARE`, `EXECUTE`,
+`DEALLOCATE` and the cursor statements. The invoking statement fails as a whole, so nothing the body
+wrote before the refusal is kept, and inside a transaction block it counts as any other failed
+statement there. An `EXCEPTION WHEN OTHERS` handler catches the refusal like any other error. Commit or
+roll back after the `CALL`, from the client.
+
 NusaScript statements: `DECLARE name TYPE [DEFAULT expr]`, `SET name = expr` (or `name := expr`),
 `IF ... THEN ... [ELSIF ...] [ELSE ...] END IF`, `WHILE cond LOOP ... END LOOP`,
 `FOR i IN low TO high LOOP ... END LOOP`, `RAISE 'message'` (reported as `P0001`), `RETURN`,
@@ -2765,7 +2775,7 @@ on the message text.
 
 | Code | Meaning | What to do |
 | --- | --- | --- |
-| `0A000` | feature not supported | the statement is recognised but not built; see [Not accepted](#not-accepted) |
+| `0A000` | feature not supported | the statement is recognised but not built; see [Not accepted](#not-accepted). Also `COMMIT`, `ROLLBACK`, a savepoint or a connection statement inside a procedure, function, trigger or `DO` block |
 | `22001` | string too long for `VARCHAR(n)`, or a bit string too long for `BIT VARYING(n)` | shorten the value or widen the column |
 | `22026` | a bit string whose length does not match `BIT(n)` | give exactly `n` bits, or cast explicitly |
 | `22003` | numeric value out of range | integer overflow, a value outside a function's domain, or a `setval` outside the sequence's bounds |

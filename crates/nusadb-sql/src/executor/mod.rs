@@ -3087,6 +3087,62 @@ fn dispatch(
     outcome
 }
 
+/// Run one statement of a routine body: a procedure, a `DO` block, a NusaScript function or a
+/// trigger. A routine runs inside the transaction of the statement that invoked it and has no
+/// session of its own, so a statement that ends or nests that transaction, or reads or changes
+/// per-connection state, is refused with `0A000` before anything runs. The statement that invoked
+/// the routine then fails as a whole, so none of the body's earlier writes survive it.
+pub(super) fn dispatch_routine_statement(
+    plan: PhysicalPlan,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<ExecutionResult, Error> {
+    if let Some(refusal) = routine_refusal(&plan) {
+        return Err(Error::Unsupported(refusal));
+    }
+    dispatch(plan, engine, txn)
+}
+
+/// Why `plan` cannot run inside a routine body, or `None` when it can.
+fn routine_refusal(plan: &PhysicalPlan) -> Option<String> {
+    let transaction_control = match plan {
+        PhysicalPlan::BeginTransaction(_) => "BEGIN",
+        PhysicalPlan::Commit => "COMMIT",
+        PhysicalPlan::Rollback => "ROLLBACK",
+        PhysicalPlan::PrepareTransaction(_) => "PREPARE TRANSACTION",
+        PhysicalPlan::CommitPrepared(_) => "COMMIT PREPARED",
+        PhysicalPlan::RollbackPrepared(_) => "ROLLBACK PREPARED",
+        PhysicalPlan::SetTransaction(_) => "SET TRANSACTION",
+        PhysicalPlan::SetSessionCharacteristics(_) => "SET SESSION CHARACTERISTICS",
+        PhysicalPlan::Savepoint(_) => "SAVEPOINT",
+        PhysicalPlan::RollbackToSavepoint(_) => "ROLLBACK TO SAVEPOINT",
+        PhysicalPlan::ReleaseSavepoint(_) => "RELEASE SAVEPOINT",
+        _ => {
+            let session_state = match plan {
+                PhysicalPlan::SetVariable { .. } => "SET",
+                PhysicalPlan::ShowVariable(_) => "SHOW",
+                PhysicalPlan::Prepare { .. } => "PREPARE",
+                PhysicalPlan::Execute { .. } => "EXECUTE",
+                PhysicalPlan::Deallocate(_) => "DEALLOCATE",
+                PhysicalPlan::DeclareCursor { .. } => "DECLARE CURSOR",
+                PhysicalPlan::FetchCursor { is_move: true, .. } => "MOVE",
+                PhysicalPlan::FetchCursor { .. } => "FETCH",
+                PhysicalPlan::CloseCursor(_) => "CLOSE",
+                _ => return None,
+            };
+            return Some(format!(
+                "{session_state} inside a procedure, function, trigger or DO block; it works on \
+                 the connection's own state, which a routine body does not have"
+            ));
+        },
+    };
+    Some(format!(
+        "{transaction_control} inside a procedure, function, trigger or DO block; a routine runs \
+         in the transaction of the statement that called it, so end or nest that transaction \
+         outside the routine"
+    ))
+}
+
 /// The body of [`dispatch`]: run one plan.
 #[allow(
     clippy::too_many_lines,

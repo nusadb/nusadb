@@ -1365,3 +1365,8 @@ fn slt_p5_generated_from_string_types() {
 fn slt_p5_sequence_limits() {
     run_slt("tests/slt/p5_advanced/sequence_limits.slt");
 }
+
+#[test]
+fn slt_p12_routine_transaction_control() {
+    run_slt("tests/slt/p12_txn/routine_transaction_control.slt");
+}

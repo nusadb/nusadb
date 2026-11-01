@@ -412,7 +412,7 @@ fn exec_one(
         ScriptStmt::Sql(sql) => {
             let bound = bind((**sql).clone(), env, params, engine, txn)?;
             let logical = crate::analyze(bound, &ExecCatalog::new(engine, txn))?;
-            super::dispatch(crate::plan(logical), engine, txn)?;
+            super::dispatch_routine_statement(crate::plan(logical), engine, txn)?;
             Ok(Flow::Normal)
         },
         ScriptStmt::SelectInto {

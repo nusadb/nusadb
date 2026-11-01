@@ -1130,7 +1130,7 @@ fn fire_one(
     let mut stmt = crate::parse(&trig.action)?;
     substitute_row_refs(&mut stmt, &refs)?;
     let logical = crate::analyze(stmt, &ExecCatalog::new(engine, txn))?;
-    super::dispatch(crate::plan(logical), engine, txn)?;
+    super::dispatch_routine_statement(crate::plan(logical), engine, txn)?;
     Ok(Fired::Proceed)
 }
 

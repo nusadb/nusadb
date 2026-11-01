@@ -156,7 +156,7 @@ pub(super) fn run_call(
         for stmt in crate::parser::parse_statements(&proc.body)? {
             let bound = crate::params::substitute_values(stmt, &plan.args)?;
             let logical = crate::analyze(bound, &ExecCatalog::new(engine, txn))?;
-            super::dispatch(crate::plan(logical), engine, txn)?;
+            super::dispatch_routine_statement(crate::plan(logical), engine, txn)?;
         }
         let values = vec![ast::Value::Null; proc.out_params.len()];
         Ok(call_result(proc.out_params, values))
@@ -178,7 +178,7 @@ pub(super) fn run_do(
     } else {
         for stmt in crate::parser::parse_statements(body)? {
             let logical = crate::analyze(stmt, &ExecCatalog::new(engine, txn))?;
-            super::dispatch(crate::plan(logical), engine, txn)?;
+            super::dispatch_routine_statement(crate::plan(logical), engine, txn)?;
         }
     }
     Ok(ExecutionResult::ProcedureCalled)

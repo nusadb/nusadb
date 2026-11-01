@@ -1,0 +1,128 @@
+# p12_txn/routine_transaction_control: COMMIT, ROLLBACK and the other statements that need the
+# connection's own state are refused inside a routine body.
+#
+# A procedure, DO block, NusaScript function or trigger runs in the transaction of the statement
+# that invoked it, so it cannot end or nest that transaction. The statement fails as a whole, and
+# nothing the body wrote before the refusal is kept. The SQLSTATE (0A000) is asserted in
+# tests/routine_transaction_control.rs.
+
+statement ok
+CREATE TABLE rt (v INT)
+
+statement ok
+CREATE PROCEDURE rt_commit() AS $$
+BEGIN
+  INSERT INTO rt VALUES (1);
+  COMMIT;
+  INSERT INTO rt VALUES (2);
+  ROLLBACK;
+END
+$$
+
+statement error COMMIT inside a procedure, function, trigger or DO block
+CALL rt_commit()
+
+query I
+SELECT count(*) FROM rt
+----
+0
+
+# A plain statement list in a DO block is refused the same way.
+statement error ROLLBACK inside a procedure, function, trigger or DO block
+DO $$ INSERT INTO rt VALUES (3); ROLLBACK; $$
+
+statement error SAVEPOINT inside a procedure, function, trigger or DO block
+DO $$ SAVEPOINT a; $$
+
+statement error RELEASE SAVEPOINT inside a procedure, function, trigger or DO block
+DO $$ BEGIN RELEASE SAVEPOINT a; END $$
+
+statement error ROLLBACK TO SAVEPOINT inside a procedure, function, trigger or DO block
+DO $$ BEGIN ROLLBACK TO SAVEPOINT a; END $$
+
+statement error BEGIN inside a procedure, function, trigger or DO block
+DO $$ BEGIN START TRANSACTION; END $$
+
+# A NusaScript function, reached from an expression.
+statement ok
+CREATE FUNCTION rt_fn() RETURNS INT LANGUAGE nusascript AS $$
+BEGIN
+  INSERT INTO rt VALUES (4);
+  COMMIT;
+  RETURN 1;
+END
+$$
+
+statement error COMMIT inside a procedure, function, trigger or DO block
+SELECT rt_fn()
+
+# A trigger function.
+statement ok
+CREATE TABLE rt_src (v INT)
+
+statement ok
+CREATE FUNCTION rt_trg() RETURNS trigger LANGUAGE nusascript AS $$
+BEGIN
+  INSERT INTO rt VALUES (NEW.v);
+  ROLLBACK;
+  RETURN NEW;
+END
+$$
+
+statement ok
+CREATE TRIGGER rt_on_insert AFTER INSERT ON rt_src FOR EACH ROW EXECUTE FUNCTION rt_trg()
+
+statement error ROLLBACK inside a procedure, function, trigger or DO block
+INSERT INTO rt_src VALUES (5)
+
+query II
+SELECT (SELECT count(*) FROM rt), (SELECT count(*) FROM rt_src)
+----
+0 0
+
+# Statements that work on the connection's own state are refused too.
+statement error SET inside a procedure, function, trigger or DO block
+DO $$ SET search_path = public; $$
+
+statement error SHOW inside a procedure, function, trigger or DO block
+DO $$ BEGIN SHOW search_path; END $$
+
+statement error PREPARE inside a procedure, function, trigger or DO block
+DO $$ BEGIN PREPARE q AS SELECT 1; END $$
+
+statement error FETCH inside a procedure, function, trigger or DO block
+DO $$ BEGIN FETCH NEXT FROM c; END $$
+
+# Inside a transaction block, the refused CALL leaves the block open with the caller's own writes.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO rt VALUES (100)
+
+statement error COMMIT inside a procedure, function, trigger or DO block
+CALL rt_commit()
+
+statement ok
+ROLLBACK
+
+query I
+SELECT count(*) FROM rt
+----
+0
+
+# An EXCEPTION handler catches the refusal like any other error and runs in place of the body.
+statement ok
+DO $$
+BEGIN
+  INSERT INTO rt VALUES (9);
+  COMMIT;
+EXCEPTION WHEN OTHERS THEN
+  INSERT INTO rt VALUES (10);
+END
+$$
+
+query I
+SELECT v FROM rt
+----
+10
