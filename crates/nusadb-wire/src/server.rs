@@ -9,6 +9,7 @@
 //! Auth is currently trust-on-startup; the SCRAM-SHA-256 handshake ([`auth`](crate::auth)) and
 //! TLS upgrade ([`tls`](crate::tls)) slot in before `AuthOk` in a later batch.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
@@ -1004,12 +1005,12 @@ where
                             "current transaction is aborted, commands ignored until end of \
                              transaction block"
                                 .to_owned(),
-                            "25P02",
+                            "25P02".into(),
                         ))
                     } else if let Some(msg) = gate {
                         // The COPY access gate refuses on privilege / RLS / reserved-namespace
                         // grounds — an access-control refusal (`42501`), not an engine fault.
-                        Err((msg, "42501"))
+                        Err((msg, "42501".into()))
                     } else {
                         match copy.direction {
                             nusadb_sql::ast::CopyDirection::From => {
@@ -1066,7 +1067,7 @@ where
                                 .await?;
                         },
                         Err((message, code)) => {
-                            conn.write_frame(&error_response_coded(&message, code).encode()?)
+                            conn.write_frame(&error_response_coded(&message, &code).encode()?)
                                 .await?;
                         },
                     }
@@ -1304,7 +1305,7 @@ where
                             conn.write_frame(&msg.encode()?).await?;
                         },
                         Err((msg, code)) => {
-                            fail_coded(&mut conn, &mut failed, &msg, code).await?;
+                            fail_coded(&mut conn, &mut failed, &msg, &code).await?;
                         },
                     },
                 }
@@ -1473,7 +1474,7 @@ where
                         if !already_executed && let Some(m) = &metrics {
                             m.query(false);
                         }
-                        fail_coded(&mut conn, &mut failed, &msg, code).await?;
+                        fail_coded(&mut conn, &mut failed, &msg, &code).await?;
                     },
                 }
             },
@@ -1810,7 +1811,7 @@ async fn handle_copy_in<S>(
     timezone: Option<String>,
     open_block: Option<(TxnId, i64)>,
     in_flight: &InFlight,
-) -> io::Result<Result<usize, (String, &'static str)>>
+) -> io::Result<Result<usize, Failure>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1831,7 +1832,7 @@ where
         let Some(frame) = read_next(conn, idle_timeout, shutdown).await? else {
             return Ok(Err((
                 "connection closed during COPY FROM".to_owned(),
-                "08006", // connection_failure
+                "08006".into(), // connection_failure
             )));
         };
         match FrontendMessage::decode(&frame).map_err(io::Error::other)? {
@@ -1851,14 +1852,14 @@ where
             FrontendMessage::CopyFail { message } => {
                 return Ok(Err((
                     format!("COPY aborted by client: {message}"),
-                    "57014", // query_canceled — the client asked to stop
+                    "57014".into(), // query_canceled — the client asked to stop
                 )));
             },
             // Any other message mid-copy is a protocol violation; abort the load.
             _ => {
                 return Ok(Err((
                     "unexpected message during COPY FROM".to_owned(),
-                    "08P01", // protocol_violation
+                    "08P01".into(), // protocol_violation
                 )));
             },
         }
@@ -1870,7 +1871,7 @@ where
                 "COPY data exceeds the {}-byte limit",
                 max_bytes.unwrap_or(0)
             ),
-            "53400", // configuration_limit_exceeded
+            "53400".into(), // configuration_limit_exceeded
         )));
     }
 
@@ -1903,7 +1904,7 @@ where
             if owned {
                 let _ = deferred::rollback(&*engine, txn);
             }
-            return Err((msg, "42501")); // access-control refusal
+            return Err((msg, "42501".into())); // access-control refusal
         }
         // A load failure — a value the column type rejects (`22P02`), a duplicate key (`23505`),
         // and so on — carries its own SQLSTATE, so the client sees the real class rather than the
@@ -1914,19 +1915,19 @@ where
                 Ok(()) => Ok(count),
                 Err(e) => {
                     let _ = deferred::rollback(&*engine, txn);
-                    Err((e.to_string(), e.sqlstate()))
+                    Err((e.to_string(), e.code()))
                 },
             },
             Err(e) => {
                 if owned {
                     let _ = deferred::rollback(&*engine, txn);
                 }
-                Err((e.to_string(), e.sqlstate()))
+                Err((e.to_string(), e.code()))
             },
         }
     })
     .await
-    .unwrap_or_else(|_join| Err(("internal execution error".to_owned(), INTERNAL_ERROR)));
+    .unwrap_or_else(|_join| Err(("internal execution error".to_owned(), INTERNAL_ERROR.into())));
     Ok(result)
 }
 
@@ -1972,7 +1973,7 @@ async fn copy_in_column_count(
 fn copy_transaction(
     engine: &dyn StorageEngine,
     open_txn: Option<TxnId>,
-) -> Result<(TxnId, bool), (String, &'static str)> {
+) -> Result<(TxnId, bool), Failure> {
     open_txn
         .map_or_else(
             || {
@@ -1985,7 +1986,7 @@ fn copy_transaction(
                 engine.begin_statement(txn).map(|()| (txn, false))
             },
         )
-        .map_err(|e| (e.to_string(), e.sqlstate()))
+        .map_err(|e| (e.to_string(), e.sqlstate().into()))
 }
 
 /// Drive the `COPY ... TO STDOUT` sub-protocol: render the rows, then stream them as
@@ -1999,7 +2000,7 @@ async fn handle_copy_out<S>(
     timezone: Option<String>,
     open_block: Option<(TxnId, i64)>,
     in_flight: &InFlight,
-) -> io::Result<Result<usize, (String, &'static str)>>
+) -> io::Result<Result<usize, Failure>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -2036,17 +2037,17 @@ where
             if owned {
                 let _ = deferred::rollback(&*engine, txn);
             }
-            return Err((msg, "42501")); // access-control refusal
+            return Err((msg, "42501".into())); // access-control refusal
         }
         let out = nusadb_sql::copy_to_bytes_with_columns_in(engine.as_ref(), &copy, &actor, txn)
-            .map_err(|e| (e.to_string(), e.sqlstate()));
+            .map_err(|e| (e.to_string(), e.code()));
         if owned {
             let _ = deferred::rollback(&*engine, txn); // read-only: nothing to commit
         }
         out
     })
     .await
-    .unwrap_or_else(|_join| Err(("internal execution error".to_owned(), INTERNAL_ERROR)));
+    .unwrap_or_else(|_join| Err(("internal execution error".to_owned(), INTERNAL_ERROR.into())));
 
     let (count, columns, payload) = match rendered {
         Ok(out) => out,
@@ -2181,7 +2182,7 @@ async fn run_blocking(
     stores: &SessionStores,
     notices: bool,
 ) -> (
-    Result<ExecutionResult, (String, &'static str)>,
+    Result<ExecutionResult, Failure>,
     TxnState,
     Vec<BackendMessage>,
 ) {
@@ -2219,7 +2220,7 @@ async fn run_blocking(
             &stores,
         );
         (
-            outcome.map_err(|e| (e.to_string(), e.sqlstate())),
+            outcome.map_err(|e| (e.to_string(), e.code())),
             new_state,
             notice_messages(notices),
         )
@@ -2232,7 +2233,7 @@ async fn run_blocking(
         // The statement panicked. Whatever it did in an open block is not to be committed, so the
         // block is aborted, as after any failed statement.
         (
-            Err(("internal execution error".to_owned(), INTERNAL_ERROR)),
+            Err(("internal execution error".to_owned(), INTERNAL_ERROR.into())),
             state.aborted(),
             Vec::new(),
         )
@@ -2274,7 +2275,7 @@ async fn describe_portal(
     acting_user: &str,
     settings: &HashMap<String, String>,
     state: TxnState,
-) -> Result<(Vec<String>, Vec<nusadb_core::ColumnType>), (String, &'static str)> {
+) -> Result<(Vec<String>, Vec<nusadb_core::ColumnType>), Failure> {
     let (sql, params) = match portals.get(name) {
         // A portal already executed (its rows are cached) reuses the executed column names. Types are
         // not cached, so a Describe after Execute falls back to the untyped form (empty type list).
@@ -2284,7 +2285,10 @@ async fn describe_portal(
         },
         // A protocol-level client mistake, not an engine fault — see `INVALID_CURSOR_NAME`.
         None => {
-            return Err((format!("unknown portal {name:?}"), INVALID_CURSOR_NAME));
+            return Err((
+                format!("unknown portal {name:?}"),
+                INVALID_CURSOR_NAME.into(),
+            ));
         },
     };
     let engine = Arc::clone(engine);
@@ -2354,8 +2358,8 @@ async fn describe_portal(
     .map_or_else(
         // The worker panicked: name the internal class outright rather than borrowing it from
         // whatever `Unsupported` happens to map to, which is due to change.
-        |_join| Err(("internal error".to_owned(), INTERNAL_ERROR)),
-        |result| result.map_err(|e: nusadb_sql::Error| (e.to_string(), e.sqlstate())),
+        |_join| Err(("internal error".to_owned(), INTERNAL_ERROR.into())),
+        |result| result.map_err(|e: nusadb_sql::Error| (e.to_string(), e.code())),
     )
 }
 
@@ -2379,11 +2383,7 @@ async fn ensure_executed(
     settings: &Arc<std::sync::Mutex<HashMap<String, String>>>,
     stores: &SessionStores,
     notices: bool,
-) -> (
-    Result<Vec<String>, (String, &'static str)>,
-    TxnState,
-    Vec<BackendMessage>,
-) {
+) -> (Result<Vec<String>, Failure>, TxnState, Vec<BackendMessage>) {
     let job = match portals.get(name) {
         Some(p) if p.result.is_none() => {
             Some((p.sql.clone(), p.params.clone(), p.result_formats.clone()))
@@ -2391,7 +2391,10 @@ async fn ensure_executed(
         Some(_) => None, // already executed
         None => {
             return (
-                Err((format!("unknown portal {name:?}"), INVALID_CURSOR_NAME)),
+                Err((
+                    format!("unknown portal {name:?}"),
+                    INVALID_CURSOR_NAME.into(),
+                )),
                 state,
                 Vec::new(),
             );
@@ -2798,7 +2801,7 @@ const fn type_tag_for(ty: nusadb_core::ColumnType, array_elements: bool) -> u8 {
 /// tail (see [`ChannelSink::into_tail`]), the connection's next transaction state, and the
 /// moved-back plan cache.
 type StreamedOutcome = (
-    Result<String, (String, &'static str)>,
+    Result<String, Failure>,
     Vec<BackendMessage>,
     TxnState,
     nusadb_sql::PlanCache,
@@ -3045,7 +3048,7 @@ fn run_statement_streaming(
         return StreamedRun::Done((
             result
                 .map(|r| command_tag(&r))
-                .map_err(|e| (e.to_string(), e.sqlstate())),
+                .map_err(|e| (e.to_string(), e.code())),
             Vec::new(),
             state,
             plan_cache,
@@ -3123,7 +3126,7 @@ fn run_statement_streaming(
         return StreamedRun::Done((
             result
                 .map(|r| command_tag(&r))
-                .map_err(|e| (e.to_string(), e.sqlstate())),
+                .map_err(|e| (e.to_string(), e.code())),
             Vec::new(),
             new_state,
             plan_cache,
@@ -3136,7 +3139,7 @@ fn run_statement_streaming(
             return StreamedRun::Done((
                 result
                     .map(|r| command_tag(&r))
-                    .map_err(|e| (e.to_string(), e.sqlstate())),
+                    .map_err(|e| (e.to_string(), e.code())),
                 Vec::new(),
                 state,
                 plan_cache,
@@ -3192,7 +3195,7 @@ fn run_statement_streaming(
     StreamedRun::Done((
         outcome
             .map(|o| stream_command_tag(&o))
-            .map_err(|e| (e.to_string(), e.sqlstate())),
+            .map_err(|e| (e.to_string(), e.code())),
         sink.into_tail(),
         new_state,
         plan_cache,
@@ -3208,7 +3211,7 @@ fn run_show_streaming(
     tx: SinkTx,
     typed: bool,
     array_elements: bool,
-) -> (Result<String, (String, &'static str)>, Vec<BackendMessage>) {
+) -> (Result<String, Failure>, Vec<BackendMessage>) {
     let mut snapshot = settings.lock().map(|s| s.clone()).unwrap_or_default();
     stamp_transaction_state(&mut snapshot, state);
     let mut sink = ChannelSink {
@@ -3222,7 +3225,7 @@ fn run_show_streaming(
     (
         pushed
             .map(|()| "SHOW".to_owned())
-            .map_err(|e| (e.to_string(), e.sqlstate())),
+            .map_err(|e| (e.to_string(), e.code())),
         sink.into_tail(),
     )
 }
@@ -3638,7 +3641,7 @@ where
     let stmt = match parse(&sql).and_then(|s| params.bind(s)) {
         Ok(stmt) => stmt,
         Err(e) => {
-            conn.write_frame(&error_response_coded(&e.to_string(), e.sqlstate()).encode()?)
+            conn.write_frame(&error_response_coded(&e.to_string(), &e.code()).encode()?)
                 .await?;
             return Ok((false, state, plan_cache));
         },
@@ -3712,7 +3715,7 @@ where
                 *txn_state = state.aborted();
                 let ok = write_statement_outcome(
                     conn,
-                    Err(("internal execution error".to_owned(), INTERNAL_ERROR)),
+                    Err(("internal execution error".to_owned(), INTERNAL_ERROR.into())),
                     Vec::new(),
                     suppress_row_description,
                 )
@@ -3742,7 +3745,7 @@ where
                         Ok(stmt) => stmt,
                         Err(e) => {
                             conn.write_frame(
-                                &error_response_coded(&e.to_string(), e.sqlstate()).encode()?,
+                                &error_response_coded(&e.to_string(), &e.code()).encode()?,
                             )
                             .await?;
                             return Ok((false, state, plan_cache));
@@ -3797,7 +3800,7 @@ where
             StreamedRun::Punt(plan_cache) => (
                 Err((
                     "internal: the pool path cannot punt".to_owned(),
-                    nusadb_sql::INTERNAL_ERROR,
+                    nusadb_sql::INTERNAL_ERROR.into(),
                 )),
                 Vec::new(),
                 state,
@@ -3845,7 +3848,7 @@ where
         // (cold but correct). The statement may have done part of its work in an open block, which
         // must not be committed, so the block is aborted as after any failed statement.
         (
-            Err(("internal execution error".to_owned(), INTERNAL_ERROR)),
+            Err(("internal execution error".to_owned(), INTERNAL_ERROR.into())),
             Vec::new(),
             state.aborted(),
             nusadb_sql::PlanCache::new(),
@@ -3868,7 +3871,7 @@ where
 /// the blocking-pool path and the reactor-inline path.
 async fn write_statement_outcome<S>(
     conn: &mut Connection<S>,
-    outcome: Result<String, (String, &'static str)>,
+    outcome: Result<String, Failure>,
     tail: Vec<BackendMessage>,
     // The portal path suppresses `RowDescription` in the buffered tail too (see the reactor loop).
     suppress_row_description: bool,
@@ -3893,7 +3896,7 @@ where
             Ok(true)
         },
         Err((message, code)) => {
-            conn.write_frame(&error_response_coded(&message, code).encode()?)
+            conn.write_frame(&error_response_coded(&message, &code).encode()?)
                 .await?;
             Ok(false)
         },
@@ -6171,7 +6174,7 @@ where
         if let Err(e) = parse(piece) {
             batch
                 .conn
-                .write_frame(&error_response_coded(&e.to_string(), e.sqlstate()).encode()?)
+                .write_frame(&error_response_coded(&e.to_string(), &e.code()).encode()?)
                 .await?;
             return Ok(());
         }
@@ -6218,7 +6221,7 @@ where
                 let e = needs_block(control.as_ref());
                 batch
                     .conn
-                    .write_frame(&error_response_coded(&e.to_string(), e.sqlstate()).encode()?)
+                    .write_frame(&error_response_coded(&e.to_string(), &e.code()).encode()?)
                     .await?;
                 false
             },
@@ -6299,7 +6302,7 @@ where
     if let Err(e) = result {
         batch
             .conn
-            .write_frame(&error_response_coded(&e.to_string(), e.sqlstate()).encode()?)
+            .write_frame(&error_response_coded(&e.to_string(), &e.code()).encode()?)
             .await?;
         return Ok(false);
     }
@@ -6374,7 +6377,7 @@ where
     if let Err(e) = result {
         batch
             .conn
-            .write_frame(&error_response_coded(&e.to_string(), e.sqlstate()).encode()?)
+            .write_frame(&error_response_coded(&e.to_string(), &e.code()).encode()?)
             .await?;
     }
     Ok(())
@@ -6634,6 +6637,10 @@ fn command_complete(tag: &str) -> BackendMessage {
         tag: tag.to_owned(),
     }
 }
+
+/// A failed statement as its client is told it: the message and the SQLSTATE. The code is owned
+/// when it is one a NusaScript `RAISE` named, which is not known for the life of the program.
+type Failure = (String, Cow<'static, str>);
 
 fn error_response(message: &str) -> BackendMessage {
     // The internal-error class. Use `error_response_coded` for an error whose SQLSTATE the engine

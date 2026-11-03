@@ -1,0 +1,75 @@
+# NusaScript RAISE naming its condition. The SQLSTATE each one carries is checked in
+# tests/raise_conditions.rs; this file checks the surface and the messages.
+
+statement ok
+CREATE FUNCTION spend(n INT) RETURNS INT LANGUAGE nusascript AS $$ BEGIN IF n > 100 THEN RAISE 'quota % exceeded', n USING ERRCODE = 'MA001', HINT = 'ask for more'; END IF; RETURN n; END $$
+
+query I
+SELECT spend(5)
+----
+5
+
+statement error raised exception: quota 101 exceeded
+SELECT spend(101)
+
+statement ok
+CREATE FUNCTION by_name() RETURNS INT LANGUAGE nusascript AS $$ BEGIN RAISE unique_violation; END $$
+
+statement error raised exception: unique_violation
+SELECT by_name()
+
+statement ok
+CREATE FUNCTION by_code() RETURNS INT LANGUAGE nusascript AS $$ BEGIN RAISE SQLSTATE '22023' USING MESSAGE = 'bad value'; END $$
+
+statement error raised exception: bad value
+SELECT by_code()
+
+# A written SQLSTATE, a condition after a level and an option name are checked when the function
+# is created.
+
+statement error invalid SQLSTATE code 'MA00'
+CREATE FUNCTION bad1() RETURNS INT LANGUAGE nusascript AS $$ BEGIN RAISE SQLSTATE 'MA00'; END $$
+
+statement error unrecognized exception condition "no_such_condition"
+CREATE FUNCTION bad2() RETURNS INT LANGUAGE nusascript AS $$ BEGIN RAISE EXCEPTION no_such_condition; END $$
+
+statement error unrecognized RAISE statement option "foo"
+CREATE FUNCTION bad3() RETURNS INT LANGUAGE nusascript AS $$ BEGIN RAISE 'x' USING foo = 'y'; END $$
+
+# An ERRCODE is an expression, so it is checked when the RAISE runs.
+
+statement ok
+CREATE FUNCTION lower_code() RETURNS INT LANGUAGE nusascript AS $$ BEGIN RAISE 'x' USING ERRCODE = 'ma001'; END $$
+
+statement error unrecognized exception condition "ma001"
+SELECT lower_code()
+
+statement ok
+CREATE FUNCTION twice() RETURNS INT LANGUAGE nusascript AS $$ BEGIN RAISE 'x' USING MESSAGE = 'y'; END $$
+
+statement error RAISE option already specified: MESSAGE
+SELECT twice()
+
+statement ok
+CREATE FUNCTION null_hint() RETURNS INT LANGUAGE nusascript AS $$ BEGIN RAISE 'x' USING HINT = NULL; END $$
+
+statement error RAISE statement option cannot be null
+SELECT null_hint()
+
+# WHEN OTHERS catches a named condition like any other.
+
+statement ok
+CREATE FUNCTION caught() RETURNS TEXT LANGUAGE nusascript AS $$ BEGIN BEGIN RAISE 'q' USING ERRCODE = 'MA001'; EXCEPTION WHEN OTHERS THEN RETURN 'caught'; END; RETURN 'not reached'; END $$
+
+query T
+SELECT caught()
+----
+caught
+
+# A plain RAISE keeps its message, the text as written.
+
+statement ok
+CREATE FUNCTION plain() RETURNS INT LANGUAGE nusascript AS $$ BEGIN RAISE '50%% off'; END $$
+
+statement error raised exception: 50%% off
+SELECT plain()

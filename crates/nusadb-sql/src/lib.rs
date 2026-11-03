@@ -41,6 +41,7 @@ pub mod planner;
 pub mod range;
 pub mod rbac;
 pub mod retry;
+pub(crate) mod sqlstate;
 pub mod temporal;
 pub mod two_phase;
 pub mod udf;

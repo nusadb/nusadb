@@ -53,7 +53,8 @@ use dml::*;
 use expr::*;
 use query::*;
 pub(crate) use script::{
-    RaiseLevel, ScriptBlock, ScriptStmt, TriggerReturn, is_script, parse_script,
+    RaiseLevel, RaiseOption, RaiseSpec, RaiseText, ScriptBlock, ScriptStmt, TriggerReturn,
+    is_script, parse_script,
 };
 use select::*;
 

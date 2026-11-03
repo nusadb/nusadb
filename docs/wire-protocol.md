@@ -447,9 +447,11 @@ connection that negotiated effective `minor >= 3` each one arrives as
 Backend → `NoticeResponse` (`N`): `[ severity:Str ][ code:Str ][ message:Str ]`
 
 with `Str` as in §4.2. `severity` is one of `NOTICE`, `WARNING` or `INFO`; `code` is a 5-character
-SQLSTATE: `00000` when the notice reports nothing wrong, `01000` for a `RAISE WARNING`, otherwise
-the code the statement would have failed with had it not been told to skip (`42P07` for a
-`CREATE TABLE IF NOT EXISTS` of an existing table, `42P06` for a schema, `42701` for a column).
+SQLSTATE: `00000` when the notice reports nothing wrong, `01000` for a `RAISE WARNING`, the code a
+`RAISE ... USING ERRCODE` names, otherwise the code the statement would have failed with had it not
+been told to skip (`42P07` for a `CREATE TABLE IF NOT EXISTS` of an existing table, `42P06` for a
+schema, `42701` for a column). The frame has no field for a `RAISE`'s `DETAIL` or `HINT`, which
+are not sent.
 
 Ordering. A statement's notices come immediately before its own `CommandComplete`, after every
 `DataRow` it sends, or immediately before its `Error` when it fails after raising them. This holds
@@ -736,7 +738,7 @@ Backend → `Error` (type `E`): `[ code : Str ][ message : Str ]`.
   | Class | Meaning | Examples |
   | --- | --- | --- |
   | `00` | successful completion (notices only, never an `Error`) | `00000` a `NoticeResponse` that reports nothing wrong (§9.4) |
-  | `01` | warning (notices only, never an `Error`) | `01000` a `RAISE WARNING` notice |
+  | `01` | warning (notices, and an `Error` only from a `RAISE` that names a `01` code) | `01000` a `RAISE WARNING` notice |
   | `08` | connection exception | `08006` the connection failed while the statement was running |
   | `0A` | the server has not built this feature | `0A000` — see the note below on what this does and does not mean |
   | `21` | cardinality violation | `21000` a subquery returned more than one row where one was required |
@@ -758,7 +760,7 @@ Backend → `Error` (type `E`): `[ code : Str ][ message : Str ]`.
   | `55` | object not in a state the operation needs | `55006` object in use or reserved, `55P02` parameter cannot be changed now |
   | `57` | operator intervention | `57014` statement cancelled or timed out |
   | `58` | the environment failed, not the statement | `58030` an I/O error under the engine |
-  | `P0` | raised by the user's own code | `P0001` `RAISE` from a procedure |
+  | `P0` | raised by the user's own code | `P0001` `RAISE` from a procedure; a `RAISE ... USING ERRCODE` reports the code it names, in any class |
   | `XX` | internal error — the server's fault, not the caller's | `XX000` |
 
   The list is what the server emits today, not a closed set: a future version may add a class, and
@@ -779,7 +781,8 @@ Backend → `Error` (type `E`): `[ code : Str ][ message : Str ]`.
     `Execute`. `26000` now also answers the SQL-level `EXECUTE` / `DEALLOCATE` of a statement this
     session never prepared, so both spellings of the same mistake report the same code.
 
-- `message` is human-readable.
+- `message` is human-readable. The frame has no other field: the `DETAIL` and `HINT` of a
+  NusaScript `RAISE` are not sent.
 
 An `Error` during a simple query is followed by `ReadyForQuery`. During extended query it triggers
 skip-until-Sync (§10.2). During the handshake it precedes connection close.

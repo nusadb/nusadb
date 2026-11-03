@@ -428,6 +428,20 @@ pub enum Error {
     #[error("raised exception: {0}")]
     Raised(String),
 
+    /// A NusaScript `RAISE` that names its own condition (`USING ERRCODE`, `SQLSTATE '...'`, a
+    /// condition name) or adds a detail or hint. Reported with that SQLSTATE.
+    #[error("raised exception: {message}")]
+    RaisedWith {
+        /// The SQLSTATE the `RAISE` named: five digits or upper-case letters.
+        sqlstate: String,
+        /// The raised message.
+        message: String,
+        /// `USING DETAIL`, if given.
+        detail: Option<String>,
+        /// `USING HINT`, if given.
+        hint: Option<String>,
+    },
+
     /// `CREATE FUNCTION` named a function that already exists (and no `OR REPLACE` was given).
     #[error("function `{name}` already exists")]
     FunctionExists {
@@ -532,6 +546,21 @@ pub enum Error {
 }
 
 impl Error {
+    /// The SQLSTATE this error reports to a client: [`sqlstate`](Self::sqlstate), except for a
+    /// NusaScript `RAISE` that named a code outside the standard list, whose code it carries
+    /// with it. Nothing is kept anywhere else, so one session's codes cannot affect another's.
+    #[must_use]
+    pub fn code(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::RaisedWith { sqlstate, .. }
+                if crate::sqlstate::standard_code(sqlstate).is_none() =>
+            {
+                std::borrow::Cow::Owned(sqlstate.clone())
+            },
+            other => std::borrow::Cow::Borrowed(other.sqlstate()),
+        }
+    }
+
     /// The `22003` error for a number that does not fit `NUMERIC(precision, scale)`: after
     /// rounding to `scale` digits it needs more than `precision` digits. Shared by the cast and by
     /// every write into a column of that type, so both report the same condition the same way.
@@ -594,6 +623,10 @@ impl Error {
     /// The match below is exhaustive on purpose. A wildcard arm is what once let most of this
     /// enum report `internal_error` unnoticed; without one, a new variant does not compile until
     /// someone decides its class.
+    ///
+    /// A NusaScript `RAISE` may name a code of its own (`USING ERRCODE = 'MA001'`), which is not a
+    /// `&'static str`: for that one this reports `P0001`, and [`code`](Self::code) reports the
+    /// code itself. A client-facing writer uses `code`.
     #[must_use]
     pub fn sqlstate(&self) -> &'static str {
         match self {
@@ -676,6 +709,12 @@ impl Error {
             // engine fault is the single most misleading code here: the statement did exactly what
             // it was told to.
             Self::Raised { .. } => "P0001",
+            // The user's own RAISE that named its condition: that condition when it is a standard
+            // one. Any other code is not known for the life of the program, so this reports the
+            // default `raise_exception` for it; `code` reports it exactly.
+            Self::RaisedWith { sqlstate, .. } => {
+                crate::sqlstate::standard_code(sqlstate).unwrap_or("P0001")
+            },
             // Class 22 — data exception: a runtime value error, not an internal fault.
             Self::DivisionByZero => "22012", // division_by_zero
             // numeric_value_out_of_range — an overflow or a value outside a function's domain.
@@ -819,6 +858,15 @@ mod tests {
             (Error::UnknownFunction("nosuchfn".to_owned()), "42883"),
             (Error::Raised("custom".to_owned()), "P0001"),
             (
+                Error::RaisedWith {
+                    sqlstate: "23514".to_owned(),
+                    message: "no seat left".to_owned(),
+                    detail: None,
+                    hint: None,
+                },
+                "23514",
+            ),
+            (
                 Error::SequenceExhausted("reached maximum value".to_owned()),
                 "2200H",
             ),
@@ -960,5 +1008,30 @@ mod tests {
                  invites it to skip a statement it should have stopped at"
             );
         }
+    }
+
+    /// A code a `RAISE` names travels with the error: `code` reports it exactly, while the
+    /// `&'static str` form falls back to `raise_exception` for a code outside the standard list.
+    #[test]
+    fn a_raised_code_is_carried_by_the_error() {
+        let custom = Error::RaisedWith {
+            sqlstate: "MA001".to_owned(),
+            message: "quota exceeded".to_owned(),
+            detail: None,
+            hint: None,
+        };
+        assert_eq!(custom.code(), "MA001");
+        assert_eq!(custom.sqlstate(), "P0001");
+        let standard = Error::RaisedWith {
+            sqlstate: "23505".to_owned(),
+            message: "dup".to_owned(),
+            detail: None,
+            hint: None,
+        };
+        assert_eq!(
+            (standard.code().as_ref(), standard.sqlstate()),
+            ("23505", "23505")
+        );
+        assert_eq!(Error::DivisionByZero.code(), "22012");
     }
 }

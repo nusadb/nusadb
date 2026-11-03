@@ -43,6 +43,10 @@ pub struct Notice {
     pub code: String,
     /// The human-readable text.
     pub message: String,
+    /// More about it (a `RAISE ... USING DETAIL`), if anything.
+    pub detail: Option<String>,
+    /// What to do about it (a `RAISE ... USING HINT`), if anything.
+    pub hint: Option<String>,
 }
 
 /// The SQLSTATE of a notice that reports nothing wrong.
@@ -105,6 +109,8 @@ impl NoticeBuffer {
                     "{} more notices were dropped (at most {MAX_NOTICES} are kept)",
                     self.dropped
                 ),
+                detail: None,
+                hint: None,
             });
         }
         out
@@ -117,11 +123,17 @@ thread_local! {
 
 /// Raise a notice from the statement running on this thread.
 pub fn raise(severity: Severity, code: &str, message: impl Into<String>) {
-    let notice = Notice {
+    raise_notice(Notice {
         severity,
         code: code.to_owned(),
         message: message.into(),
-    };
+        detail: None,
+        hint: None,
+    });
+}
+
+/// Raise `notice` (with its detail and hint, if any) from the statement running on this thread.
+pub fn raise_notice(notice: Notice) {
     PENDING.with(|pending| pending.borrow_mut().push(notice));
 }
 

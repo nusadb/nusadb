@@ -1719,6 +1719,21 @@ fn sub_script_stmt(stmt: &mut ScriptStmt, refs: &RowRefs<'_>) -> Result<(), Erro
             }
             Ok(())
         },
+        ScriptStmt::RaiseWith(spec) => {
+            match &mut spec.message {
+                Some(crate::parser::RaiseText::Format { args, .. }) => {
+                    for arg in args {
+                        sub_expr(arg, refs)?;
+                    }
+                },
+                Some(crate::parser::RaiseText::Value(expr)) => sub_expr(expr, refs)?,
+                None => {},
+            }
+            for (_, expr) in &mut spec.options {
+                sub_expr(expr, refs)?;
+            }
+            Ok(())
+        },
         // Rewritten above.
         ScriptStmt::Return(_) | ScriptStmt::ReturnRow(_) => Ok(()),
         ScriptStmt::Sql(stmt) => substitute_row_refs(stmt, refs),

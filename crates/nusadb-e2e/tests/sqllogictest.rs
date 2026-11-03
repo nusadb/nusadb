@@ -1395,3 +1395,8 @@ fn slt_p3_partial_index_scan() {
 fn slt_p3_partial_index_ddl() {
     run_slt("tests/slt/p3_filter/partial_index_ddl.slt");
 }
+
+#[test]
+fn slt_p13_raise_using() {
+    run_slt("tests/slt/p13_functions/raise_using.slt");
+}

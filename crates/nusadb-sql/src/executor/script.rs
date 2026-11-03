@@ -14,7 +14,9 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use super::*;
-use crate::parser::{RaiseLevel, ScriptBlock, ScriptStmt, TriggerReturn};
+use crate::parser::{
+    RaiseLevel, RaiseOption, RaiseSpec, RaiseText, ScriptBlock, ScriptStmt, TriggerReturn,
+};
 
 /// Maximum `WHILE` iterations before a loop is aborted as non-terminating.
 const MAX_LOOP_ITERS: u64 = 1_000_000;
@@ -400,6 +402,7 @@ fn exec_one(
             format,
             args,
         } => raise_message(*level, format, args, env, params, engine, txn),
+        ScriptStmt::RaiseWith(spec) => raise_with(spec, env, params, engine, txn),
         ScriptStmt::Return(expr) => {
             let value = match expr {
                 Some(expr) => Some(eval_value(expr, env, params, engine, txn)?),
@@ -562,6 +565,110 @@ fn raise_message(
         RaiseLevel::Warning => (crate::notice::Severity::Warning, "01000"),
     };
     crate::notice::raise(severity, code, message);
+    Ok(Flow::Normal)
+}
+
+/// A `RAISE` with a condition or `USING` options. Everything is evaluated first, whatever the
+/// level: the message, then each option in order. An option that is `NULL` is `22004`, one given
+/// twice (or `MESSAGE` beside a format, `ERRCODE` beside a condition) is `42601`, and an `ERRCODE`
+/// that is neither five digits or upper-case letters nor a condition name is `42704`. Without a
+/// message the condition's text as written is the message. `EXCEPTION` then fails with the
+/// condition (`P0001` when none is named, and for `00000`); `NOTICE`, `INFO` and `WARNING` send a
+/// notice with it (by default `00000`, `00000` and `01000`); `LOG` and `DEBUG` send nothing.
+fn raise_with(
+    spec: &RaiseSpec,
+    env: &Env,
+    params: &[ast::Value],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<Flow, Error> {
+    let mut message = match &spec.message {
+        Some(RaiseText::Format { format, args }) => {
+            let values = args
+                .iter()
+                .map(|arg| eval_value(arg, env, params, engine, txn))
+                .collect::<Result<Vec<_>, Error>>()?;
+            Some(format_raise(format, &values)?)
+        },
+        Some(RaiseText::Value(expr)) => {
+            Some(message_text(&eval_value(expr, env, params, engine, txn)?))
+        },
+        None => None,
+    };
+    let (mut code, mut written) = match &spec.condition {
+        Some((code, written)) => (Some(code.clone()), Some(written.clone())),
+        None => (None, None),
+    };
+    let (mut detail, mut hint) = (None, None);
+    for (option, expr) in &spec.options {
+        let value = eval_value(expr, env, params, engine, txn)?;
+        if matches!(value, ast::Value::Null) {
+            return Err(Error::Coded {
+                message: "RAISE statement option cannot be null".to_owned(),
+                sqlstate: "22004", // null_value_not_allowed
+            });
+        }
+        let text = message_text(&value);
+        let slot = match option {
+            RaiseOption::Message => &mut message,
+            RaiseOption::Detail => &mut detail,
+            RaiseOption::Hint => &mut hint,
+            RaiseOption::Errcode => &mut code,
+        };
+        if slot.is_some() {
+            return Err(Error::Coded {
+                message: format!("RAISE option already specified: {}", option.name()),
+                sqlstate: "42601", // syntax_error
+            });
+        }
+        if *option == RaiseOption::Errcode {
+            let resolved = if crate::sqlstate::is_code(&text) {
+                text.clone()
+            } else {
+                crate::sqlstate::code_for_condition(&text)
+                    .ok_or_else(|| Error::Coded {
+                        message: format!("unrecognized exception condition \"{text}\""),
+                        sqlstate: "42704", // undefined_object
+                    })?
+                    .to_owned()
+            };
+            *slot = Some(resolved);
+            written = Some(text);
+        } else {
+            *slot = Some(text);
+        }
+    }
+    let (severity, default_code) = match spec.level {
+        RaiseLevel::Debug | RaiseLevel::Log => return Ok(Flow::Normal),
+        RaiseLevel::Info => (crate::notice::Severity::Info, "00000"),
+        RaiseLevel::Notice => (crate::notice::Severity::Notice, "00000"),
+        RaiseLevel::Warning => (crate::notice::Severity::Warning, "01000"),
+        RaiseLevel::Exception => {
+            // An error cannot report success: `00000` raises the default condition instead.
+            let code = code
+                .filter(|c| c != crate::notice::SUCCESSFUL_COMPLETION)
+                .unwrap_or_else(|| "P0001".to_owned());
+            let message = message.or(written).unwrap_or_else(|| code.clone());
+            if code == "P0001" && detail.is_none() && hint.is_none() {
+                return Err(Error::Raised(message));
+            }
+            return Err(Error::RaisedWith {
+                sqlstate: code,
+                message,
+                detail,
+                hint,
+            });
+        },
+    };
+    let code = code.unwrap_or_else(|| default_code.to_owned());
+    let message = message.or(written).unwrap_or_else(|| code.clone());
+    crate::notice::raise_notice(crate::notice::Notice {
+        severity,
+        code,
+        message,
+        detail,
+        hint,
+    });
     Ok(Flow::Normal)
 }
 

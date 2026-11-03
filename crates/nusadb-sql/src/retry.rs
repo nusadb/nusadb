@@ -84,10 +84,12 @@ pub fn budget(setting: Option<&str>) -> u32 {
 /// again, so retrying them would turn one error into several while the client waits. Only the codes
 /// the standard marks retryable qualify — `40001` (serialization failure) and `40P01` (deadlock
 /// detected) — read through [`Error::sqlstate`], so this agrees with what the client is told by
-/// construction rather than by a second, parallel classification.
+/// construction rather than by a second, parallel classification. A NusaScript `RAISE` that names
+/// one of those codes is left to the client: it is the routine's own decision, which a re-run
+/// would only repeat.
 #[must_use]
 pub fn is_retryable_conflict(err: &Error) -> bool {
-    matches!(err.sqlstate(), "40001" | "40P01")
+    !matches!(err, Error::RaisedWith { .. }) && matches!(err.sqlstate(), "40001" | "40P01")
 }
 
 /// Pause before attempt number `attempt` (1 for the first retry): exponential, capped, and jittered.
@@ -173,6 +175,12 @@ mod tests {
             Error::IntegerOutOfRange,
             Error::Cancelled,
             Error::Empty,
+            Error::RaisedWith {
+                sqlstate: "40001".to_owned(),
+                message: "try again later".to_owned(),
+                detail: None,
+                hint: None,
+            },
         ] {
             assert!(
                 !is_retryable_conflict(&err),

@@ -1955,7 +1955,7 @@ roll back after the `CALL`, from the client.
 
 NusaScript statements: `DECLARE name TYPE [DEFAULT expr]`, `SET name = expr` (or `name := expr`),
 `IF ... THEN ... [ELSIF ...] [ELSE ...] END IF`, `WHILE cond LOOP ... END LOOP`,
-`FOR i IN low TO high LOOP ... END LOOP`, `RAISE 'message'` (reported as `P0001`), `RETURN`,
+`FOR i IN low TO high LOOP ... END LOOP`, `RAISE` (see below), `RETURN`,
 `PERFORM expr` (evaluate and discard, for a call made for its side effects),
 `SELECT ... INTO [STRICT] target [, ...]`, and any SQL data statement. An `EXCEPTION WHEN OTHERS
 THEN` handler rolls the body's writes back to a savepoint and runs in their place. Variables may
@@ -1998,6 +1998,75 @@ BEGIN
 END
 $$;
 ```
+
+#### Naming the condition a `RAISE` reports
+
+A `RAISE` reports `P0001` unless it names its own condition, so an application can tell its errors
+apart by SQLSTATE:
+
+```sql
+RAISE 'quota exceeded' USING ERRCODE = 'MA001';
+RAISE EXCEPTION 'quota % of %', used, allowed USING ERRCODE = 'MA001', HINT = 'ask for more';
+RAISE SQLSTATE '22023' USING MESSAGE = 'amount must be positive';
+RAISE unique_violation USING MESSAGE = 'email already registered';
+RAISE EXCEPTION USING MESSAGE = 'no seat left', ERRCODE = 'check_violation';
+RAISE NOTICE 'retrying' USING ERRCODE = 'MA900';
+```
+
+The grammar, where `level` is `EXCEPTION` (the default), `WARNING`, `NOTICE`, `INFO`, `LOG` or
+`DEBUG`:
+
+```
+RAISE [ level ] 'format' [, value ...] [ USING option = expr [, ...] ]
+RAISE [ level ] condition_name [ USING option = expr [, ...] ]
+RAISE [ level ] SQLSTATE 'code' [ USING option = expr [, ...] ]
+RAISE [ level ] USING option = expr [, ...]
+RAISE expr [ USING option = expr [, ...] ]
+```
+
+The options are `MESSAGE`, `DETAIL`, `HINT` and `ERRCODE`, written with `=` or `:=`, each an
+expression evaluated when the `RAISE` runs. `ERRCODE` takes a code of five digits or upper-case
+letters (`'22023'`, `'MA001'`) or a condition name in lower case. A condition name is one of the
+standard names of an error condition, such as `unique_violation` (`23505`), `foreign_key_violation`
+(`23503`), `not_null_violation` (`23502`), `check_violation` (`23514`), `invalid_parameter_value`
+(`22023`), `division_by_zero` (`22012`), `insufficient_privilege` (`42501`),
+`serialization_failure` (`40001`), `no_data_found` (`P0002`), `too_many_rows` (`P0003`) and
+`raise_exception` (`P0001`); the names of warnings and of successful completion are not among them.
+When no message is given, the condition as written is the message (`RAISE unique_violation`
+reports the message `unique_violation`). The code travels with the error itself, so every code a `RAISE`
+names reaches the client exactly, and nothing one session raises changes what another's errors
+report. An embedded session reads it with `Error::code`; `Error::sqlstate`, which returns a
+`&'static str`, reports `P0001` for a code outside the standard list.
+
+The error's message reads `raised exception: <message>`, as for a plain `RAISE`. `DETAIL` and
+`HINT` travel with the error to an embedded session (`Error::RaisedWith`) and with a notice
+(`Notice::detail`, `Notice::hint`); the wire protocol's `Error` and `NoticeResponse` frames carry
+only the code and the message, so a client connected over the network does not receive them.
+
+Checked when the routine is created, `42601` or `42704`: a `SQLSTATE` code that is not five
+digits or upper-case letters, a condition name after a level that is not a known one, and an
+option other than the four. Checked when the `RAISE` runs, whatever its level (`LOG` and `DEBUG`
+included): an `ERRCODE` that is neither a code nor a known name (`42704`, `unrecognized exception
+condition`; names and codes are case-sensitive, so `'ma001'` and `'Unique_Violation'` fail), an
+option that is `NULL` (`22004`), and an option given twice, `MESSAGE` beside a format, or
+`ERRCODE` beside a condition (`42601`, `RAISE option already specified`).
+
+An error cannot report success: `ERRCODE = '00000'` on an `EXCEPTION` reports `P0001`. A code of
+the warning class `01` on an `EXCEPTION` is still an error, with that code. On `NOTICE`, `INFO` and
+`WARNING` the named code replaces the notice's own (`00000`, `00000` and `01000`). An `EXCEPTION
+WHEN OTHERS` handler catches a named condition like any other error; `SQLSTATE` and `SQLERRM` are
+not available inside it. A `BEFORE` trigger that raises a named condition fails the `INSERT`,
+`UPDATE`, `COPY` or `MERGE` that fired it with that code, and the statement leaves no row behind.
+A `RAISE` that names `40001` or `40P01` is the routine's own decision, so the server's automatic
+retry of an auto-commit statement that met a conflict does not run it again; the client sees the
+error at once.
+
+Without a level and without values, `RAISE 'text'` takes the text as it is: a `%` in it stays a
+`%` (`RAISE '50%% off'` reports `50%% off`). With a level, or with values after the text, `%`
+takes the next value and `%%` is a single `%`. A bare word after `RAISE` is a condition only when
+it names one and ends the statement or is followed by `USING`; otherwise it is an expression, so
+`RAISE msg` still raises the value of a variable `msg`, and an unknown word there fails when the
+`RAISE` runs, as an unknown column (`42703`).
 
 Notices reach a client that negotiated protocol 1.3 (see the
 [wire protocol](wire-protocol.md#94-notices-protocol-13)); an embedded session returns them from
@@ -2927,7 +2996,7 @@ on the message text.
 | `54001` | statement too complex | trigger or procedure recursion limit |
 | `55P02` | parameter cannot be changed | `server_version` and the other read-only settings |
 | `57014` | query cancelled | `statement_timeout` or a client cancel |
-| `P0001` | raised by a procedure's own `RAISE` | |
+| `P0001` | raised by a procedure's own `RAISE` | a `RAISE` that names a condition reports that code instead, in whatever class it is |
 | `XX000` | internal error, or a memory ceiling was reached | the message names the limit and the flag that raises it |
 
 ---
