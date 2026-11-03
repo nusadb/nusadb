@@ -12,6 +12,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -833,9 +834,6 @@ where
     let mut statements: HashMap<String, (String, Vec<u8>)> = HashMap::new();
     let mut portals: HashMap<String, Portal> = HashMap::new();
     let mut failed = false;
-    // Explicit-transaction state across statements on this connection (transaction-over-wire). The
-    // simple- and extended-query paths both thread it, so `BEGIN ... COMMIT` spans either.
-    let mut txn_state = TxnState::Auto;
     // Per-connection `ON COMMIT` registry for temporary tables (`DELETE ROWS` / `DROP`). Populated
     // when such a table is created and consumed after each successful commit; the connection loop owns
     // it because it is the only place that observes every transaction boundary.
@@ -879,7 +877,20 @@ where
     let stores = SessionStores {
         cursors: Arc::clone(&cursors),
         prepared: Arc::clone(&prepared),
+        in_flight: InFlight::default(),
     };
+    // What the session holds in the engine, given back when the connection ends, whichever way it
+    // ends (see `SessionTeardown`). It owns the explicit-transaction state across statements
+    // (transaction-over-wire), which the simple- and extended-query paths both thread so that
+    // `BEGIN ... COMMIT` spans either; keeping it there means the teardown always sees the block
+    // that is open at the moment the connection ends.
+    let mut teardown = SessionTeardown::new(
+        Arc::clone(&engine),
+        temp_schema_name.clone(),
+        Arc::clone(&cancel_token),
+        stores.in_flight.clone(),
+    );
+    let txn_state = &mut teardown.state;
     // LISTEN/NOTIFY (async pub/sub): this connection's notification mailbox. `LISTEN` subscribes its
     // pid in the process-global registry; a `NOTIFY` from any connection in the same database pushes a
     // `Notification` here, which the loop below drains and writes as a `NotificationResponse` while the
@@ -924,6 +935,8 @@ where
         match FrontendMessage::decode(&frame).map_err(io::Error::other)? {
             FrontendMessage::Query { sql } => {
                 failed = false; // a simple query abandons any half-built extended pipeline
+                #[cfg(test)]
+                fault::in_task(&sql);
                 let pieces = nusadb_sql::split_statements(&sql);
                 if pieces.len() > 1 {
                     let mut batch = SimpleBatch {
@@ -941,9 +954,10 @@ where
                         settings: &settings,
                         cursors: &cursors,
                         prepared: &prepared,
+                        in_flight: &stores.in_flight,
                         temp_schema: &temp_schema_name,
                         metrics: metrics.as_ref(),
-                        txn_state: &mut txn_state,
+                        txn_state: &mut *txn_state,
                         plan_cache: &mut plan_cache,
                         on_commit: &mut on_commit,
                         pending_notify: &mut pending_notify,
@@ -1011,6 +1025,7 @@ where
                                         .get("timezone")
                                         .cloned(),
                                     txn_state.open_block(),
+                                    &stores.in_flight,
                                 )
                                 .await?
                             },
@@ -1022,6 +1037,7 @@ where
                                     &copy_actor,
                                     settings_snapshot(&settings, &database).get("timezone").cloned(),
                                     txn_state.open_block(),
+                                    &stores.in_flight,
                                 )
                                 .await?
                             },
@@ -1032,8 +1048,8 @@ where
                     }
                     // A COPY inside a transaction block is one of its statements: it dirties the
                     // block, and a failure aborts it like any other statement's would.
-                    if let TxnState::Active { txn, isolation, started, .. } = txn_state {
-                        txn_state = if outcome.is_ok() {
+                    if let TxnState::Active { txn, isolation, started, .. } = *txn_state {
+                        *txn_state = if outcome.is_ok() {
                             TxnState::Active {
                                 txn,
                                 dirty: true,
@@ -1057,7 +1073,7 @@ where
                 } else if let Some(stmt) = pubsub_statement(&sql) {
                     // A transaction that ran LISTEN/UNLISTEN/NOTIFY cannot be prepared: its
                     // effects belong to this connection, which the prepared transaction leaves.
-                    if in_transaction_block(&txn_state)
+                    if in_transaction_block(txn_state)
                         && let Ok(mut store) = settings.lock()
                     {
                         store.insert(TXN_PUBSUB_SETTING.to_owned(), "1".to_owned());
@@ -1085,7 +1101,7 @@ where
                     let was_active = matches!(txn_state, TxnState::Active { .. });
                     // Capture the transaction state and any `ON COMMIT` registration before `sql` is
                     // moved into the streaming call, so the temp-table hook can fire after the commit.
-                    let old_state = txn_state;
+                    let old_state = *txn_state;
                     let on_commit_create = detect_on_commit_create(&sql, &temp_schema_name);
                     // Stream the result's rows to the socket as they are produced:
                     // `RowDescription`, then each `DataRow` as the executor yields it, then
@@ -1102,7 +1118,7 @@ where
                         user.clone(),
                         Arc::clone(&cancel_token),
                         statement_timeout,
-                        txn_state,
+                        *txn_state,
                         typed_row_description,
                         array_element_types,
                         notices_enabled,
@@ -1111,9 +1127,10 @@ where
                         &cursors,
                         &prepared,
                         false, // simple query sends its own RowDescription
+                        &stores.in_flight,
                     )
                     .await?;
-                    txn_state = new_state;
+                    *txn_state = new_state;
                     plan_cache = new_cache;
                     settle_cursors_after_stmt(&cursors, control.as_ref(), ok, old_state, new_state);
                     // Fire any temporary-table ON COMMIT actions this commit triggered, before the
@@ -1237,7 +1254,7 @@ where
                                         )
                                         .await?;
                                         // Like any Describe error, it fails an open block.
-                                        txn_state = txn_state.aborted();
+                                        *txn_state = txn_state.aborted();
                                         continue;
                                     }
                                 },
@@ -1262,7 +1279,7 @@ where
                         &name,
                         &effective_user(&user, &settings),
                         &settings.lock().map(|g| g.clone()).unwrap_or_default(),
-                        txn_state,
+                        *txn_state,
                     )
                     .await
                     {
@@ -1294,7 +1311,7 @@ where
                 // A Describe that failed inside a transaction block aborts the block, exactly as a
                 // failed Execute does: the client saw an error, so later statements must not run.
                 if failed {
-                    txn_state = txn_state.aborted();
+                    *txn_state = txn_state.aborted();
                 }
             },
             FrontendMessage::Execute { portal, max_rows } => {
@@ -1313,7 +1330,7 @@ where
                     .filter(|p| p.result.is_none() && p.result_formats.iter().all(|&f| f == 0))
                     .map(|p| (p.sql.clone(), p.params.clone()));
                 if let Some((sql, params)) = stream_job {
-                    let old_state = txn_state;
+                    let old_state = *txn_state;
                     let on_commit_control = txn_control_kind(&sql);
                     let on_commit_create = detect_on_commit_create(&sql, &temp_schema_name);
                     let (ok, new_state, new_cache) = stream_query_to_conn(
@@ -1326,7 +1343,7 @@ where
                         user.clone(),
                         Arc::clone(&cancel_token),
                         statement_timeout,
-                        txn_state,
+                        *txn_state,
                         typed_row_description,
                         array_element_types,
                         notices_enabled,
@@ -1335,9 +1352,10 @@ where
                         &cursors,
                         &prepared,
                         true, // portal path: `Describe` already sent `RowDescription`
+                        &stores.in_flight,
                     )
                     .await?;
-                    txn_state = new_state;
+                    *txn_state = new_state;
                     plan_cache = new_cache;
                     settle_cursors_after_stmt(
                         &cursors,
@@ -1393,7 +1411,7 @@ where
                 let on_commit_sql = (!already_executed)
                     .then(|| portals.get(&portal).map(|p| p.sql.clone()))
                     .flatten();
-                let old_state = txn_state;
+                let old_state = *txn_state;
                 let (executed, new_state, raised) = ensure_executed(
                     &engine,
                     &cluster,
@@ -1403,13 +1421,13 @@ where
                     &user,
                     Arc::clone(&cancel_token),
                     statement_timeout,
-                    txn_state,
+                    *txn_state,
                     &settings,
                     &stores,
                     notices_enabled,
                 )
                 .await;
-                txn_state = new_state;
+                *txn_state = new_state;
                 // Only a failed statement's notices are left here, to go right before its error;
                 // a successful one's are sent by `drain_portal` right before its completion.
                 for notice in raised {
@@ -1502,26 +1520,151 @@ where
     // preceded `Terminate`) before the socket drops.
     conn.flush_now().await?;
 
-    // Roll back an explicit transaction left open when the connection ends, so a disconnect mid
-    // `BEGIN ... ` does not leak it in the engine.
-    if let Some(txn) = txn_state.open_txn() {
-        let engine = Arc::clone(&engine);
-        let _ = tokio::task::spawn_blocking(move || deferred::rollback(engine.as_ref(), txn)).await;
-    }
-    // Drop this connection's temporary schema (and every table in it) if a `CREATE TEMP TABLE` ever
-    // created one. Best-effort on a blocking thread: a disconnect cleanup must never fail teardown,
-    // and a connection that made no temp table finds no schema and does nothing.
-    {
-        let engine = Arc::clone(&engine);
-        let _ = tokio::task::spawn_blocking(move || {
-            drop_temp_schema(engine.as_ref(), &temp_schema_name);
-            // Release any advisory locks this connection held, keyed by the same per-connection
-            // temporary-schema name the lock functions use, so they never outlive the connection.
-            nusadb_sql::release_advisory_locks(&temp_schema_name);
-        })
-        .await;
-    }
+    // Roll back the block left open, if any, drop the temporary schema and release the advisory
+    // locks, and wait for that to finish. Every other way out of this function leaves the same
+    // work to the guard's `Drop`.
+    teardown.finish().await;
     Ok(())
+}
+
+/// Gives back what a session holds in the engine when its connection ends, however it ends.
+///
+/// The connection task owns one, and the query loop keeps the session's transaction state in it,
+/// so it always knows the block open at this moment. What it gives back: that block, rolled back
+/// (with the row locks it holds); the connection's temporary schema and every table in it; and the
+/// advisory locks keyed by that schema's name. A transaction the session prepared for two-phase
+/// commit is not touched: `PREPARE TRANSACTION` hands it off and leaves the session in autocommit.
+///
+/// The ordinary end of the query loop calls [`finish`](Self::finish) and waits for the work. Every
+/// other way out drops the guard instead: an I/O or protocol error returned early, a panic anywhere
+/// in the task, or the task being aborted by a shutdown that stopped waiting for it. `Drop` cannot
+/// wait and must not block the reactor, so it hands the same work to the blocking pool and returns.
+/// The work is best-effort: a failure is logged or ignored, never raised, and a session that made
+/// no temporary table and holds nothing finds nothing to do.
+struct SessionTeardown {
+    engine: Arc<dyn StorageEngine>,
+    temp_schema: String,
+    cancel: nusadb_sql::cancel::CancelToken,
+    in_flight: InFlight,
+    /// The connection's transaction state, threaded through the query loop by reference.
+    state: TxnState,
+    /// Set once the work has been handed out, so it runs exactly once.
+    done: bool,
+}
+
+impl SessionTeardown {
+    const fn new(
+        engine: Arc<dyn StorageEngine>,
+        temp_schema: String,
+        cancel: nusadb_sql::cancel::CancelToken,
+        in_flight: InFlight,
+    ) -> Self {
+        Self {
+            engine,
+            temp_schema,
+            cancel,
+            in_flight,
+            state: TxnState::Auto,
+            done: false,
+        }
+    }
+
+    /// The cleanup, the first time it is asked for.
+    fn take_work(&mut self) -> Option<impl FnOnce() + Send + 'static> {
+        if std::mem::replace(&mut self.done, true) {
+            return None;
+        }
+        let engine = Arc::clone(&self.engine);
+        let temp_schema = std::mem::take(&mut self.temp_schema);
+        let cancel = Arc::clone(&self.cancel);
+        let in_flight = self.in_flight.clone();
+        let open = self.state.open_txn();
+        Some(move || {
+            // A task aborted while it waited on the blocking pool leaves that statement running in
+            // the session's transaction. Ask it to stop and wait until it has, so the rollback
+            // below never runs alongside a statement of the same transaction.
+            cancel.store(true, Ordering::Relaxed);
+            let _idle = in_flight.enter();
+            if let Some(txn) = open {
+                let _ = deferred::rollback(engine.as_ref(), txn);
+            }
+            drop_temp_schema(engine.as_ref(), &temp_schema);
+            nusadb_sql::release_advisory_locks(&temp_schema);
+        })
+    }
+
+    /// Run the cleanup on the blocking pool and wait for it.
+    async fn finish(mut self) {
+        if let Some(work) = self.take_work() {
+            let _ = tokio::task::spawn_blocking(work).await;
+        }
+    }
+}
+
+impl Drop for SessionTeardown {
+    fn drop(&mut self) {
+        let Some(work) = self.take_work() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            // Not awaited: the connection is already gone, and nothing here may wait. A runtime
+            // that is shutting down may never run it, but then the process is ending and an
+            // unfinished transaction does not survive a restart.
+            Ok(runtime) => drop(runtime.spawn_blocking(work)),
+            // Outside any runtime there is no reactor to keep free.
+            Err(_) => work(),
+        }
+    }
+}
+
+/// Held by a blocking-pool job for as long as it works in a connection's transaction, so the
+/// connection's teardown can wait for it. Uncontended in normal operation: a connection runs one
+/// statement at a time, and its teardown only competes with a job when the task was aborted
+/// while waiting on one.
+#[derive(Clone, Debug, Default)]
+struct InFlight(Arc<std::sync::Mutex<()>>);
+
+impl InFlight {
+    /// Mark the current job as working in the connection's transaction until the guard drops. A
+    /// job that panicked while holding it poisons nothing that matters, so poison is ignored.
+    fn enter(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Rolls back a transaction a statement began for itself when the statement unwinds before ending
+/// it, so a panic cannot leave that transaction active in the engine, with the row locks it took,
+/// for the rest of the process. On every ordinary path the statement commits or rolls back on its
+/// own and the guard does nothing.
+struct RollbackOnUnwind<'a> {
+    engine: &'a dyn StorageEngine,
+    txn: TxnId,
+}
+
+impl<'a> RollbackOnUnwind<'a> {
+    const fn new(engine: &'a dyn StorageEngine, txn: TxnId) -> Self {
+        Self { engine, txn }
+    }
+}
+
+impl Drop for RollbackOnUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let _ = deferred::rollback(self.engine, self.txn);
+        }
+    }
+}
+
+/// Log a panic caught while a statement ran. The statement reports `XX000` to its client.
+fn log_statement_panic(payload: &(dyn std::any::Any + Send)) {
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload");
+    tracing::error!(panic = message, "a statement panicked; it fails with XX000");
 }
 
 /// Drop a connection's temporary schema on disconnect — best-effort, in a fresh transaction.
@@ -1666,12 +1809,13 @@ async fn handle_copy_in<S>(
     actor: &str,
     timezone: Option<String>,
     open_block: Option<(TxnId, i64)>,
+    in_flight: &InFlight,
 ) -> io::Result<Result<usize, (String, &'static str)>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let open_txn = open_block.map(|(txn, _)| txn);
-    let columns = copy_in_column_count(engine, &copy, open_txn).await;
+    let columns = copy_in_column_count(engine, &copy, open_txn, in_flight).await;
     let format = copy_wire_format(&copy);
     conn.write_frame(&BackendMessage::CopyInResponse { format, columns }.encode()?)
         .await?;
@@ -1735,7 +1879,9 @@ where
     let data = buf;
     let engine = Arc::clone(engine);
     let actor = actor.to_owned();
+    let in_flight = in_flight.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let _busy = in_flight.enter();
         // COPY runs outside the ordinary statement pipeline, so pin the session zone here —
         // a `timestamptz` field with no explicit offset is read as session-local wall time.
         nusadb_sql::pin_statement_timezone(timezone.as_deref());
@@ -1746,6 +1892,7 @@ where
         // "written" for a concurrent change to slip through. Inside a transaction block that is
         // the block's transaction, left open for the block to commit or roll back.
         let (txn, owned) = copy_transaction(engine.as_ref(), open_txn)?;
+        let _unwind = owned.then(|| RollbackOnUnwind::new(engine.as_ref(), txn));
         if let Some(msg) = copy_access_verdict(
             engine.as_ref(),
             txn,
@@ -1792,15 +1939,19 @@ async fn copy_in_column_count(
     engine: &Arc<dyn StorageEngine>,
     copy: &nusadb_sql::ast::Copy,
     open_txn: Option<TxnId>,
+    in_flight: &InFlight,
 ) -> u16 {
     let columns = if copy.columns.is_empty() {
         let engine = Arc::clone(engine);
         let probe = copy.clone();
+        let in_flight = in_flight.clone();
         tokio::task::spawn_blocking(move || {
+            let _busy = in_flight.enter();
             if let Some(txn) = open_txn {
                 return nusadb_sql::copy_column_count_in(engine.as_ref(), &probe, txn).ok();
             }
             let txn = engine.begin(IsolationLevel::default()).ok()?;
+            let _unwind = RollbackOnUnwind::new(engine.as_ref(), txn);
             let count = nusadb_sql::copy_column_count_in(engine.as_ref(), &probe, txn).ok();
             let _ = deferred::rollback(&*engine, txn);
             count
@@ -1847,6 +1998,7 @@ async fn handle_copy_out<S>(
     actor: &str,
     timezone: Option<String>,
     open_block: Option<(TxnId, i64)>,
+    in_flight: &InFlight,
 ) -> io::Result<Result<usize, (String, &'static str)>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1855,7 +2007,9 @@ where
     let format = copy_wire_format(&copy);
     let engine = Arc::clone(engine);
     let actor = actor.to_owned();
+    let in_flight = in_flight.clone();
     let rendered = tokio::task::spawn_blocking(move || {
+        let _busy = in_flight.enter();
         // COPY runs outside the ordinary statement pipeline, so pin the session zone here —
         // `timestamptz` fields render on the session-local wall clock like every other output.
         nusadb_sql::pin_statement_timezone(timezone.as_deref());
@@ -1865,6 +2019,7 @@ where
         // access check was evaluated against. Inside a transaction block that is the block's
         // transaction, so the rows include what the block wrote and it stays open.
         let (txn, owned) = copy_transaction(engine.as_ref(), open_txn)?;
+        let _unwind = owned.then(|| RollbackOnUnwind::new(engine.as_ref(), txn));
         // The table form's SELECT-privilege check is raised here because table COPY never reaches the
         // analyzer. The query form (`COPY (<query>) TO STDOUT`) DOES go through analysis — which
         // enforces per-table privileges and row-level security as the COPY user — so the flat
@@ -2048,6 +2203,7 @@ async fn run_blocking(
     let settings = Arc::clone(settings);
     let stores = stores.clone();
     let (result, new_state, raised) = tokio::task::spawn_blocking(move || {
+        let _busy = stores.in_flight.enter();
         let _cancel_guard = nusadb_sql::cancel::scope(cancel);
         // A pool thread may hold notices an earlier statement left behind; this one's start clean.
         nusadb_sql::notice::clear();
@@ -2069,10 +2225,15 @@ async fn run_blocking(
         )
     })
     .await
-    .unwrap_or_else(|_join| {
+    .unwrap_or_else(|join| {
+        if let Ok(payload) = join.try_into_panic() {
+            log_statement_panic(&*payload);
+        }
+        // The statement panicked. Whatever it did in an open block is not to be committed, so the
+        // block is aborted, as after any failed statement.
         (
             Err(("internal execution error".to_owned(), INTERNAL_ERROR)),
-            state,
+            state.aborted(),
             Vec::new(),
         )
     });
@@ -2131,6 +2292,7 @@ async fn describe_portal(
     let acting_user = acting_user.to_owned();
     let settings = settings.clone();
     tokio::task::spawn_blocking(move || {
+        let _busy = stores.in_flight.enter();
         let stmt = params.bind(parse(&sql)?)?;
         // Describe resolves the row shape without running the statement, but analysis still
         // needs a transaction to resolve schema visibility. Inside an open transaction block that
@@ -2153,6 +2315,7 @@ async fn describe_portal(
             },
             TxnState::Auto => (engine.begin(IsolationLevel::default())?, true),
         };
+        let _unwind = owned.then(|| RollbackOnUnwind::new(engine.as_ref(), txn));
         let catalog = EngineCatalog::new(engine.as_ref(), txn, &acting_user, &settings);
         let result = analyze(stmt, &catalog).and_then(|logical| {
             let physical = plan(logical);
@@ -2522,6 +2685,7 @@ fn copy_rls_block(
     let Ok(txn) = engine.begin(IsolationLevel::default()) else {
         return Some("could not verify access for COPY".to_owned());
     };
+    let _unwind = RollbackOnUnwind::new(engine, txn);
     let verdict = copy_access_verdict(engine, txn, copy, user, direction);
     let _ = deferred::rollback(engine, txn);
     verdict
@@ -3239,6 +3403,8 @@ fn stream_stmt_in_state(
             let outcome = execute_streamed_with_session_state(
                 physical, engine, txn, true, user, snapshot, cursors, prepared, sink,
             );
+            #[cfg(test)]
+            fault::after_execute(sql, matches!(sink.tx, SinkTx::Inline));
             match outcome {
                 Ok(o) => StmtRun::Done(
                     Ok(o),
@@ -3327,6 +3493,7 @@ fn stream_stmt_autocommit(
             Ok(txn) => txn,
             Err(e) => return StmtRun::Done(Err(e.into()), TxnState::Auto),
         };
+        let _unwind = RollbackOnUnwind::new(engine, txn);
         let physical = match plan_streamed_stmt(
             bypass_cache,
             plan_cache,
@@ -3354,6 +3521,8 @@ fn stream_stmt_autocommit(
         let outcome = execute_streamed_with_session_state(
             physical, engine, txn, false, user, snapshot, cursors, prepared, sink,
         );
+        #[cfg(test)]
+        fault::after_execute(sql, inline);
         let failure = match outcome {
             Ok(o) => match deferred::commit(engine, txn) {
                 Ok(()) => {
@@ -3449,6 +3618,8 @@ async fn stream_query_to_conn<S>(
     // Extended-query `Execute` must NOT repeat `RowDescription` (that is `Describe`'s job) — set for
     // the portal path so the streamed frames carry only `DataRow`s + `CommandComplete`.
     suppress_row_description: bool,
+    // Held by the blocking-pool run for as long as it works, for the connection's teardown.
+    in_flight: &InFlight,
 ) -> io::Result<(bool, TxnState, nusadb_sql::PlanCache)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -3502,7 +3673,11 @@ where
         // Keep the parsed statement for the (rare) punt re-dispatch; candidates that don't
         // punt pay one small AST clone.
         let backup = point_get.then(|| stmt.clone());
-        let run = {
+        // A panic here would otherwise unwind the connection task from the reactor. Caught, it fails
+        // just this statement with `XX000` and aborts an open block, as the pool path does when a
+        // statement panics there; the connection stays usable. A transaction the statement began
+        // for itself was rolled back on the way out (`RollbackOnUnwind`).
+        let run = std::panic::catch_unwind(AssertUnwindSafe(|| {
             let _cancel_guard = nusadb_sql::cancel::scope(Arc::clone(&cancel));
             run_query_streaming(
                 engine.as_ref(),
@@ -3523,6 +3698,23 @@ where
                 point_get,
                 bypass_plan_cache,
             )
+        }));
+        let run = match run {
+            Ok(run) => run,
+            Err(payload) => {
+                log_statement_panic(&*payload);
+                // Notices raised before the panic belong to a statement that reports none.
+                nusadb_sql::notice::clear();
+                let ok = write_statement_outcome(
+                    conn,
+                    Err(("internal execution error".to_owned(), INTERNAL_ERROR)),
+                    Vec::new(),
+                    suppress_row_description,
+                )
+                .await?;
+                // The plan cache went down with the statement; resume with an empty one.
+                return Ok((ok, state.aborted(), nusadb_sql::PlanCache::new()));
+            },
         };
         match run {
             StreamedRun::Done((outcome, tail, new_state, new_cache)) => {
@@ -3570,7 +3762,9 @@ where
     let settings = Arc::clone(settings);
     let cursors = Arc::clone(cursors);
     let prepared = Arc::clone(prepared);
+    let in_flight = in_flight.clone();
     let task = tokio::task::spawn_blocking(move || {
+        let _busy = in_flight.enter();
         let _cancel_guard = nusadb_sql::cancel::scope(cancel);
         match run_query_streaming(
             engine.as_ref(),
@@ -3637,13 +3831,17 @@ where
     // Drop the receiver so a producer parked on a full channel (or still running after a write
     // error) unblocks, then collect its outcome.
     drop(rx);
-    let (outcome, tail, new_state, new_cache) = task.await.unwrap_or_else(|_join| {
+    let (outcome, tail, new_state, new_cache) = task.await.unwrap_or_else(|join| {
+        if let Ok(payload) = join.try_into_panic() {
+            log_statement_panic(&*payload);
+        }
         // The blocking task panicked: its moved-in plan cache is gone, so resume with an empty one
-        // (cold but correct). A panic mid-statement is catastrophic regardless.
+        // (cold but correct). The statement may have done part of its work in an open block, which
+        // must not be committed, so the block is aborted as after any failed statement.
         (
             Err(("internal execution error".to_owned(), INTERNAL_ERROR)),
             Vec::new(),
-            state,
+            state.aborted(),
             nusadb_sql::PlanCache::new(),
         )
     });
@@ -4464,11 +4662,12 @@ impl RowSink for CollectSink {
 }
 
 /// A connection's cursor and SQL-level prepared-statement stores, shared into each statement's
-/// blocking task.
+/// blocking task, with the marker that task holds while it works in the connection's transaction.
 #[derive(Clone)]
 struct SessionStores {
     cursors: Arc<std::sync::Mutex<nusadb_sql::CursorStore>>,
     prepared: Arc<std::sync::Mutex<nusadb_sql::PreparedStore>>,
+    in_flight: InFlight,
 }
 
 impl SessionStores {
@@ -4599,6 +4798,7 @@ fn run_session_stmt_in_state(
                     Ok(txn) => txn,
                     Err(e) => return (Err(e.into()), TxnState::Auto),
                 };
+                let _unwind = RollbackOnUnwind::new(engine, txn);
                 let outcome =
                     run_session_stmt_once(engine, current, txn, false, user, &snapshot, stores)
                         .and_then(|result| deferred::commit(engine, txn).map(|()| result));
@@ -5518,6 +5718,7 @@ fn run_stmt_in_state(
                     Ok(txn) => txn,
                     Err(e) => return (Err(e.into()), TxnState::Auto),
                 };
+                let _unwind = RollbackOnUnwind::new(engine, txn);
                 let outcome = analyze(current, &EngineCatalog::new(engine, txn, user, &snapshot))
                     .and_then(|logical| {
                         execute_in_txn_as_with_settings(plan(logical), engine, txn, user, &snapshot)
@@ -5922,6 +6123,7 @@ struct SimpleBatch<'a, S> {
     settings: &'a Arc<std::sync::Mutex<HashMap<String, String>>>,
     cursors: &'a Arc<std::sync::Mutex<nusadb_sql::CursorStore>>,
     prepared: &'a Arc<std::sync::Mutex<nusadb_sql::PreparedStore>>,
+    in_flight: &'a InFlight,
     temp_schema: &'a str,
     metrics: Option<&'a Arc<Metrics>>,
     txn_state: &'a mut TxnState,
@@ -6067,7 +6269,9 @@ where
     let engine = Arc::clone(batch.engine);
     let settings = Arc::clone(batch.settings);
     let state = *batch.txn_state;
+    let in_flight = batch.in_flight.clone();
     let (result, new_state) = tokio::task::spawn_blocking(move || {
+        let _busy = in_flight.enter();
         begin_txn(
             engine.as_ref(),
             state,
@@ -6105,7 +6309,9 @@ where
     let old_state = *batch.txn_state;
     let engine = Arc::clone(batch.engine);
     let settings = Arc::clone(batch.settings);
+    let in_flight = batch.in_flight.clone();
     let (result, new_state) = tokio::task::spawn_blocking(move || {
+        let _busy = in_flight.enter();
         if commit {
             commit_txn(engine.as_ref(), old_state, &settings)
         } else {
@@ -6114,6 +6320,14 @@ where
     })
     .await
     .unwrap_or_else(|_join| {
+        // The commit or rollback panicked, leaving the transaction in an unknown state. Roll it
+        // back so it does not stay active; one that did commit refuses the rollback harmlessly.
+        if let Some(txn) = old_state.open_txn() {
+            let engine = Arc::clone(batch.engine);
+            drop(tokio::task::spawn_blocking(move || {
+                deferred::rollback(engine.as_ref(), txn)
+            }));
+        }
         (
             Err(nusadb_sql::Error::Unsupported(
                 "internal execution error".to_owned(),
@@ -6206,6 +6420,7 @@ where
         batch.cursors,
         batch.prepared,
         false,
+        batch.in_flight,
     )
     .await?;
     *batch.txn_state = new_state;
@@ -6708,5 +6923,456 @@ mod timeout_tests {
             ),
             default
         );
+    }
+}
+
+/// Fault injection for the connection teardown tests. A statement whose text carries one of the
+/// markers panics at a fixed point, so a test can drive a panic down each path without relying on
+/// a real bug. Compiled into this crate's unit-test build only: a normal build has none of it.
+#[cfg(test)]
+mod fault {
+    use std::sync::Mutex;
+
+    /// A statement carrying this marker panics right after it executes and before its transaction
+    /// commits, so any row locks it took are held at the moment of the panic.
+    pub(super) const PANIC_AFTER_EXECUTE: &str = "nusadb_fault_after_execute";
+    /// A simple query carrying this marker panics in the connection task itself, outside any
+    /// statement, which ends the task.
+    pub(super) const PANIC_IN_TASK: &str = "nusadb_fault_in_task";
+
+    /// The text of every statement that panicked on the reactor-inline path, so a test can show
+    /// its panic took that path rather than the blocking pool.
+    pub(super) static INLINE_PANICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(super) fn after_execute(sql: &str, inline: bool) {
+        if sql.contains(PANIC_AFTER_EXECUTE) {
+            if inline && let Ok(mut seen) = INLINE_PANICS.lock() {
+                seen.push(sql.to_owned());
+            }
+            panic!("injected fault after executing: {sql}");
+        }
+    }
+
+    pub(super) fn in_task(sql: &str) {
+        assert!(
+            !sql.contains(PANIC_IN_TASK),
+            "injected fault in the connection task: {sql}"
+        );
+    }
+
+    /// Whether `sql` panicked on the reactor-inline path.
+    pub(super) fn panicked_inline(sql: &str) -> bool {
+        INLINE_PANICS
+            .lock()
+            .is_ok_and(|seen| seen.iter().any(|s| s == sql))
+    }
+}
+
+/// What a session leaves behind when its connection ends in a panic: the open transaction, its row
+/// locks, its advisory locks and its temporary schema must all go, and a prepared transaction must
+/// stay. Driven through the test-only faults in [`fault`].
+#[cfg(test)]
+mod teardown_tests {
+    use super::*;
+    use nusadb_btree::BtreeEngine;
+    use tokio::io::DuplexStream;
+
+    type Client = Connection<DuplexStream>;
+
+    /// How long a test waits for a teardown that runs on another thread to take effect.
+    const SETTLE: Duration = Duration::from_secs(3);
+
+    async fn send(conn: &mut Client, msg: FrontendMessage) {
+        conn.write_frame(&msg.encode().unwrap()).await.unwrap();
+        conn.flush_now().await.unwrap();
+    }
+
+    /// The next backend message, or `None` once the server closed the connection.
+    async fn next(conn: &mut Client) -> Option<BackendMessage> {
+        let frame = conn.read_frame().await.ok().flatten()?;
+        Some(BackendMessage::decode(&frame).unwrap())
+    }
+
+    async fn connect(engine: &Arc<dyn StorageEngine>) -> Client {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        drop(tokio::spawn(handle_client(server, Arc::clone(engine))));
+        let mut conn = Connection::new(client);
+        send(
+            &mut conn,
+            FrontendMessage::Startup {
+                major: 1,
+                minor: 0,
+                user: "u".to_owned(),
+                database: String::new(),
+            },
+        )
+        .await;
+        while !matches!(
+            next(&mut conn).await,
+            Some(BackendMessage::ReadyForQuery(_))
+        ) {}
+        conn
+    }
+
+    /// One statement's result as a client sees it.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Reply {
+        /// The command tag, the first column of each row, and the status that followed.
+        Done(String, Vec<String>, TxnStatus),
+        /// The SQLSTATE, and the status that followed.
+        Failed(String, TxnStatus),
+        /// The server closed the connection.
+        Closed,
+    }
+
+    impl Reply {
+        fn code(&self) -> Option<&str> {
+            match self {
+                Self::Failed(code, _) => Some(code),
+                _ => None,
+            }
+        }
+
+        fn is_ok(&self) -> bool {
+            matches!(self, Self::Done(..))
+        }
+    }
+
+    /// Read replies up to the next `ReadyForQuery`.
+    async fn reply(conn: &mut Client) -> Reply {
+        let mut tag = None;
+        let mut code = None;
+        let mut rows = Vec::new();
+        loop {
+            match next(conn).await {
+                None => return Reply::Closed,
+                Some(BackendMessage::CommandComplete { tag: t }) => tag = Some(t),
+                Some(BackendMessage::Error { code: c, .. }) => code = Some(c),
+                Some(BackendMessage::DataRow { values }) => rows.push(
+                    values
+                        .first()
+                        .cloned()
+                        .flatten()
+                        .map(|v| String::from_utf8(v).unwrap())
+                        .unwrap_or_default(),
+                ),
+                Some(BackendMessage::ReadyForQuery(status)) => {
+                    return code.map_or_else(
+                        || Reply::Done(tag.unwrap_or_default(), rows, status),
+                        |code| Reply::Failed(code, status),
+                    );
+                },
+                Some(_) => {},
+            }
+        }
+    }
+
+    async fn run(conn: &mut Client, sql: &str) -> Reply {
+        send(
+            conn,
+            FrontendMessage::Query {
+                sql: sql.to_owned(),
+            },
+        )
+        .await;
+        reply(conn).await
+    }
+
+    /// Run `sql` until it succeeds or [`SETTLE`] passes, returning the last reply.
+    async fn eventually(conn: &mut Client, sql: &str) -> Reply {
+        let deadline = tokio::time::Instant::now() + SETTLE;
+        loop {
+            let reply = run(conn, sql).await;
+            if reply.is_ok() || tokio::time::Instant::now() >= deadline {
+                return reply;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn engine_with_row() -> (Arc<dyn StorageEngine>, Client) {
+        let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+        let mut setup = connect(&engine).await;
+        assert!(
+            run(&mut setup, "CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+                .await
+                .is_ok()
+        );
+        assert!(run(&mut setup, "INSERT INTO t VALUES (1, 0)").await.is_ok());
+        (engine, setup)
+    }
+
+    /// Open a block on `a` that holds the row lock on `t` row 1, and show `b` is shut out by it.
+    async fn hold_row_lock(a: &mut Client, b: &mut Client) {
+        assert!(run(a, "BEGIN").await.is_ok());
+        assert!(run(a, "UPDATE t SET n = 5 WHERE id = 1").await.is_ok());
+        assert_eq!(
+            run(b, "UPDATE t SET n = 6 WHERE id = 1").await.code(),
+            Some("40001"),
+            "the open block holds the row"
+        );
+    }
+
+    /// The reported leak. A panic in a statement that runs on the reactor, inside a block that
+    /// holds a row lock, must not leave that lock held once the session is gone.
+    #[tokio::test]
+    async fn an_inline_panic_does_not_leak_the_open_block() {
+        let (engine, mut b) = engine_with_row().await;
+        let mut a = connect(&engine).await;
+        hold_row_lock(&mut a, &mut b).await;
+
+        let sql = format!("SELECT 1 AS {} /* leak */", fault::PANIC_AFTER_EXECUTE);
+        let _ = run(&mut a, &sql).await;
+        assert!(
+            fault::panicked_inline(&sql),
+            "the panic took the inline path"
+        );
+        drop(a);
+
+        assert!(
+            eventually(&mut b, "UPDATE t SET n = 6 WHERE id = 1")
+                .await
+                .is_ok(),
+            "the row lock of the panicked session is still held"
+        );
+    }
+
+    /// The same panic, seen from the session that hit it: the statement fails with `XX000`, the
+    /// connection stays up, the block is aborted (`25P02`) and holds its locks until `ROLLBACK`,
+    /// as after any other failed statement in a block.
+    #[tokio::test]
+    async fn an_inline_panic_fails_the_statement_and_aborts_the_block() {
+        let (engine, mut b) = engine_with_row().await;
+        let mut a = connect(&engine).await;
+        hold_row_lock(&mut a, &mut b).await;
+
+        let from_less = format!("SELECT 1 AS {} /* block */", fault::PANIC_AFTER_EXECUTE);
+        assert_eq!(
+            run(&mut a, &from_less).await,
+            Reply::Failed(INTERNAL_ERROR.to_owned(), TxnStatus::Failed)
+        );
+        assert!(fault::panicked_inline(&from_less));
+        assert_eq!(
+            run(&mut a, "SELECT 1").await,
+            Reply::Failed("25P02".to_owned(), TxnStatus::Failed)
+        );
+        assert_eq!(
+            run(&mut b, "UPDATE t SET n = 6 WHERE id = 1").await.code(),
+            Some("40001"),
+            "an aborted block keeps its locks until it ends"
+        );
+        assert_eq!(
+            run(&mut a, "ROLLBACK").await,
+            Reply::Done("ROLLBACK".to_owned(), Vec::new(), TxnStatus::Idle)
+        );
+        assert!(run(&mut b, "UPDATE t SET n = 6 WHERE id = 1").await.is_ok());
+
+        // A point lookup on the inline path, outside a block: its own transaction is rolled back
+        // and the connection carries on.
+        let point_get = format!(
+            "SELECT n AS {} FROM t WHERE id = 1 /* auto */",
+            fault::PANIC_AFTER_EXECUTE
+        );
+        assert_eq!(
+            run(&mut a, &point_get).await,
+            Reply::Failed(INTERNAL_ERROR.to_owned(), TxnStatus::Idle)
+        );
+        assert!(fault::panicked_inline(&point_get));
+        assert_eq!(
+            run(&mut a, "SELECT n FROM t WHERE id = 1").await,
+            Reply::Done("SELECT 1".to_owned(), vec!["6".to_owned()], TxnStatus::Idle)
+        );
+    }
+
+    /// The extended protocol reaches the inline path too: the failing `Execute` reports `XX000`,
+    /// the pipeline resumes at `Sync`, and the block is left aborted for the client to end.
+    #[tokio::test]
+    async fn an_inline_panic_under_the_extended_protocol_aborts_the_block() {
+        let (engine, mut b) = engine_with_row().await;
+        let mut a = connect(&engine).await;
+        hold_row_lock(&mut a, &mut b).await;
+
+        let sql = format!(
+            "SELECT n AS {} FROM t WHERE id = $1 /* extended */",
+            fault::PANIC_AFTER_EXECUTE
+        );
+        for msg in [
+            FrontendMessage::Parse {
+                name: String::new(),
+                sql: sql.clone(),
+                param_types: Vec::new(),
+            },
+            FrontendMessage::Bind {
+                portal: String::new(),
+                statement: String::new(),
+                params: vec![Some(b"1".to_vec())],
+                result_formats: Vec::new(),
+            },
+            FrontendMessage::Execute {
+                portal: String::new(),
+                max_rows: 0,
+            },
+            FrontendMessage::Sync,
+        ] {
+            send(&mut a, msg).await;
+        }
+        assert_eq!(
+            reply(&mut a).await,
+            Reply::Failed(INTERNAL_ERROR.to_owned(), TxnStatus::Failed)
+        );
+        assert!(run(&mut a, "ROLLBACK").await.is_ok());
+        assert!(run(&mut b, "UPDATE t SET n = 6 WHERE id = 1").await.is_ok());
+    }
+
+    /// A panic after an auto-commit write executed, on the blocking pool: the statement's own
+    /// transaction is rolled back, so its row lock and its change are both gone.
+    #[tokio::test]
+    async fn a_panic_in_an_autocommit_write_rolls_its_transaction_back() {
+        let (engine, mut b) = engine_with_row().await;
+        let mut a = connect(&engine).await;
+
+        let sql = format!(
+            "UPDATE t SET n = 7 WHERE id = 1 /* {} */",
+            fault::PANIC_AFTER_EXECUTE
+        );
+        assert_eq!(
+            run(&mut a, &sql).await,
+            Reply::Failed(INTERNAL_ERROR.to_owned(), TxnStatus::Idle)
+        );
+        assert!(!fault::panicked_inline(&sql), "a write runs on the pool");
+        assert!(
+            eventually(&mut b, "UPDATE t SET n = 6 WHERE id = 1")
+                .await
+                .is_ok(),
+            "the panicked statement's row lock is still held"
+        );
+        assert_eq!(
+            run(&mut a, "SELECT n FROM t WHERE id = 1").await,
+            Reply::Done("SELECT 1".to_owned(), vec!["6".to_owned()], TxnStatus::Idle)
+        );
+    }
+
+    /// A panic after a write executed inside a block, on the blocking pool: the block is aborted,
+    /// so a following `COMMIT` rolls back instead of committing half a statement.
+    #[tokio::test]
+    async fn a_panic_on_the_pool_inside_a_block_aborts_the_block() {
+        let (engine, mut b) = engine_with_row().await;
+        let mut a = connect(&engine).await;
+        assert!(run(&mut a, "BEGIN").await.is_ok());
+
+        let sql = format!(
+            "UPDATE t SET n = 7 WHERE id = 1 /* {} block */",
+            fault::PANIC_AFTER_EXECUTE
+        );
+        assert_eq!(
+            run(&mut a, &sql).await,
+            Reply::Failed(INTERNAL_ERROR.to_owned(), TxnStatus::Failed)
+        );
+        assert!(!fault::panicked_inline(&sql), "a write runs on the pool");
+        assert_eq!(
+            run(&mut a, "COMMIT").await,
+            Reply::Done("ROLLBACK".to_owned(), Vec::new(), TxnStatus::Idle)
+        );
+        assert_eq!(
+            run(&mut b, "SELECT n FROM t WHERE id = 1").await,
+            Reply::Done("SELECT 1".to_owned(), vec!["0".to_owned()], TxnStatus::Idle)
+        );
+    }
+
+    /// A panic that ends the connection task itself, outside any statement. Every piece of
+    /// session state goes with it: the block and its row lock, the session's advisory lock and
+    /// its temporary schema.
+    #[tokio::test]
+    async fn a_panic_that_ends_the_task_releases_every_session_resource() {
+        let (engine, mut b) = engine_with_row().await;
+        let mut a = connect(&engine).await;
+        assert!(
+            run(&mut a, "CREATE TEMP TABLE scratch (x INT)")
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            run(&mut a, "SELECT nusadb_try_advisory_lock(42)").await,
+            Reply::Done(
+                "SELECT 1".to_owned(),
+                vec!["true".to_owned()],
+                TxnStatus::Idle
+            )
+        );
+        hold_row_lock(&mut a, &mut b).await;
+        assert!(run(&mut a, "INSERT INTO scratch VALUES (1)").await.is_ok());
+        let temp_schemas = "SELECT count(*) FROM information_schema.schemata \
+                            WHERE schema_name LIKE 'nusadb_temp_%'";
+        assert_eq!(
+            run(&mut b, temp_schemas).await,
+            Reply::Done("SELECT 1".to_owned(), vec!["1".to_owned()], TxnStatus::Idle)
+        );
+
+        let task_panic = format!("SELECT 1 AS {}", fault::PANIC_IN_TASK);
+        assert_eq!(run(&mut a, &task_panic).await, Reply::Closed);
+
+        assert!(
+            eventually(&mut b, "UPDATE t SET n = 6 WHERE id = 1")
+                .await
+                .is_ok(),
+            "the row lock outlived the session"
+        );
+        assert_eq!(
+            run(&mut b, "SELECT nusadb_try_advisory_lock(42)").await,
+            Reply::Done(
+                "SELECT 1".to_owned(),
+                vec!["true".to_owned()],
+                TxnStatus::Idle
+            ),
+            "the advisory lock outlived the session"
+        );
+        assert_eq!(
+            run(&mut b, temp_schemas).await,
+            Reply::Done("SELECT 1".to_owned(), vec!["0".to_owned()], TxnStatus::Idle),
+            "the temporary schema outlived the session"
+        );
+    }
+
+    /// A prepared transaction belongs to no connection: neither a panic that ends the session
+    /// that prepared it nor a plain disconnect may roll it back.
+    #[tokio::test]
+    async fn a_prepared_transaction_survives_the_session_that_prepared_it() {
+        let (engine, mut b) = engine_with_row().await;
+        for (gid, n, ends_in_panic) in [("by_panic", 5, true), ("by_close", 8, false)] {
+            let mut a = connect(&engine).await;
+            assert!(run(&mut a, "BEGIN").await.is_ok());
+            assert!(
+                run(&mut a, &format!("UPDATE t SET n = {n} WHERE id = 1"))
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                run(&mut a, &format!("PREPARE TRANSACTION '{gid}'"))
+                    .await
+                    .is_ok()
+            );
+            if ends_in_panic {
+                let task_panic = format!("SELECT 1 AS {}", fault::PANIC_IN_TASK);
+                assert_eq!(run(&mut a, &task_panic).await, Reply::Closed);
+            } else {
+                drop(a);
+            }
+            // Give a teardown time to run, then show the prepared transaction still holds its row.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                run(&mut b, "UPDATE t SET n = 6 WHERE id = 1").await.code(),
+                Some("40001"),
+                "the prepared transaction {gid} was rolled back"
+            );
+            assert!(
+                run(&mut b, &format!("COMMIT PREPARED '{gid}'"))
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(
+                run(&mut b, "SELECT n FROM t WHERE id = 1").await,
+                Reply::Done("SELECT 1".to_owned(), vec![n.to_string()], TxnStatus::Idle)
+            );
+        }
     }
 }
