@@ -1118,7 +1118,7 @@ where
                         user.clone(),
                         Arc::clone(&cancel_token),
                         statement_timeout,
-                        *txn_state,
+                        &mut *txn_state,
                         typed_row_description,
                         array_element_types,
                         notices_enabled,
@@ -1343,7 +1343,7 @@ where
                         user.clone(),
                         Arc::clone(&cancel_token),
                         statement_timeout,
-                        *txn_state,
+                        &mut *txn_state,
                         typed_row_description,
                         array_element_types,
                         notices_enabled,
@@ -3606,7 +3606,10 @@ async fn stream_query_to_conn<S>(
     user: String,
     cancel: nusadb_sql::cancel::CancelToken,
     statement_timeout: Option<Duration>,
-    state: TxnState,
+    // The connection's transaction state. It is set to the state the statement leaves before the
+    // statement's outcome is written, so a connection that fails while writing still ends the
+    // transaction the statement left open, not the one it found.
+    txn_state: &mut TxnState,
     typed: bool,
     array_elements: bool,
     // Protocol minor 3: the statement's notices are sent ahead of its completion.
@@ -3624,6 +3627,7 @@ async fn stream_query_to_conn<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let state = *txn_state;
     // Reset the per-connection cancel flag for this statement (matching `run_blocking`): a cancel
     // that arrived between statements must not abort this one.
     cancel.store(false, Ordering::Relaxed);
@@ -3705,6 +3709,7 @@ where
                 log_statement_panic(&*payload);
                 // Notices raised before the panic belong to a statement that reports none.
                 nusadb_sql::notice::clear();
+                *txn_state = state.aborted();
                 let ok = write_statement_outcome(
                     conn,
                     Err(("internal execution error".to_owned(), INTERNAL_ERROR)),
@@ -3721,6 +3726,7 @@ where
                 if point_get {
                     INLINE_POINT_GET_RUNS.fetch_add(1, Ordering::Relaxed);
                 }
+                *txn_state = new_state;
                 let ok =
                     write_statement_outcome(conn, outcome, tail, suppress_row_description).await?;
                 return Ok((ok, new_state, new_cache));
@@ -3849,6 +3855,7 @@ where
         timer.abort();
     }
 
+    *txn_state = new_state;
     if let Some(err) = write_err {
         return Err(err);
     }
@@ -6411,7 +6418,7 @@ where
         batch.user.to_owned(),
         Arc::clone(batch.cancel),
         batch.statement_timeout,
-        old_state,
+        &mut *batch.txn_state,
         batch.typed,
         batch.array_elements,
         batch.notices,
@@ -7090,6 +7097,20 @@ mod teardown_tests {
         }
     }
 
+    /// Run `sql` until it replies `expected` or [`SETTLE`] passes, returning the last reply. The
+    /// teardown releases the row lock first and the advisory locks last, so a check of a later
+    /// step must wait for it too.
+    async fn eventually_eq(conn: &mut Client, sql: &str, expected: &Reply) -> Reply {
+        let deadline = tokio::time::Instant::now() + SETTLE;
+        loop {
+            let reply = run(conn, sql).await;
+            if reply == *expected || tokio::time::Instant::now() >= deadline {
+                return reply;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     async fn engine_with_row() -> (Arc<dyn StorageEngine>, Client) {
         let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
         let mut setup = connect(&engine).await;
@@ -7317,18 +7338,21 @@ mod teardown_tests {
                 .is_ok(),
             "the row lock outlived the session"
         );
-        assert_eq!(
-            run(&mut b, "SELECT nusadb_try_advisory_lock(42)").await,
-            Reply::Done(
-                "SELECT 1".to_owned(),
-                vec!["true".to_owned()],
-                TxnStatus::Idle
-            ),
-            "the advisory lock outlived the session"
+        let lock_taken = Reply::Done(
+            "SELECT 1".to_owned(),
+            vec!["true".to_owned()],
+            TxnStatus::Idle,
         );
         assert_eq!(
-            run(&mut b, temp_schemas).await,
-            Reply::Done("SELECT 1".to_owned(), vec!["0".to_owned()], TxnStatus::Idle),
+            eventually_eq(&mut b, "SELECT nusadb_try_advisory_lock(42)", &lock_taken).await,
+            lock_taken,
+            "the advisory lock outlived the session"
+        );
+        let no_temp_schema =
+            Reply::Done("SELECT 1".to_owned(), vec!["0".to_owned()], TxnStatus::Idle);
+        assert_eq!(
+            eventually_eq(&mut b, temp_schemas, &no_temp_schema).await,
+            no_temp_schema,
             "the temporary schema outlived the session"
         );
     }

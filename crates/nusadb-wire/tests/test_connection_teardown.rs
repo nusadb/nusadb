@@ -225,3 +225,71 @@ async fn a_connection_aborted_by_shutdown_does_not_leak_the_open_block() {
     );
     drop(a);
 }
+
+/// Parse, bind and execute `sql` in the unnamed portal, without waiting for a reply.
+async fn execute<S: AsyncRead + AsyncWrite + Unpin>(conn: &mut Connection<S>, sql: &str) {
+    send(
+        conn,
+        FrontendMessage::Parse {
+            name: String::new(),
+            sql: sql.to_owned(),
+            param_types: Vec::new(),
+        },
+    )
+    .await;
+    send(
+        conn,
+        FrontendMessage::Bind {
+            portal: String::new(),
+            statement: String::new(),
+            params: Vec::new(),
+            result_formats: Vec::new(),
+        },
+    )
+    .await;
+    send(
+        conn,
+        FrontendMessage::Execute {
+            portal: String::new(),
+            max_rows: 0,
+        },
+    )
+    .await;
+}
+
+/// A statement that opens a block, and whose reply is the write that finds the client gone. The
+/// block it opened must be rolled back, which only happens if the teardown sees the state the
+/// statement left rather than the one it found.
+#[tokio::test]
+async fn a_block_opened_by_a_statement_whose_reply_fails_is_rolled_back() {
+    // A durable engine: only it checkpoints.
+    let dir = nusadb_test_utils::temp_dir();
+    let engine: Arc<dyn StorageEngine> =
+        Arc::new(BtreeEngine::open(dir.path().join("db")).unwrap());
+    let mut b = connect(&engine).await;
+    assert_eq!(run(&mut b, "CHECKPOINT").await, Ok("CHECKPOINT".to_owned()));
+
+    let mut raw = open(&engine);
+    let mut a = Connection::new(&mut raw);
+    start(&mut a).await;
+    // The first reply leaves the server's output just below its 64 KiB flush threshold, so the
+    // reply to BEGIN is the write that sends it, after the client has gone.
+    execute(&mut a, "SELECT repeat('x', 65480)").await;
+    execute(&mut a, "BEGIN").await;
+    send(&mut a, FrontendMessage::Sync).await;
+    drop(a);
+    drop(raw);
+
+    // A checkpoint refuses while any transaction is open, so it shows whether one leaked.
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    let mut last = run(&mut b, "CHECKPOINT").await;
+    while last.is_err() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        last = run(&mut b, "CHECKPOINT").await;
+    }
+    assert_eq!(
+        last,
+        Ok("CHECKPOINT".to_owned()),
+        "the block the statement opened outlived the session"
+    );
+}
