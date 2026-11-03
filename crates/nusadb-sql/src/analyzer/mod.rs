@@ -619,6 +619,10 @@ pub struct IndexInfo {
     /// Whether the index enforces key uniqueness — an equality bound covering the whole key
     /// then matches at most one row, which the reactor-inline point-get gate relies on.
     pub unique: bool,
+    /// A partial index's predicate (SQL text, as cataloged); `None` for an index over every row.
+    /// The analyzer resolves it, and the planner scans the index only for a query whose `WHERE`
+    /// implies it.
+    pub predicate: Option<String>,
 }
 
 /// Blank-pad each fixed-width `CHAR(n)` output column to width `n` for the client-facing result of a

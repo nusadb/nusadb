@@ -4330,38 +4330,197 @@ fn scannable_indexes_of(
     txn: TxnId,
     schema: &TableSchema,
 ) -> Result<Vec<crate::IndexInfo>, Error> {
-    let mut out = Vec::new();
-    for def in engine.list_indexes_as_of(txn, schema.id)? {
+    let defs = engine.list_indexes_as_of(txn, schema.id)?;
+    let mut out = Vec::with_capacity(defs.len());
+    let has_char = schema
+        .columns
+        .iter()
+        .any(|c| matches!(c.ty, ColumnType::Char(_)));
+    for mut def in defs {
         let Some(id) = engine.lookup_index(&def.name)? else {
             continue;
         };
         if !engine.index_is_complete(id)? {
             continue;
         }
-        // A partial index holds only the rows satisfying its predicate, so a scan through it could
-        // miss rows: it is maintained (and enforces uniqueness) but not offered as a scan path. An
-        // index keyed on expressions is offered; the planner uses it only for a predicate on the
+        // A partial index holds only the rows satisfying its predicate. It is offered with that
+        // predicate, and the planner scans it only for a query whose `WHERE` implies it. An index
+        // keyed on expressions is offered too; the planner uses it only for a predicate on the
         // same expression.
-        if unique_index::split_predicate(&def).0.is_some() {
-            continue;
-        }
+        let predicate_len = unique_index::split_predicate(&def).0.map(str::len);
         // An index an earlier release built over a CHAR(n) column may hold a value with trailing
         // blanks its row no longer has. A column index is scanned through every spelling of the
         // key (`scan::legacy_index_entries`); an expression over such a column cannot be spelled,
-        // so that index is not offered until REINDEX.
-        if !def.key_exprs.is_empty()
+        // and a predicate over one may have admitted rows by that older value, so such an index is
+        // not offered until REINDEX. Only a table with a CHAR(n) column can hold one, which keeps
+        // the check (it re-reads the key and predicate) off every other table.
+        if (!def.key_exprs.is_empty() || predicate_len.is_some())
+            && has_char
             && char_canon::needs_legacy_probe(engine, txn, id, &def, schema)?
         {
             continue;
         }
+        // The predicate is what follows the `NULLS NOT DISTINCT` tag, if any: the stored text's end.
+        let predicate = predicate_len
+            .zip(def.predicate.take())
+            .map(|(len, mut text)| {
+                text.drain(..text.len().saturating_sub(len));
+                text
+            });
         out.push(crate::IndexInfo {
             name: def.name,
             columns: def.columns,
             key_exprs: def.key_exprs,
             unique: def.unique,
+            predicate,
         });
     }
     Ok(out)
+}
+
+/// A partial index's predicate as the planner holds it: its top-level `AND` conjuncts, resolved
+/// against the table and constant-folded, shared rather than copied.
+pub(crate) type PartialPredicate = std::sync::Arc<[crate::planner::TypedExpr]>;
+
+/// The column ordinals a partial index's predicate reads, sorted.
+pub(crate) type PredicateColumns = std::sync::Arc<[usize]>;
+
+/// The partial-index predicates of `table`, resolved for the planner (see
+/// [`PartialPredicates::get`]).
+///
+/// A resolved predicate depends only on its text and on the table's name and columns (the analysis
+/// resolves nothing through a catalog), so each thread remembers what it resolved, per table. The
+/// table's name and columns are compared once here, not once per index, and a predicate already
+/// resolved is handed out as a shared reference: planning a query on a table with many partial
+/// indexes neither re-parses nor copies them.
+pub(crate) fn partial_index_predicates(table: &TableSchema) -> PartialPredicates<'_> {
+    PREDICATE_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        let current = memo
+            .get(&table.id)
+            .is_some_and(|m| m.name == table.name && m.columns == table.columns);
+        if !current {
+            if memo.len() >= MEMO_TABLES && !memo.contains_key(&table.id) {
+                memo.clear();
+            }
+            memo.insert(table.id, TableMemo::of(table));
+        }
+    });
+    PartialPredicates { table }
+}
+
+/// How many tables a thread remembers predicates for, and how many predicates per table, before
+/// it starts over.
+const MEMO_TABLES: usize = 64;
+const MEMO_PREDICATES: usize = 256;
+
+/// The predicates resolved against one table (by name and columns, which is all they depend on).
+struct TableMemo {
+    name: String,
+    columns: Vec<ColumnDef>,
+    resolved: HashMap<String, Option<(PartialPredicate, PredicateColumns)>>,
+}
+
+impl TableMemo {
+    fn of(table: &TableSchema) -> Self {
+        Self {
+            name: table.name.clone(),
+            columns: table.columns.clone(),
+            resolved: HashMap::new(),
+        }
+    }
+
+    fn is_for(&self, table: &TableSchema) -> bool {
+        self.name == table.name && self.columns == table.columns
+    }
+}
+
+thread_local! {
+    static PREDICATE_MEMO: std::cell::RefCell<HashMap<nusadb_core::TableId, TableMemo>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// The partial-index predicates of one table (from [`partial_index_predicates`]).
+pub(crate) struct PartialPredicates<'t> {
+    table: &'t TableSchema,
+}
+
+impl PartialPredicates<'_> {
+    /// The predicate `sql` of one of the table's partial indexes, resolved exactly as the write
+    /// path resolves it to decide which rows the index holds (`dml::build_index_target`), so the
+    /// planner reasons about the same predicate. `None` when it no longer analyzes (the write path
+    /// then does not maintain the index) or when its value could depend on the session (a
+    /// `TIMESTAMPTZ`/`TIMETZ` value): such an index is never scanned. With it come the columns it
+    /// reads: a query whose `WHERE` reads not all of them cannot imply it.
+    pub(crate) fn get(&self, sql: &str) -> Option<(PartialPredicate, PredicateColumns)> {
+        let table = self.table;
+        let hit = PREDICATE_MEMO.with(|memo| {
+            memo.borrow()
+                .get(&table.id)
+                .and_then(|m| m.resolved.get(sql).cloned())
+        });
+        if let Some(found) = hit {
+            return found;
+        }
+        let resolved = resolve_partial_index_predicate(sql, table).map(|conjuncts| {
+            let mut columns = Vec::new();
+            for conjunct in &conjuncts {
+                crate::planner::collect_columns(conjunct, &mut columns);
+            }
+            columns.sort_unstable();
+            columns.dedup();
+            (
+                PartialPredicate::from(conjuncts),
+                PredicateColumns::from(columns),
+            )
+        });
+        PREDICATE_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            let entry = memo.entry(table.id).or_insert_with(|| TableMemo::of(table));
+            if entry.is_for(table) {
+                if entry.resolved.len() >= MEMO_PREDICATES {
+                    entry.resolved.clear();
+                }
+                entry.resolved.insert(sql.to_owned(), resolved.clone());
+            }
+        });
+        resolved
+    }
+}
+
+/// [`PartialPredicates::get`] without the memo.
+fn resolve_partial_index_predicate(
+    sql: &str,
+    table: &TableSchema,
+) -> Option<Vec<crate::planner::TypedExpr>> {
+    fn flatten(expr: crate::planner::TypedExpr, out: &mut Vec<crate::planner::TypedExpr>) {
+        match expr.kind {
+            crate::planner::TypedExprKind::Binary {
+                left,
+                op: ast::BinaryOp::And,
+                right,
+            } => {
+                flatten(*left, out);
+                flatten(*right, out);
+            },
+            kind => out.push(crate::planner::TypedExpr { kind, ty: expr.ty }),
+        }
+    }
+    let typed = crate::analyzer::analyze_check_predicate(sql, table, &dml::EmptyCatalog).ok()?;
+    if !crate::analyzer::expr_is_index_immutable(&typed) {
+        return None;
+    }
+    let folded = crate::planner::fold_constants(typed);
+    let mut conjuncts = Vec::new();
+    flatten(folded, &mut conjuncts);
+    // A predicate folded to `true` holds for every row.
+    conjuncts.retain(|c| {
+        !matches!(
+            c.kind,
+            crate::planner::TypedExprKind::Literal(ast::Value::Bool(true))
+        )
+    });
+    Some(conjuncts)
 }
 
 /// The ANALYZE statistics of table `name` under `txn`'s snapshot, for cost-based planning

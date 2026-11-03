@@ -1952,6 +1952,10 @@ pub struct IndexMeta {
     pub key_exprs: Vec<TypedExpr>,
     /// Whether the index enforces key uniqueness (from [`crate::analyzer::IndexInfo::unique`]).
     pub unique: bool,
+    /// A partial index's predicate as its top-level `AND` conjuncts, resolved against the table and
+    /// constant-folded; `None` for an index over every row. A scan may use a partial index only
+    /// when the query's `WHERE` implies every conjunct (`planner::implication`).
+    pub predicate: Option<std::sync::Arc<[TypedExpr]>>,
 }
 
 /// One resolved join in a [`SelectPlan`].

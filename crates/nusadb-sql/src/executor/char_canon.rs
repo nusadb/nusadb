@@ -338,8 +338,10 @@ pub(super) fn needs_legacy_probe(
 
 /// `REINDEX { INDEX | TABLE | SCHEMA | DATABASE | SYSTEM } name`: rebuild every legacy index
 /// among the target's from its rows, so its entries are canonical, and take it out of the legacy
-/// set. An index that is already canonical, or reads no `CHAR(n)` column, is left alone (there is
-/// nothing it could hold out of form). A rebuilt index keeps its name, key, predicate,
+/// set. Every other index the target names keeps its id and has its entries brought in line with
+/// the rows in place ([`dml::resync_table_indexes`]): each row it holds under its current key, and
+/// a partial index exactly the rows its predicate accepts under the columns as they are now, a
+/// row it should not hold having its entry dead-stamped. A rebuilt index keeps its name, key, predicate,
 /// `NULLS [NOT] DISTINCT`, uniqueness and what refers to it by name (comments, the deferral of its
 /// constraint, an exclusion constraint owning it); a key constraint's referencing foreign keys are
 /// dropped and added back around it. Rows are streamed, never held whole. The statement is one
@@ -389,6 +391,12 @@ pub(super) fn run_reindex(
     let mut fks_done: HashSet<String> = HashSet::new();
     for (table, index_name) in tables {
         let wanted = |name: &str| index_name.as_deref().is_none_or(|n| n == name);
+        // Every other index the target names has its entries brought in line with its rows, in
+        // place: a partial index holds exactly the rows its predicate accepts under the table's
+        // columns as they are now, and every row it holds sits under its current key. A row that
+        // leaves an index has its entry dead-stamped, so a snapshot older than the statement keeps
+        // reading what it read before.
+        let mut in_place = Vec::new();
         for def in engine.list_indexes_as_of(txn, table.id)? {
             if !wanted(&def.name) {
                 continue;
@@ -397,6 +405,7 @@ pub(super) fn run_reindex(
                 continue;
             };
             if !reads_char(&def, &table) || !state.is_legacy(id) {
+                in_place.push(id);
                 continue;
             }
             // A foreign key rebuilt with its referenced key already has a new child index.
@@ -405,6 +414,10 @@ pub(super) fn run_reindex(
             }
             rebuilt.push(id);
             rebuild_index(engine, txn, &table, &def, id, &mut fks_done, &mut rebuilt)?;
+        }
+        if !in_place.is_empty() {
+            let _fresh = super::ddl::hold_fresh(table.id, engine, txn)?;
+            dml::resync_table_indexes(&table, &in_place, engine, txn)?;
         }
     }
     forget_rebuilt(engine, txn, &rebuilt)?;
@@ -1245,6 +1258,43 @@ mod tests {
             .map(|v| crate::display::value_text(&v))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A partial index an earlier release built with a predicate over a `CHAR(n)` column is not
+    /// read until `REINDEX` rebuilds it, and then it is; both times the query answers as the rows
+    /// do.
+    #[test]
+    fn a_legacy_partial_index_over_char_is_read_only_after_reindex() {
+        let engine = BtreeEngine::new();
+        ok(
+            &engine,
+            "CREATE TABLE lp (n INT NOT NULL, c CHAR(3), k INT NOT NULL)",
+        );
+        ok(&engine, "CREATE INDEX lp_c ON lp (k) WHERE c = 'a'");
+        reset_to_legacy(&engine);
+        write_old(
+            &engine,
+            "lp",
+            &[
+                vec![int(1), text("a  "), int(1)],
+                vec![int(2), text("a"), int(2)],
+                vec![int(3), text("b  "), int(0)],
+                vec![int(4), ast::Value::Null, int(0)],
+            ],
+        );
+        let q = "SELECT count(*) FROM lp WHERE c = 'a' AND k >= 0";
+        let first = "SELECT n FROM lp WHERE c = 'a' ORDER BY k LIMIT 1";
+        assert!(is_legacy(&engine, "lp_c"));
+        assert!(!plan_of(&engine, q).contains("lp_c"));
+        assert!(!plan_of(&engine, first).contains("lp_c"));
+        assert_eq!(count(&engine, q), 2);
+        assert_eq!(rows_of(&engine, first), vec![vec![int(1)]]);
+        ok(&engine, "REINDEX TABLE lp");
+        assert!(!is_legacy(&engine, "lp_c"));
+        assert!(plan_of(&engine, q).contains("using lp_c"));
+        assert!(plan_of(&engine, first).contains("using lp_c"));
+        assert_eq!(count(&engine, q), 2);
+        assert_eq!(rows_of(&engine, first), vec![vec![int(1)]]);
     }
 
     /// A legacy index is still read through, with every spelling of a key found, ranges and

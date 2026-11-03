@@ -1,0 +1,782 @@
+# Column DDL on a table with partial indexes. The planner scans a partial index only for a query
+# whose WHERE implies its predicate, so after any DDL the index must hold exactly the rows its
+# predicate accepts under the table's current columns. Every query below also runs against a copy
+# of the table with no index (`*_plain`), and the two must return the same rows.
+
+# ALTER COLUMN TYPE on a column the predicate reads: TEXT to INT turns a text comparison into a
+# numeric one, so a row the index left out ('10' > '5' is false as text) now belongs in it.
+
+statement ok
+CREATE TABLE a3 (id INT PRIMARY KEY, v TEXT, k INT NOT NULL)
+
+statement ok
+CREATE TABLE a3_plain (id INT PRIMARY KEY, v TEXT, k INT NOT NULL)
+
+statement ok
+CREATE INDEX a3i ON a3 (k) WHERE v > '5'
+
+statement ok
+INSERT INTO a3 VALUES (1, '10', 1), (2, '7', 2), (3, NULL, 3), (4, '3', 4)
+
+statement ok
+INSERT INTO a3_plain SELECT * FROM a3
+
+statement ok
+ALTER TABLE a3 ALTER COLUMN v TYPE INT
+
+statement ok
+ALTER TABLE a3_plain ALTER COLUMN v TYPE INT
+
+query T
+EXPLAIN SELECT id FROM a3 WHERE v > '5' AND k >= 0
+----
+Project (1 column(s))
+  Filter
+    IndexScan: a3 using a3i
+
+query I rowsort
+SELECT id FROM a3 WHERE v > '5' AND k >= 0
+----
+1
+2
+
+query I rowsort
+SELECT id FROM a3_plain WHERE v > '5' AND k >= 0
+----
+1
+2
+
+# NUMERIC to INT rounds 5.4 down to 5, so its row leaves the index of `v > 5`.
+
+statement ok
+CREATE TABLE a1 (id INT PRIMARY KEY, v NUMERIC(6,2), k INT NOT NULL)
+
+statement ok
+CREATE TABLE a1_plain (id INT PRIMARY KEY, v NUMERIC(6,2), k INT NOT NULL)
+
+statement ok
+CREATE INDEX a1i ON a1 (k) WHERE v > 5
+
+statement ok
+INSERT INTO a1 VALUES (1, 5.4, 1), (2, 6, 2), (3, 7, 3), (4, NULL, 4)
+
+statement ok
+INSERT INTO a1_plain SELECT * FROM a1
+
+statement ok
+ALTER TABLE a1 ALTER COLUMN v TYPE INT
+
+statement ok
+ALTER TABLE a1_plain ALTER COLUMN v TYPE INT
+
+query T
+EXPLAIN SELECT id FROM a1 WHERE v > 5 ORDER BY k LIMIT 1
+----
+Limit 1
+  Project (1 column(s))
+    Filter
+      IndexScan: a1 using a1i
+
+query I
+SELECT id FROM a1 WHERE v > 5 ORDER BY k LIMIT 1
+----
+2
+
+query I
+SELECT id FROM a1_plain WHERE v > 5 ORDER BY k LIMIT 1
+----
+2
+
+query I rowsort
+SELECT id FROM a1 WHERE v > 5 AND k >= 0
+----
+2
+3
+
+query I rowsort
+SELECT id FROM a1_plain WHERE v > 5 AND k >= 0
+----
+2
+3
+
+# REINDEX keeps a correct index correct
+
+statement ok
+REINDEX INDEX a1i
+
+statement ok
+REINDEX TABLE a3
+
+query I rowsort
+SELECT id FROM a3 WHERE v > '5' AND k >= 0
+----
+1
+2
+
+query I
+SELECT id FROM a1 WHERE v > 5 ORDER BY k LIMIT 1
+----
+2
+
+# a type change on the key column of a partial index whose predicate reads another column: keys
+# are encoded from the cast values
+
+statement ok
+CREATE TABLE kt (id INT PRIMARY KEY, v TEXT, k INT)
+
+statement ok
+CREATE INDEX kt_v ON kt (v) WHERE k > 2
+
+statement ok
+INSERT INTO kt VALUES (1, '10', 3), (2, '10', 1), (3, '9', 4), (4, NULL, 5), (5, '9', NULL)
+
+statement ok
+CREATE TABLE kt_plain AS SELECT * FROM kt
+
+statement ok
+ALTER TABLE kt ALTER COLUMN v TYPE INT
+
+statement ok
+ALTER TABLE kt_plain ALTER COLUMN v TYPE INT
+
+query T
+EXPLAIN SELECT id FROM kt WHERE v = 10 AND k > 2
+----
+Project (1 column(s))
+  Filter
+    IndexScan: kt using kt_v
+
+query I rowsort
+SELECT id FROM kt WHERE v = 10 AND k > 2
+----
+1
+
+query I rowsort
+SELECT id FROM kt_plain WHERE v = 10 AND k > 2
+----
+1
+
+query I rowsort
+SELECT id FROM kt WHERE v >= 9 AND k > 2
+----
+1
+3
+
+query I rowsort
+SELECT id FROM kt_plain WHERE v >= 9 AND k > 2
+----
+1
+3
+
+# a partial unique index whose predicate reads the retyped column: rows the new type admits are
+# checked for duplicates, and a duplicate refuses the change and leaves the table as it was
+
+statement ok
+CREATE TABLE ut (id INT PRIMARY KEY, v TEXT, k INT)
+
+statement ok
+CREATE UNIQUE INDEX ut_k ON ut (k) WHERE v > '5'
+
+statement ok
+INSERT INTO ut VALUES (1, '10', 1), (2, '7', 1), (3, '3', 2)
+
+statement error duplicate key
+ALTER TABLE ut ALTER COLUMN v TYPE INT
+
+query T
+SELECT v FROM ut WHERE k = 1 AND v > '5'
+----
+7
+
+statement ok
+DELETE FROM ut WHERE id = 2
+
+statement ok
+ALTER TABLE ut ALTER COLUMN v TYPE INT
+
+query I
+SELECT id FROM ut WHERE k = 1 AND v > 5
+----
+1
+
+statement error duplicate key
+INSERT INTO ut VALUES (4, 6, 1)
+
+statement ok
+INSERT INTO ut VALUES (4, 5, 1)
+
+# an expression-keyed partial index over the retyped column
+
+statement ok
+CREATE TABLE et (id INT PRIMARY KEY, v NUMERIC(6,2), k INT)
+
+statement ok
+CREATE INDEX et_e ON et ((k * 2)) WHERE v > 5
+
+statement ok
+INSERT INTO et VALUES (1, 5.4, 1), (2, 6, 1), (3, 4.6, 1), (4, NULL, 1), (5, 7, 2)
+
+statement ok
+CREATE TABLE et_plain AS SELECT * FROM et
+
+statement ok
+ALTER TABLE et ALTER COLUMN v TYPE INT
+
+statement ok
+ALTER TABLE et_plain ALTER COLUMN v TYPE INT
+
+query T
+EXPLAIN SELECT id FROM et WHERE k * 2 = 2 AND v > 5
+----
+Project (1 column(s))
+  Filter
+    IndexScan: et using et_e
+
+query I rowsort
+SELECT id FROM et WHERE k * 2 = 2 AND v > 5
+----
+2
+
+query I rowsort
+SELECT id FROM et_plain WHERE k * 2 = 2 AND v > 5
+----
+2
+
+# a type change rolled back leaves the index as it was
+
+statement ok
+CREATE TABLE rb (id INT PRIMARY KEY, v TEXT, k INT NOT NULL)
+
+statement ok
+CREATE INDEX rb_i ON rb (k) WHERE v > '5'
+
+statement ok
+INSERT INTO rb VALUES (1, '10', 1), (2, '7', 2), (3, '3', 3)
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE rb ALTER COLUMN v TYPE INT
+
+query I rowsort
+SELECT id FROM rb WHERE v > 5 AND k >= 0
+----
+1
+2
+
+statement ok
+ROLLBACK
+
+query I rowsort
+SELECT id FROM rb WHERE v > '5' AND k >= 0
+----
+2
+
+query I
+SELECT id FROM rb WHERE v > '5' ORDER BY k LIMIT 1
+----
+2
+
+# RENAME COLUMN: the stored predicate follows the column, so a column added later under the old
+# name is not what the index filters on. The same session plans the query before and after.
+
+statement ok
+CREATE TABLE rn (id INT PRIMARY KEY, v INT, k INT NOT NULL)
+
+statement ok
+CREATE INDEX rn_i ON rn (k) WHERE v > 5
+
+statement ok
+INSERT INTO rn VALUES (1, 10, 1), (2, 1, 2), (3, NULL, 3), (4, 6, 4)
+
+statement ok
+CREATE TABLE rn_plain AS SELECT * FROM rn
+
+query I rowsort
+SELECT id FROM rn WHERE v > 5 AND k >= 0
+----
+1
+4
+
+statement ok
+ALTER TABLE rn RENAME COLUMN v TO w
+
+statement ok
+ALTER TABLE rn_plain RENAME COLUMN v TO w
+
+statement error
+SELECT id FROM rn WHERE v > 5 AND k >= 0
+
+query T
+EXPLAIN SELECT id FROM rn WHERE w > 5 AND k >= 0
+----
+Project (1 column(s))
+  Filter
+    IndexScan: rn using rn_i
+
+query I rowsort
+SELECT id FROM rn WHERE w > 5 AND k >= 0
+----
+1
+4
+
+statement ok
+ALTER TABLE rn ADD COLUMN v INT DEFAULT 100
+
+statement ok
+ALTER TABLE rn_plain ADD COLUMN v INT DEFAULT 100
+
+query T
+EXPLAIN SELECT id FROM rn WHERE v > 5 AND k >= 0
+----
+Project (1 column(s))
+  Filter
+    SeqScan: rn (project 3/4 cols)
+
+query I rowsort
+SELECT id FROM rn WHERE v > 5 AND k >= 0
+----
+1
+2
+3
+4
+
+query I rowsort
+SELECT id FROM rn_plain WHERE v > 5 AND k >= 0
+----
+1
+2
+3
+4
+
+query I rowsort
+SELECT id FROM rn WHERE w > 5 AND k >= 0
+----
+1
+4
+
+query I rowsort
+SELECT id FROM rn_plain WHERE w > 5 AND k >= 0
+----
+1
+4
+
+# the key column renamed too
+
+statement ok
+ALTER TABLE rn RENAME COLUMN k TO kk
+
+query T
+EXPLAIN SELECT id FROM rn WHERE w > 5 ORDER BY kk LIMIT 1
+----
+Limit 1
+  Project (1 column(s))
+    Filter
+      IndexScan: rn using rn_i
+
+query I
+SELECT id FROM rn WHERE w > 5 ORDER BY kk LIMIT 1
+----
+1
+
+statement ok
+UPDATE rn SET w = 0 WHERE id = 1
+
+query I
+SELECT id FROM rn WHERE w > 5 ORDER BY kk LIMIT 1
+----
+4
+
+# DROP COLUMN: an index whose predicate reads the column goes with it, so a column added later
+# under that name starts with no index; an index on later columns survives the ordinal shift
+
+statement ok
+CREATE TABLE dc (id INT PRIMARY KEY, a INT, v INT, k INT NOT NULL)
+
+statement ok
+CREATE INDEX dc_v ON dc (k) WHERE v > 5
+
+statement ok
+CREATE INDEX dc_a ON dc (k) WHERE a > 5
+
+statement ok
+INSERT INTO dc VALUES (1, 10, 10, 1), (2, 1, 1, 2), (3, NULL, NULL, 3), (4, 6, 6, 4), (5, 9, 2, 5)
+
+statement ok
+CREATE TABLE dc_plain AS SELECT * FROM dc
+
+query I rowsort
+SELECT id FROM dc WHERE a > 5 AND k >= 0
+----
+1
+4
+5
+
+statement ok
+ALTER TABLE dc DROP COLUMN a
+
+statement ok
+ALTER TABLE dc_plain DROP COLUMN a
+
+query T
+EXPLAIN SELECT id FROM dc WHERE v > 5 AND k >= 0
+----
+Project (1 column(s))
+  Filter
+    IndexScan: dc using dc_v
+
+query I rowsort
+SELECT id FROM dc WHERE v > 5 AND k >= 0
+----
+1
+4
+
+query I rowsort
+SELECT id FROM dc_plain WHERE v > 5 AND k >= 0
+----
+1
+4
+
+statement ok
+ALTER TABLE dc ADD COLUMN a INT DEFAULT 7
+
+statement ok
+ALTER TABLE dc_plain ADD COLUMN a INT DEFAULT 7
+
+query T
+EXPLAIN SELECT id FROM dc WHERE a > 5 AND k >= 0
+----
+Project (1 column(s))
+  Filter
+    SeqScan: dc (project 3/4 cols)
+
+query I rowsort
+SELECT id FROM dc WHERE a > 5 AND k >= 0
+----
+1
+2
+3
+4
+5
+
+statement ok
+ALTER TABLE dc DROP COLUMN v
+
+query T
+EXPLAIN SELECT id FROM dc WHERE k = 1
+----
+Project (1 column(s))
+  Filter
+    SeqScan: dc (project 2/3 cols)
+
+# ADD COLUMN with a DEFAULT rewrites every row and keeps a partial index exact; a STORED generated
+# column can carry a partial index of its own, kept as its base column changes
+
+statement ok
+CREATE TABLE ga (id INT PRIMARY KEY, v INT, k INT NOT NULL)
+
+statement ok
+CREATE INDEX ga_v ON ga (k) WHERE v > 5
+
+statement ok
+INSERT INTO ga VALUES (1, 10, 1), (2, 1, 2), (3, NULL, 3), (4, 6, 4)
+
+statement ok
+CREATE TABLE ga_plain AS SELECT * FROM ga
+
+statement ok
+ALTER TABLE ga ADD COLUMN d INT DEFAULT 3
+
+statement ok
+ALTER TABLE ga_plain ADD COLUMN d INT DEFAULT 3
+
+statement ok
+ALTER TABLE ga ADD COLUMN g INT GENERATED ALWAYS AS (v * 2) STORED
+
+statement ok
+ALTER TABLE ga_plain ADD COLUMN g INT GENERATED ALWAYS AS (v * 2) STORED
+
+statement ok
+CREATE INDEX ga_g ON ga (k) WHERE g > 15
+
+query T
+EXPLAIN SELECT id FROM ga WHERE g > 15 ORDER BY k LIMIT 1
+----
+Limit 1
+  Project (1 column(s))
+    Filter
+      IndexScan: ga using ga_g
+
+query I rowsort
+SELECT id FROM ga WHERE v > 5 AND k >= 0
+----
+1
+4
+
+query I rowsort
+SELECT id FROM ga WHERE g > 15 AND k >= 0
+----
+1
+
+statement ok
+UPDATE ga SET v = 9 WHERE id = 2
+
+statement ok
+UPDATE ga_plain SET v = 9 WHERE id = 2
+
+statement ok
+UPDATE ga SET v = 0 WHERE id = 1
+
+statement ok
+UPDATE ga_plain SET v = 0 WHERE id = 1
+
+query I
+SELECT id FROM ga WHERE g > 15 ORDER BY k LIMIT 1
+----
+2
+
+query I
+SELECT id FROM ga_plain WHERE g > 15 ORDER BY k LIMIT 1
+----
+2
+
+query I rowsort
+SELECT id FROM ga WHERE g > 15 AND k >= 0
+----
+2
+
+query I rowsort
+SELECT id FROM ga_plain WHERE g > 15 AND k >= 0
+----
+2
+
+# SET DEFAULT: a row that takes the default enters the index by it
+
+statement ok
+ALTER TABLE ga ALTER COLUMN v SET DEFAULT 20
+
+statement ok
+ALTER TABLE ga_plain ALTER COLUMN v SET DEFAULT 20
+
+statement ok
+INSERT INTO ga (id, k) VALUES (5, 0)
+
+statement ok
+INSERT INTO ga_plain (id, k) VALUES (5, 0)
+
+query I
+SELECT id FROM ga WHERE g > 15 ORDER BY k LIMIT 1
+----
+5
+
+query I rowsort
+SELECT id FROM ga WHERE v > 5 AND k >= 0
+----
+2
+4
+5
+
+query I rowsort
+SELECT id FROM ga_plain WHERE v > 5 AND k >= 0
+----
+2
+4
+5
+
+# TRUNCATE empties the index with the table
+
+statement ok
+TRUNCATE ga
+
+statement ok
+INSERT INTO ga (id, v, k) VALUES (7, 1, 1), (8, 30, 2)
+
+query I
+SELECT id FROM ga WHERE g > 15 ORDER BY k LIMIT 1
+----
+8
+
+query I rowsort
+SELECT id FROM ga WHERE v > 5 AND k >= 0
+----
+8
+
+# a partition attached with rows and a partial index of its own, then detached again
+
+statement ok
+CREATE TABLE pa (id INT NOT NULL, v INT, k INT NOT NULL) PARTITION BY RANGE (id)
+
+statement ok
+CREATE TABLE pa1 PARTITION OF pa FOR VALUES FROM (0) TO (10)
+
+statement ok
+CREATE TABLE pa2 (id INT NOT NULL, v INT, k INT NOT NULL)
+
+statement ok
+INSERT INTO pa VALUES (1, 10, 1), (2, 1, 2), (3, NULL, 3)
+
+statement ok
+INSERT INTO pa2 VALUES (11, 10, 1), (12, 1, 2), (13, 7, 3)
+
+statement ok
+CREATE INDEX pa2_v ON pa2 (k) WHERE v > 5
+
+statement ok
+ALTER TABLE pa ATTACH PARTITION pa2 FOR VALUES FROM (10) TO (20)
+
+query I rowsort
+SELECT id FROM pa WHERE v > 5 AND k >= 0
+----
+1
+11
+13
+
+query I rowsort
+SELECT id FROM pa2 WHERE v > 5 AND k >= 0
+----
+11
+13
+
+statement ok
+INSERT INTO pa VALUES (14, 8, 0)
+
+statement ok
+UPDATE pa SET v = 0 WHERE id = 11
+
+query I rowsort
+SELECT id FROM pa WHERE v > 5 AND k >= 0
+----
+1
+13
+14
+
+statement ok
+ALTER TABLE pa DETACH PARTITION pa2
+
+query T
+EXPLAIN SELECT id FROM pa2 WHERE v > 5 ORDER BY k LIMIT 1
+----
+Limit 1
+  Project (1 column(s))
+    Filter
+      IndexScan: pa2 using pa2_v
+
+query I
+SELECT id FROM pa2 WHERE v > 5 ORDER BY k LIMIT 1
+----
+14
+
+query I rowsort
+SELECT id FROM pa2 WHERE v > 5 AND k >= 0
+----
+13
+14
+
+query I rowsort
+SELECT id FROM pa WHERE v > 5 AND k >= 0
+----
+1
+
+# a type change on a partitioned table reaches the partitions' partial indexes
+
+statement ok
+CREATE TABLE pt (id INT NOT NULL, v TEXT, k INT NOT NULL) PARTITION BY RANGE (id)
+
+statement ok
+CREATE TABLE pt1 PARTITION OF pt FOR VALUES FROM (0) TO (10)
+
+statement ok
+CREATE TABLE pt2 PARTITION OF pt FOR VALUES FROM (10) TO (20)
+
+statement ok
+INSERT INTO pt VALUES (1, '10', 1), (2, '7', 2), (11, '10', 1), (12, '3', 2)
+
+statement ok
+CREATE INDEX pt1_v ON pt1 (k) WHERE v > '5'
+
+statement ok
+CREATE INDEX pt2_v ON pt2 (k) WHERE v > '5'
+
+statement ok
+ALTER TABLE pt ALTER COLUMN v TYPE INT
+
+query I rowsort
+SELECT id FROM pt WHERE v > 5 AND k >= 0
+----
+1
+11
+2
+
+query I
+SELECT id FROM pt2 WHERE v > 5 ORDER BY k LIMIT 1
+----
+11
+
+query I
+SELECT id FROM pt1 WHERE v > 5 ORDER BY k LIMIT 1
+----
+1
+
+# an enum column: a predicate comparing it with a label is refused (the index cannot resolve the
+# label), so the only enum predicates an index holds do not depend on the label order
+
+statement ok
+CREATE TYPE pmood AS ENUM ('sad', 'ok', 'happy')
+
+statement ok
+CREATE TABLE en (id INT PRIMARY KEY, m pmood, k INT NOT NULL)
+
+statement ok
+INSERT INTO en VALUES (1, 'sad', 1), (2, 'ok', 2), (3, 'happy', 3), (4, NULL, 4)
+
+statement ok
+CREATE TABLE en_plain (id INT PRIMARY KEY, m pmood, k INT NOT NULL)
+
+statement ok
+INSERT INTO en_plain SELECT * FROM en
+
+statement error
+CREATE INDEX en_m ON en (k) WHERE m > 'sad'
+
+statement ok
+CREATE INDEX en_m ON en (k) WHERE m IS NOT NULL
+
+query I rowsort
+SELECT id FROM en WHERE m > 'sad' AND k >= 0
+----
+2
+3
+
+query I
+SELECT id FROM en WHERE m IS NOT NULL ORDER BY k LIMIT 1
+----
+1
+
+query I rowsort
+SELECT id FROM en_plain WHERE m > 'sad' AND k >= 0
+----
+2
+3
+
+# REINDEX DATABASE over all of it changes no answer
+
+statement ok
+REINDEX DATABASE
+
+query I rowsort
+SELECT id FROM a3 WHERE v > '5' AND k >= 0
+----
+1
+2
+
+query I
+SELECT id FROM pa2 WHERE v > 5 ORDER BY k LIMIT 1
+----
+14
+
+query I rowsort
+SELECT id FROM en WHERE m > 'sad' AND k >= 0
+----
+2
+3

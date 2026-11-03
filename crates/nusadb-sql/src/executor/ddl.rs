@@ -2201,7 +2201,7 @@ fn lock_for_validation<'e>(
 /// exclusive locks: the snapshot predates them, so a writer that committed in between, which the
 /// lock no longer conflicts with, would be missing from the rows the statement validates, rewrites
 /// or indexes.
-struct FreshReads<'e> {
+pub(super) struct FreshReads<'e> {
     engine: &'e dyn StorageEngine,
     txn: TxnId,
 }
@@ -2213,7 +2213,7 @@ impl Drop for FreshReads<'_> {
 }
 
 /// [`lock_one_for_validation`] then [`fresh_reads`]: one table held and read fresh.
-fn hold_fresh(
+pub(super) fn hold_fresh(
     table: nusadb_core::TableId,
     engine: &dyn StorageEngine,
     txn: TxnId,
@@ -4156,16 +4156,34 @@ pub(super) fn rewrite_set_type(
     *new_types
         .get_mut(index)
         .ok_or_else(|| internal_index(index))? = ty;
-    // Re-index every rewritten row version: ordinals are unchanged, and an index over the
+    // Re-index every rewritten row version against the table as it will be: an index over the
     // retyped column gets keys encoded from the cast values, matching what later query literals
-    // of the new type probe with.
-    let index_targets = dml::secondary_index_targets(table, engine)?;
-    for (tid, mut row) in scan_table(table, engine, txn)? {
+    // of the new type probe with, and a partial index whose predicate reads the column decides
+    // membership by the predicate under the new type (`v > '5'` compares text before a TEXT to INT
+    // change and numbers after it). A row the new predicate leaves out has its entry dead-stamped,
+    // as an UPDATE does; the old targets tell which rows the index held.
+    let mut retyped = table.clone();
+    retyped
+        .columns
+        .get_mut(index)
+        .ok_or_else(|| internal_index(index))?
+        .ty = ty;
+    let old_targets = dml::secondary_index_targets(table, engine)?;
+    let new_targets = dml::secondary_index_targets(&retyped, engine)?;
+    for (tid, old_row) in scan_table(table, engine, txn)? {
+        let mut row = old_row.clone();
         let old = row.get(index).ok_or_else(|| internal_index(index))?.clone();
         set_at(&mut row, index, eval::cast_value(old, ty)?)?;
         let bytes = row::encode(&row, &new_types)?;
         let new_tid = engine.update(txn, table.id, tid, &bytes)?;
-        dml::insert_into_indexes(&index_targets, &row, new_tid, engine, txn)?;
+        dml::resync_index_entries(
+            &new_targets,
+            Some((&old_targets, &old_row)),
+            &row,
+            new_tid,
+            engine,
+            txn,
+        )?;
     }
     Ok(())
 }

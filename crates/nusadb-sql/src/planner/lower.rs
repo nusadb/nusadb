@@ -777,69 +777,68 @@ pub(super) fn try_index_scan(
     let mut conjuncts = Vec::new();
     collect_and_conjuncts(filter, &mut conjuncts);
 
-    // The best candidate so far: its rank (see below), selectivity, and the scan.
-    let mut best: Option<((bool, usize, bool), f64, PhysicalOperator)> = None;
-    for index in indexes {
-        let mut prefix: Vec<ast::Value> = Vec::new();
-        let mut range: Option<(RangeSide, RangeSide)> = None;
-        let mut selectivity = 1.0_f64;
-        // The key's parts: its columns, or its expressions for an index keyed on expressions.
-        let parts: Vec<(KeyPart<'_>, ColumnType)> = if index.key_exprs.is_empty() {
-            let mut parts = Vec::with_capacity(index.columns.len());
-            for &col in &index.columns {
-                let Some(column) = table.columns.get(col) else {
-                    break;
-                };
-                parts.push((KeyPart::Column(col), column.ty));
-            }
-            parts
-        } else {
-            index
-                .key_exprs
-                .iter()
-                .map(|e| (KeyPart::Expr(e), e.ty))
-                .collect()
-        };
-        for (part, ty) in &parts {
-            // The index-key encoding is per the key part's type, so a bound value must be coerced
-            // to it (e.g. an integer bound on a NUMERIC column), or its bytes would not line up.
-            let ty = *ty;
-            let found = key_part_bounds(&conjuncts, part, stats);
-            // Equality extends the key prefix; it must coerce exactly to the part's type.
-            if let Some(key_val) = found.eq.and_then(|v| coerce_index_bound(v, ty)) {
-                prefix.push(key_val);
-                selectivity *= found.eq_selectivity;
-                continue;
-            }
-            // A range on the next column ends the prefix. A side that cannot coerce becomes
-            // unbounded (the retained filter removes the extra rows: a superset scan).
-            let lo = found
-                .lo
-                .and_then(|(v, inc)| coerce_index_bound(v, ty).map(|c| (c, inc)));
-            let hi = found
-                .hi
-                .and_then(|(v, inc)| coerce_index_bound(v, ty).map(|c| (c, inc)));
-            if lo.is_some() || hi.is_some() {
-                selectivity *= found.range_selectivity;
-                range = Some((lo, hi));
-            }
+    // First, each index's rank, which needs no statistics (and no key values: those are built
+    // only for the indexes weighed below).
+    let mut bounded: Vec<(usize, bool, bool)> = Vec::new();
+    let mut ranked: Vec<(IndexRank, usize)> = indexes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, index)| Some((index_rank(table, index, &conjuncts, &mut bounded)?, i)))
+        .collect();
+    // A unique point lookup reads at most one row, so it beats any other candidate (and the DML
+    // find path takes only that shape); then the most columns bound by equality, then a range after
+    // them, then the most selective, and on a tie a partial index (it holds no more rows than a full
+    // one over the same key). So the candidates are weighed best rank first (in index order within
+    // a rank), and once one is taken nothing of a lower rank can replace it: their implication
+    // check and their selectivity, which reads the statistics, are never computed.
+    ranked.sort_by_key(|&(rank, _)| std::cmp::Reverse(rank));
+    // The selectivity of the conjuncts bounding a key column, shared by the indexes over it.
+    let mut column_selectivity: Vec<(usize, f64, f64)> = Vec::new();
+    let mut best: Option<IndexCandidate> = None;
+    for (rank, i) in ranked {
+        if best.as_ref().is_some_and(|(taken, ..)| rank < *taken) {
             break;
         }
-        if prefix.is_empty() && range.is_none() {
+        let Some(index) = indexes.get(i) else {
+            continue;
+        };
+        // A partial index holds only the rows its predicate accepts: usable only when the query's
+        // conjuncts prove every row they keep is one of those.
+        if let Some(predicate) = &index.predicate
+            && !super::implication::implies(&conjuncts, predicate)
+        {
             continue;
         }
-
-        // Cost-based gate: when stats are available, only take the index if it is estimated
-        // cheaper than scanning the whole table: a barely-selective bound is better served by a
-        // sequential scan. Without stats the bound stays selective enough by assumption.
-        if let Some(ctx) = stats
-            && !crate::executor::cost::prefers_index_scan(ctx.row_count(), selectivity)
-        {
+        let Some(shape) = index_shape(table, index, &conjuncts) else {
+            continue;
+        };
+        let selectivity = match stats {
+            Some(ctx) => {
+                let selectivity =
+                    shape_selectivity(&shape, &conjuncts, ctx, &mut column_selectivity);
+                // Cost-based gate: only take the index if it is estimated cheaper than scanning
+                // the whole table: a barely-selective bound is better served by a sequential scan.
+                if !crate::executor::cost::prefers_index_scan(ctx.row_count(), selectivity) {
+                    continue;
+                }
+                selectivity
+            },
+            // Without stats the bound stays selective enough by assumption.
+            None => 1.0,
+        };
+        let partial = index.predicate.is_some();
+        let better = best.as_ref().is_none_or(|(r, sel, was_partial, _)| {
+            shape.rank > *r
+                || (shape.rank == *r
+                    && (selectivity < *sel || (selectivity <= *sel && partial && !*was_partial)))
+        });
+        if !better {
             continue;
         }
 
         // A bound on a key prefix covers every key that starts with it (the executor encodes it
         // that way); a range on the next column extends the prefix by that column's bound.
+        let prefix = &shape.prefix;
         let side = |bound: Option<(ast::Value, bool)>| match bound {
             Some((value, inclusive)) => {
                 let mut key = prefix.clone();
@@ -853,35 +852,216 @@ pub(super) fn try_index_scan(
             None if prefix.is_empty() => Bound::Unbounded,
             None => Bound::Included(prefix.clone()),
         };
-        let (lo_side, hi_side) = range.clone().unwrap_or((None, None));
+        let (lo_side, hi_side) = shape.range.unwrap_or((None, None));
         let (lo, hi) = (side(lo_side), side(hi_side));
-
-        // Equality on every column of a UNIQUE index matches at most one row: the property the
-        // reactor-inline point-get gate requires.
-        let unique_point = index.unique && range.is_none() && prefix.len() == parts.len();
         let scan = PhysicalOperator::IndexScan {
             table: table.clone(),
             index: index.name.clone(),
             lo,
             hi,
-            key_columns: parts.len(),
-            unique_point,
+            key_columns: shape.parts.len(),
+            unique_point: shape.rank.0,
             direction: nusadb_core::engine::ScanDirection::Forward,
             limit: None,
         };
-        // A unique point lookup reads at most one row, so it beats any other candidate (and the
-        // DML find path takes only that shape); then the most columns bound by equality, then a
-        // range after them, then the most selective.
-        let rank = (unique_point, prefix.len(), range.is_some());
-        let better = best
-            .as_ref()
-            .is_none_or(|(r, sel, _)| rank > *r || (rank == *r && selectivity < *sel));
-        if better {
-            best = Some((rank, selectivity, scan));
+        best = Some((shape.rank, selectivity, partial, scan));
+    }
+    best.map(|(_, _, _, scan)| scan)
+}
+
+/// What [`try_index_scan`] ranks an index scan by: whether it is a unique point lookup, how many
+/// leading key columns equalities bound, and whether a range bounds the column after them.
+type IndexRank = (bool, usize, bool);
+
+/// The rank [`index_shape`] gives `index`, without building its key values, or `None` when the
+/// conjuncts bound none of its key. `bounded` remembers, per key column, whether the conjuncts give
+/// it an equality the key can hold and a range bound it can hold (`(column, equality, range)`), so
+/// indexes over the same column share the work.
+fn index_rank(
+    table: &TableSchema,
+    index: &IndexMeta,
+    conjuncts: &[&TypedExpr],
+    bounded: &mut Vec<(usize, bool, bool)>,
+) -> Option<IndexRank> {
+    let part_bounds = |part: &KeyPart<'_>, ty: ColumnType| {
+        let found = key_part_bounds(conjuncts, part, None);
+        let eq = found
+            .eq
+            .is_some_and(|v| coerce_index_bound(v, ty).is_some());
+        let range = found
+            .lo
+            .is_some_and(|(v, _)| coerce_index_bound(v, ty).is_some())
+            || found
+                .hi
+                .is_some_and(|(v, _)| coerce_index_bound(v, ty).is_some());
+        (eq, range)
+    };
+    let (mut prefix, mut range, mut parts) = (0_usize, false, 0_usize);
+    let mut walking = true;
+    if index.key_exprs.is_empty() {
+        for &col in &index.columns {
+            let Some(column) = table.columns.get(col) else {
+                break;
+            };
+            parts += 1;
+            if !walking {
+                continue;
+            }
+            let (eq, ranged) =
+                if let Some(&(_, eq, ranged)) = bounded.iter().find(|(c, ..)| *c == col) {
+                    (eq, ranged)
+                } else {
+                    let (eq, ranged) = part_bounds(&KeyPart::Column(col), column.ty);
+                    bounded.push((col, eq, ranged));
+                    (eq, ranged)
+                };
+            if eq {
+                prefix += 1;
+            } else {
+                range = ranged;
+                walking = false;
+            }
+        }
+    } else {
+        for expr in &index.key_exprs {
+            parts += 1;
+            if !walking {
+                continue;
+            }
+            let (eq, ranged) = part_bounds(&KeyPart::Expr(expr), expr.ty);
+            if eq {
+                prefix += 1;
+            } else {
+                range = ranged;
+                walking = false;
+            }
         }
     }
-    best.map(|(_, _, scan)| scan)
+    if prefix == 0 && !range {
+        return None;
+    }
+    Some((index.unique && !range && prefix == parts, prefix, range))
 }
+
+/// The key bounds `conjuncts` put on `index` and the rank they give it (see [`try_index_scan`]),
+/// or `None` when they bound none of its key. Needs no statistics.
+fn index_shape<'i>(
+    table: &TableSchema,
+    index: &'i IndexMeta,
+    conjuncts: &[&TypedExpr],
+) -> Option<IndexShape<'i>> {
+    // The key's parts: its columns, or its expressions for an index keyed on expressions.
+    let parts: Vec<(KeyPart<'i>, ColumnType)> = if index.key_exprs.is_empty() {
+        let mut parts = Vec::with_capacity(index.columns.len());
+        for &col in &index.columns {
+            let Some(column) = table.columns.get(col) else {
+                break;
+            };
+            parts.push((KeyPart::Column(col), column.ty));
+        }
+        parts
+    } else {
+        index
+            .key_exprs
+            .iter()
+            .map(|e| (KeyPart::Expr(e), e.ty))
+            .collect()
+    };
+    let mut prefix: Vec<ast::Value> = Vec::new();
+    let mut range: Option<(RangeSide, RangeSide)> = None;
+    for (part, ty) in &parts {
+        // The index-key encoding is per the key part's type, so a bound value must be coerced to
+        // it (e.g. an integer bound on a NUMERIC column), or its bytes would not line up.
+        let ty = *ty;
+        let found = key_part_bounds(conjuncts, part, None);
+        // Equality extends the key prefix; it must coerce exactly to the part's type.
+        if let Some(key_val) = found.eq.and_then(|v| coerce_index_bound(v, ty)) {
+            prefix.push(key_val);
+            continue;
+        }
+        // A range on the next column ends the prefix. A side that cannot coerce becomes unbounded
+        // (the retained filter removes the extra rows: a superset scan).
+        let lo = found
+            .lo
+            .and_then(|(v, inc)| coerce_index_bound(v, ty).map(|c| (c, inc)));
+        let hi = found
+            .hi
+            .and_then(|(v, inc)| coerce_index_bound(v, ty).map(|c| (c, inc)));
+        if lo.is_some() || hi.is_some() {
+            range = Some((lo, hi));
+        }
+        break;
+    }
+    if prefix.is_empty() && range.is_none() {
+        return None;
+    }
+    // Equality on every column of a UNIQUE index matches at most one row: the property the
+    // reactor-inline point-get gate requires.
+    let unique_point = index.unique && range.is_none() && prefix.len() == parts.len();
+    Some(IndexShape {
+        index,
+        rank: (unique_point, prefix.len(), range.is_some()),
+        parts,
+        prefix,
+        range,
+    })
+}
+
+/// The share of the table a scan of `shape` reads under statistics `ctx`: the equality conjuncts
+/// of its prefix columns and the range ones of the column after them (only the conjuncts a scan
+/// uses count toward its cost), and for a partial index its predicate's share. `columns` keeps the
+/// selectivities of a key column's conjuncts (`(column, equality, range)`), shared by the indexes
+/// over it.
+fn shape_selectivity(
+    shape: &IndexShape<'_>,
+    conjuncts: &[&TypedExpr],
+    ctx: &crate::executor::cost::ScanStats,
+    columns: &mut Vec<(usize, f64, f64)>,
+) -> f64 {
+    let mut selectivity = 1.0_f64;
+    let used = shape.prefix.len() + usize::from(shape.range.is_some());
+    for (i, (part, _)) in shape.parts.iter().take(used).enumerate() {
+        let (eq, range) = match part {
+            KeyPart::Column(col) => {
+                if let Some(&(_, eq, range)) = columns.iter().find(|(c, ..)| c == col) {
+                    (eq, range)
+                } else {
+                    let found = key_part_bounds(conjuncts, part, Some(ctx));
+                    columns.push((*col, found.eq_selectivity, found.range_selectivity));
+                    (found.eq_selectivity, found.range_selectivity)
+                }
+            },
+            KeyPart::Expr(_) => {
+                let found = key_part_bounds(conjuncts, part, Some(ctx));
+                (found.eq_selectivity, found.range_selectivity)
+            },
+        };
+        selectivity *= if i < shape.prefix.len() { eq } else { range };
+    }
+    // A partial index holds only its predicate's rows, so a scan of it reads that share of the
+    // rows the key bounds select.
+    if let Some(predicate) = &shape.index.predicate {
+        for conjunct in predicate.iter() {
+            selectivity *= crate::executor::cost::selectivity(conjunct, ctx);
+        }
+    }
+    selectivity
+}
+
+/// An index [`try_index_scan`] could scan for the query, before its cost is weighed: the index, its
+/// rank (a unique point, the equality-bound key columns, a range after them), its key parts, and
+/// the equality prefix and range the query bounds them by.
+struct IndexShape<'i> {
+    index: &'i IndexMeta,
+    rank: IndexRank,
+    parts: Vec<(KeyPart<'i>, ColumnType)>,
+    prefix: Vec<ast::Value>,
+    range: Option<(RangeSide, RangeSide)>,
+}
+
+/// An index scan [`try_index_scan`] weighs: its rank (a unique point, the equality-bound key
+/// columns, a range after them), its selectivity, whether the index is partial, and the scan.
+type IndexCandidate = (IndexRank, f64, bool, PhysicalOperator);
 
 /// One side of a range on an index column: the coerced value and whether it is inclusive.
 type RangeSide = Option<(ast::Value, bool)>;
@@ -1051,6 +1231,18 @@ fn try_ordered_index_scan(
     // The already-computed top-N cap is `Some(offset + limit)` only when a plain `LIMIT` (no
     // `WITH TIES`/`DISTINCT`/set-returning projection) bounds the rows — exactly the gate we need.
     let cap = usize::try_from(top_n_cap?).ok()?;
+    capped_ordered_index_scan(op, order_by, indexes, cap)
+        .or_else(|| try_partial_ordered_scan(op, order_by, indexes))
+}
+
+/// The capped ordered scans of [`try_ordered_index_scan`]: those whose rows the retained `Filter`
+/// keeps all of, so the scan may stop at `cap` rows.
+fn capped_ordered_index_scan(
+    op: &PhysicalOperator,
+    order_by: &[OrderByKey],
+    indexes: &[IndexMeta],
+    cap: usize,
+) -> Option<PhysicalOperator> {
     // Under statistics the cost gate keeps a wide range on a sequential scan, which is right for
     // a full read but not here: the cap bounds the ordered scan to `cap` rows however wide the
     // range, while the scan-and-sort reads everything. So a filtered plain scan is first lifted
@@ -1071,6 +1263,9 @@ fn try_ordered_index_scan(
         None
     };
     let op = lifted.as_ref().unwrap_or(op);
+    if let Some(scan) = predicate_only_capped_scan(op, order_by, indexes, cap) {
+        return Some(scan);
+    }
     // A `WHERE` on the ordering column that the index range already answers exactly: the retained
     // `Filter` drops nothing the bounds let through, so capping the ordered scan at the LIMIT still
     // yields the right rows. Any other shape between the sort and the scan keeps the `Sort`.
@@ -1088,8 +1283,21 @@ fn try_ordered_index_scan(
     {
         let (direction, order_col) = ordered_scan_direction(table, order_by)?;
         let meta = indexes.iter().find(|meta| meta.name == *index)?;
+        // The scan below was chosen only for a `WHERE` implying a partial index's predicate;
+        // checked again here, as capping it is only right when the index holds every row.
+        let mut conjuncts = Vec::new();
+        collect_and_conjuncts(predicate, &mut conjuncts);
         if meta.columns != [order_col]
-            || !predicate_is_exactly_the_index_range(predicate, order_col, table)
+            || meta
+                .predicate
+                .as_ref()
+                .is_some_and(|p| !super::implication::implies(&conjuncts, p))
+            || !predicate_is_exactly_the_index_range(
+                predicate,
+                order_col,
+                table,
+                meta.predicate.as_deref().unwrap_or_default(),
+            )
         {
             return None;
         }
@@ -1114,9 +1322,10 @@ fn try_ordered_index_scan(
     };
     let (direction, order_cols) = ordered_scan_keys(table, order_by)?;
     // A scannable index whose leading key columns are exactly these, in order, provides the order.
+    // A partial index holds only some rows, and with no `WHERE` nothing implies its predicate.
     let index = indexes
         .iter()
-        .find(|meta| meta.columns.starts_with(&order_cols))?;
+        .find(|meta| meta.predicate.is_none() && meta.columns.starts_with(&order_cols))?;
     Some(PhysicalOperator::IndexScan {
         table: table.clone(),
         index: index.name.clone(),
@@ -1126,6 +1335,158 @@ fn try_ordered_index_scan(
         unique_point: false,
         direction,
         limit: Some(cap),
+    })
+}
+
+/// The capped ordered read of a partial index for a `WHERE` that only repeats its predicate: every
+/// row the index holds passes it, so the whole index read in order and capped at the LIMIT yields
+/// the right rows, in either direction (`WHERE status = 'pending' ORDER BY due DESC LIMIT n`). The
+/// `WHERE` must also imply the whole predicate: one that repeats only some of its conditions keeps
+/// rows the index does not hold.
+fn predicate_only_capped_scan(
+    op: &PhysicalOperator,
+    order_by: &[OrderByKey],
+    indexes: &[IndexMeta],
+    cap: usize,
+) -> Option<PhysicalOperator> {
+    let PhysicalOperator::Filter { input, predicate } = op else {
+        return None;
+    };
+    let PhysicalOperator::SeqScan { table, .. } = input.as_ref() else {
+        return None;
+    };
+    let (direction, order_col) = ordered_scan_direction(table, order_by)?;
+    let mut conjuncts = Vec::new();
+    collect_and_conjuncts(predicate, &mut conjuncts);
+    let meta = indexes.iter().find(|meta| {
+        meta.columns == [order_col]
+            && meta.predicate.as_ref().is_some_and(|p| {
+                conjuncts.iter().all(|c| p.contains(c))
+                    && super::implication::implies(&conjuncts, p)
+            })
+    })?;
+    Some(PhysicalOperator::Filter {
+        input: Box::new(PhysicalOperator::IndexScan {
+            table: table.clone(),
+            index: meta.name.clone(),
+            lo: Bound::Unbounded,
+            hi: Bound::Unbounded,
+            key_columns: 1,
+            unique_point: false,
+            direction,
+            limit: Some(cap),
+        }),
+        predicate: predicate.clone(),
+    })
+}
+
+/// Sort-elimination through a partial index: a `WHERE` over the base table implies the predicate
+/// of a partial index whose leading key columns are the `ORDER BY` keys. The index then holds every
+/// row the query can return, in the order asked for, so it is scanned in that order (narrowed by
+/// whatever key bounds the `WHERE` gives) under the retained `Filter`, and the `Sort` is dropped.
+/// The scan is not capped: the `Filter` may drop rows the index holds (a bound that is not a
+/// constant, such as `due_at <= now()`), so the `LIMIT` above ends it instead. Only an ascending
+/// order qualifies, because only a forward scan streams and so stops there: a backward one reads
+/// its whole range when it opens, which for a large index costs more than the sort it saves (as
+/// does any index scan under SERIALIZABLE, which records what it reads).
+///
+/// That is the claim-queue shape `WHERE status = 'pending' AND due_at <= now() ORDER BY due_at
+/// LIMIT n` over an index on `(due_at) WHERE status = 'pending'`. An ordering column may be
+/// nullable only when the `WHERE` or the predicate proves it non-NULL: the index places NULL first,
+/// while an ascending `ORDER BY` places it last. `None` for any other shape.
+fn try_partial_ordered_scan(
+    op: &PhysicalOperator,
+    order_by: &[OrderByKey],
+    indexes: &[IndexMeta],
+) -> Option<PhysicalOperator> {
+    use nusadb_core::engine::ScanDirection;
+    let PhysicalOperator::Filter { input, predicate } = op else {
+        return None;
+    };
+    let (table, current) = match input.as_ref() {
+        PhysicalOperator::SeqScan { table, .. } => (table, None),
+        PhysicalOperator::IndexScan {
+            table,
+            index,
+            limit: None,
+            ..
+        } => (table, Some(index)),
+        _ => return None,
+    };
+    let mut order_cols = Vec::with_capacity(order_by.len());
+    for key in order_by {
+        let TypedExprKind::Column(ordinal) = key.expr.kind else {
+            return None;
+        };
+        if !key.ascending {
+            return None;
+        }
+        order_cols.push(ordinal);
+    }
+    let mut conjuncts = Vec::new();
+    collect_and_conjuncts(predicate, &mut conjuncts);
+    let meta = indexes.iter().find(|meta| {
+        meta.predicate
+            .as_ref()
+            .is_some_and(|p| super::implication::implies(&conjuncts, p))
+            && meta.columns.starts_with(&order_cols)
+            // An index scan already chosen stays unless it is this index.
+            && current.is_none_or(|name| *name == meta.name)
+    })?;
+    let mut known = conjuncts.clone();
+    known.extend(meta.predicate.as_deref().unwrap_or_default());
+    for &col in &order_cols {
+        let column = table.columns.get(col)?;
+        if column.nullable {
+            let not_null = TypedExpr {
+                kind: TypedExprKind::IsNull {
+                    expr: Box::new(TypedExpr {
+                        kind: TypedExprKind::Column(col),
+                        ty: column.ty,
+                    }),
+                    negated: true,
+                },
+                ty: ColumnType::Bool,
+            };
+            if !super::implication::implies(&known, std::slice::from_ref(&not_null)) {
+                return None;
+            }
+        }
+    }
+    let direction = ScanDirection::Forward;
+    let scan = match input.as_ref() {
+        PhysicalOperator::IndexScan {
+            table,
+            index,
+            lo,
+            hi,
+            key_columns,
+            unique_point,
+            ..
+        } => PhysicalOperator::IndexScan {
+            table: table.clone(),
+            index: index.clone(),
+            lo: lo.clone(),
+            hi: hi.clone(),
+            key_columns: *key_columns,
+            unique_point: *unique_point,
+            direction,
+            limit: None,
+        },
+        _ => PhysicalOperator::IndexScan {
+            table: table.clone(),
+            index: meta.name.clone(),
+            lo: Bound::Unbounded,
+            hi: Bound::Unbounded,
+            key_columns: meta.columns.len(),
+            unique_point: false,
+            direction,
+            limit: None,
+        },
+    };
+    Some(PhysicalOperator::Filter {
+        input: Box::new(scan),
+        predicate: predicate.clone(),
     })
 }
 
@@ -1179,10 +1540,13 @@ fn ordered_scan_direction(
 /// first upper bound they meet and leave every other conjunct to the retained `Filter`, so this
 /// accepts precisely the shapes that leave nothing behind: one `BETWEEN`, one equality, or at most
 /// one lower and one upper comparison, all on `col`, all with literals the index key can hold.
+/// A conjunct identical to one of `holds` (the conjuncts of a partial index's predicate, true for
+/// every row the index holds) leaves nothing behind either.
 fn predicate_is_exactly_the_index_range(
     predicate: &TypedExpr,
     col: usize,
     table: &TableSchema,
+    holds: &[TypedExpr],
 ) -> bool {
     let Some(col_ty) = table.columns.get(col).map(|c| c.ty) else {
         return false;
@@ -1190,7 +1554,12 @@ fn predicate_is_exactly_the_index_range(
     let mut conjuncts = Vec::new();
     collect_and_conjuncts(predicate, &mut conjuncts);
     let (mut lower, mut upper) = (0_usize, 0_usize);
+    let mut ranged = false;
     for conjunct in &conjuncts {
+        if holds.contains(conjunct) {
+            continue;
+        }
+        ranged = true;
         if let TypedExprKind::Between {
             expr,
             low,
@@ -1228,7 +1597,7 @@ fn predicate_is_exactly_the_index_range(
             _ => return false,
         }
     }
-    !conjuncts.is_empty() && lower <= 1 && upper <= 1
+    ranged && lower <= 1 && upper <= 1
 }
 
 /// Flatten a predicate's top-level `AND` chain into its conjuncts (a non-`AND` node is one

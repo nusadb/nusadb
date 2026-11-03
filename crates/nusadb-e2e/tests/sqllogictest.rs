@@ -66,34 +66,34 @@ impl SltCatalog<'_> {
 
     /// The table's SQL-maintained secondary indexes, the ones safe to scan.
     fn scannable_indexes(&self, schema: &TableSchema) -> Result<Vec<IndexInfo>, nusadb_sql::Error> {
-        // Constraint-backing (PK/UNIQUE/FK) indexes are enforced by scanning and not maintained on
-        // write, so they are unsafe to scan: expose only SQL-maintained secondary indexes.
+        // Constraint-backing (PK/UNIQUE/FK) indexes are left out, so a query keeps the plan this
+        // corpus was written against; every other index is offered exactly as the server's
+        // catalog offers it (a partial one with its predicate).
         let backing: std::collections::HashSet<_> = self
             .engine
             .list_constraints(schema.id)?
             .into_iter()
             .filter_map(|c| c.index)
             .collect();
+        let offered = if let Some(txn) = self.txn {
+            nusadb_sql::catalog_list_indexes_in(self.engine, txn, &schema.schema, &schema.name)
+        } else {
+            let txn = self.engine.begin(nusadb_core::IsolationLevel::default())?;
+            let out =
+                nusadb_sql::catalog_list_indexes_in(self.engine, txn, &schema.schema, &schema.name);
+            let _ = self.engine.commit(txn);
+            out
+        }?;
         let mut out = Vec::new();
-        for def in self.engine.list_indexes(schema.id)? {
+        for info in offered {
             if self
                 .engine
-                .lookup_index(&def.name)?
+                .lookup_index(&info.name)?
                 .is_some_and(|id| backing.contains(&id))
             {
                 continue;
             }
-            // A functional/expression key or partial predicate is unsafe as a scan candidate;
-            // mirror the production `catalog_list_indexes` exclusion.
-            if !def.key_exprs.is_empty() || def.predicate.is_some() {
-                continue;
-            }
-            out.push(IndexInfo {
-                name: def.name,
-                columns: def.columns,
-                key_exprs: Vec::new(),
-                unique: def.unique,
-            });
+            out.push(info);
         }
         Ok(out)
     }
@@ -1384,4 +1384,14 @@ fn slt_p10_json_array_literal_operands() {
 #[test]
 fn slt_p13_real_function_results() {
     run_slt("tests/slt/p13_functions/real_function_results.slt");
+}
+
+#[test]
+fn slt_p3_partial_index_scan() {
+    run_slt("tests/slt/p3_filter/partial_index_scan.slt");
+}
+
+#[test]
+fn slt_p3_partial_index_ddl() {
+    run_slt("tests/slt/p3_filter/partial_index_ddl.slt");
 }

@@ -99,7 +99,7 @@ fn fold_in_place(expr: &mut TypedExpr) {
 }
 
 /// Fold every constant sub-expression of `expr` to a literal, bottom-up.
-fn fold_expr(expr: TypedExpr) -> TypedExpr {
+pub(super) fn fold_expr(expr: TypedExpr) -> TypedExpr {
     let ty = expr.ty;
     let node = TypedExpr {
         kind: fold_children(expr.kind),

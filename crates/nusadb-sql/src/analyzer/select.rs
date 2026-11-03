@@ -1071,7 +1071,7 @@ pub(super) fn resolve_from(
         // name must not borrow those of a table it shadows.
         let (indexes, table_stats) = if join_gates {
             (
-                resolve_table_indexes(Some(&joined), catalog)?,
+                resolve_table_indexes(Some(&joined), catalog, None)?,
                 catalog.table_stats_in(&joined.schema, &joined.name)?,
             )
         } else {
@@ -2089,7 +2089,16 @@ fn analyze_select_scoped(
     // Only a real catalog table has them: a CTE resolved under its own name would otherwise be
     // scanned through the index of a table it shadows.
     let catalog_table = table.as_ref().filter(|_| base_is_real_table);
-    let indexes = resolve_table_indexes(catalog_table, catalog)?;
+    // The columns the `WHERE` and `ORDER BY` read, which bound which partial indexes are worth
+    // resolving (the base table's columns lead the row, so their ordinals are the table's own).
+    let mut referenced = Vec::new();
+    if let Some(filter) = &filter {
+        crate::planner::collect_columns(filter, &mut referenced);
+    }
+    for key in &order_by {
+        crate::planner::collect_columns(&key.expr, &mut referenced);
+    }
+    let indexes = resolve_table_indexes(catalog_table, catalog, Some(&referenced))?;
     // Fetch the base table's ANALYZE stats for cost-based planning: the index-vs-scan choice
     // for the base scan, alone or under a join. `None` leaves planning heuristic.
     let table_stats = match catalog_table {
@@ -2274,15 +2283,51 @@ fn srf_projection_func(projection: &[Projection]) -> Option<ast::SetReturningFun
 /// Resolve a base table's catalog indexes to planner [`IndexMeta`] — mapping each index's key
 /// column names to ordinals into `schema.columns`. An index naming a column that does not
 /// resolve is skipped (it cannot be matched safely). Returns empty for a CTE / no-`FROM` base.
+///
+/// A partial index carries its resolved predicate. `referenced`, when given, lists the columns the
+/// query's `WHERE` and `ORDER BY` read: a partial column index whose leading column is not among
+/// them could serve neither a bound nor an order, so its predicate is not even resolved, and one
+/// whose predicate reads a column not among them cannot have it implied, so it is left out too
+/// (that keeps a point query on a table with many partial indexes cheap to plan).
 fn resolve_table_indexes(
     table: Option<&TableSchema>,
     catalog: &dyn Catalog,
+    referenced: Option<&[usize]>,
 ) -> Result<Vec<IndexMeta>, Error> {
     let Some(schema) = table else {
         return Ok(Vec::new());
     };
-    let mut out = Vec::new();
-    for info in catalog.list_indexes_in(&schema.schema, &schema.name)? {
+    let infos = catalog.list_indexes_in(&schema.schema, &schema.name)?;
+    let mut out = Vec::with_capacity(infos.len());
+    let mut predicates = None;
+    for info in infos {
+        // A partial index whose leading column the query never reads cannot be chosen.
+        if info.predicate.is_some()
+            && info.key_exprs.is_empty()
+            && let (Some(referenced), Some(lead)) = (referenced, info.columns.first())
+            && !referenced
+                .iter()
+                .any(|&ord| schema.columns.get(ord).is_some_and(|c| &c.name == lead))
+        {
+            continue;
+        }
+        let predicate = match &info.predicate {
+            Some(sql) => match predicates
+                .get_or_insert_with(|| crate::executor::partial_index_predicates(schema))
+                .get(sql)
+            {
+                // Implying the predicate takes a condition on every column it reads.
+                Some((_, columns))
+                    if referenced.is_some_and(|r| !columns.iter().all(|c| r.contains(c))) =>
+                {
+                    continue;
+                },
+                Some((conjuncts, _)) => Some(conjuncts),
+                // A predicate the write path cannot evaluate either: never scan the index.
+                None => continue,
+            },
+            None => None,
+        };
         if !info.key_exprs.is_empty() {
             // Keyed on expressions: resolve each against the table, exactly as writes compute the
             // key. One that no longer analyzes makes the index unusable for scans, and so does one
@@ -2301,6 +2346,7 @@ fn resolve_table_indexes(
                     columns: Vec::new(),
                     key_exprs,
                     unique: info.unique,
+                    predicate,
                 });
             }
             continue;
@@ -2320,6 +2366,7 @@ fn resolve_table_indexes(
                 columns,
                 key_exprs: Vec::new(),
                 unique: info.unique,
+                predicate,
             });
         }
     }

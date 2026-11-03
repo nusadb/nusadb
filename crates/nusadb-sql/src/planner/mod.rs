@@ -21,6 +21,7 @@ use nusadb_core::{ColumnType, TableSchema};
 use crate::ast;
 
 mod fold;
+mod implication;
 mod join;
 
 pub(crate) use join::collect_columns;
@@ -58,6 +59,12 @@ pub(crate) fn try_point_get_index(
 }
 #[allow(clippy::wildcard_imports)]
 pub use plan_types::*;
+
+/// Fold the constant sub-expressions of `expr` exactly as the planner folds a query's `WHERE`, so a
+/// partial index's predicate is compared with the query in the same form.
+pub(crate) fn fold_constants(expr: TypedExpr) -> TypedExpr {
+    fold::fold_expr(expr)
+}
 
 /// Whether `plan` is a *bounded unique-key point lookup* the wire layer may run inline on the
 /// reactor.
@@ -454,6 +461,7 @@ mod tests {
                     columns: vec!["a".to_owned()],
                     key_exprs: Vec::new(),
                     unique: self.1,
+                    predicate: None,
                 }]
             } else {
                 Vec::new()

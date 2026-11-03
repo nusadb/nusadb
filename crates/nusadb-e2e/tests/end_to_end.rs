@@ -49,9 +49,9 @@ impl Catalog for EngineCatalog<'_> {
             {
                 continue;
             }
-            // A functional/expression key or a partial predicate makes an index unsafe as an
-            // equality/range scan candidate (the planner encodes plain-column ascending bounds) —
-            // mirror the production `catalog_list_indexes` exclusion.
+            // This harness offers plain column indexes only: an expression-keyed or partial one is
+            // left out (the production `catalog_list_indexes` offers both, a partial one with its
+            // predicate for the planner to check).
             if !def.key_exprs.is_empty() || def.predicate.is_some() {
                 continue;
             }
@@ -60,6 +60,7 @@ impl Catalog for EngineCatalog<'_> {
                 columns: def.columns,
                 key_exprs: Vec::new(),
                 unique: def.unique,
+                predicate: None,
             });
         }
         Ok(out)

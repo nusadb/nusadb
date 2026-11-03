@@ -1,0 +1,1432 @@
+# A partial index holds only the rows its predicate accepts. The planner scans it only when the
+# query's WHERE implies that predicate; every query below also runs against a copy of the table
+# with no index (`*_plain`), and the two must return the same rows, NULL rows included.
+
+statement ok
+CREATE TABLE pi (id INT NOT NULL, k INT, status TEXT, email TEXT, flag BOOL, n INT)
+
+statement ok
+INSERT INTO pi SELECT g, g % 13, CASE WHEN g % 5 = 0 THEN 'active' WHEN g % 7 = 0 THEN NULL ELSE 'idle' END, CASE WHEN g % 3 = 0 THEN NULL ELSE 'u' || g END, CASE WHEN g % 11 = 0 THEN NULL ELSE g % 2 = 0 END, g FROM generate_series(1, 200) g
+
+statement ok
+CREATE TABLE pi_plain AS SELECT * FROM pi
+
+statement ok
+CREATE INDEX pi_k_active ON pi (k) WHERE status = 'active'
+
+statement ok
+CREATE UNIQUE INDEX pi_email ON pi (email) WHERE email IS NOT NULL
+
+statement ok
+CREATE INDEX pi_k_flag ON pi (k) WHERE flag
+
+statement ok
+CREATE INDEX pi_k_not_flag ON pi (k) WHERE NOT flag
+
+statement ok
+CREATE INDEX pi_k_no_status ON pi (k) WHERE status IS NULL
+
+statement ok
+CREATE INDEX pi_n_in ON pi (n) WHERE status IN ('active', 'idle')
+
+statement ok
+CREATE INDEX pi_k_big ON pi (k) WHERE n > 100
+
+# the WHERE repeats the predicate: the partial index answers
+
+query T
+EXPLAIN SELECT id FROM pi WHERE k = 5 AND status = 'active'
+----
+Project (1 column(s))
+  Filter
+    IndexScan: pi using pi_k_active
+
+query I rowsort
+SELECT id FROM pi WHERE k = 5 AND status = 'active'
+----
+135
+200
+5
+70
+
+query I rowsort
+SELECT id FROM pi_plain WHERE k = 5 AND status = 'active'
+----
+135
+200
+5
+70
+
+# the constant may stand on either side
+
+query T
+EXPLAIN SELECT id FROM pi WHERE 5 = k AND 'active' = status
+----
+Project (1 column(s))
+  Filter
+    IndexScan: pi using pi_k_active
+
+query I rowsort
+SELECT id FROM pi WHERE 5 = k AND 'active' = status
+----
+135
+200
+5
+70
+
+query I rowsort
+SELECT id FROM pi_plain WHERE 5 = k AND 'active' = status
+----
+135
+200
+5
+70
+
+# without the predicate in the WHERE the index could miss rows: sequential scan
+
+query T
+EXPLAIN SELECT id FROM pi WHERE k = 5
+----
+Project (1 column(s))
+  Filter
+    SeqScan: pi (project 2/6 cols)
+
+query I rowsort
+SELECT id FROM pi WHERE k = 5
+----
+109
+122
+135
+148
+161
+174
+18
+187
+200
+31
+44
+5
+57
+70
+83
+96
+
+query I rowsort
+SELECT id FROM pi_plain WHERE k = 5
+----
+109
+122
+135
+148
+161
+174
+18
+187
+200
+31
+44
+5
+57
+70
+83
+96
+
+# another status value does not imply the predicate
+
+query T
+EXPLAIN SELECT id FROM pi WHERE k = 7 AND status = 'gone'
+----
+Project (1 column(s))
+  Filter
+    SeqScan: pi (project 3/6 cols)
+
+query I rowsort
+SELECT id FROM pi WHERE k = 7 AND status = 'gone'
+----
+
+query I rowsort
+SELECT id FROM pi_plain WHERE k = 7 AND status = 'gone'
+----
+
+# an equality implies IS NOT NULL
+
+query T
+EXPLAIN SELECT id FROM pi WHERE email = 'u7'
+----
+Project (1 column(s))
+  Filter
+    IndexScan: pi using pi_email
+
+query I rowsort
+SELECT id FROM pi WHERE email = 'u7'
+----
+7
+
+query I rowsort
+SELECT id FROM pi_plain WHERE email = 'u7'
+----
+7
+
+# IS NULL is not IS NOT NULL
+
+query T
+EXPLAIN SELECT id FROM pi WHERE email IS NULL AND id < 12
+----
+Project (1 column(s))
+  Filter
+    SeqScan: pi (project 2/6 cols)
+
+query I rowsort
+SELECT id FROM pi WHERE email IS NULL AND id < 12
+----
+3
+6
+9
+
+query I rowsort
+SELECT id FROM pi_plain WHERE email IS NULL AND id < 12
+----
+3
+6
+9
+
+# a bare boolean column is col = true
+
+query T
+EXPLAIN SELECT id FROM pi WHERE k = 4 AND flag
+----
+Project (1 column(s))
+  Filter
+    IndexScan: pi using pi_k_flag
+
+query I rowsort
+SELECT id FROM pi WHERE k = 4 AND flag
+----
+108
+134
+160
+186
+30
+4
+56
+82
+
+query I rowsort
+SELECT id FROM pi_plain WHERE k = 4 AND flag
+----
+108
+134
+160
+186
+30
+4
+56
+82
+
+# col = true is the bare column
+
+query T
+EXPLAIN SELECT id FROM pi WHERE k = 4 AND flag = true
+----
+Project (1 column(s))
+  Filter
+    IndexScan: pi using pi_k_flag
+
+query I rowsort
+SELECT id FROM pi WHERE k = 4 AND flag = true
+----
+108
+134
+160
+186
+30
+4
+56
+82
+
+query I rowsort
+SELECT id FROM pi_plain WHERE k = 4 AND flag = true
+----
+108
+134
+160
+186
+30
+4
+56
+82
+
+# NOT col is col = false
+
+query T
+EXPLAIN SELECT id FROM pi WHERE k = 4 AND NOT flag
+----
+Project (1 column(s))
+  Filter
+    IndexScan: pi using pi_k_not_flag
+
+query I rowsort
+SELECT id FROM pi WHERE k = 4 AND NOT flag
+----
+147
+17
+173
+199
+43
+69
+95
+
+query I rowsort
+SELECT id FROM pi_plain WHERE k = 4 AND NOT flag
+----
+147
+17
+173
+199
+43
+69
+95
+
+# col = false is NOT col
+
+query T
+EXPLAIN SELECT id FROM pi WHERE k = 4 AND flag = false
+----
+Project (1 column(s))
+  Filter
+    IndexScan: pi using pi_k_not_flag
+
+query I rowsort
+SELECT id FROM pi WHERE k = 4 AND flag = false
+----
+147
+17
+173
+199
+43
+69
+95
+
+query I rowsort
+SELECT id FROM pi_plain WHERE k = 4 AND flag = false
+----
+147
+17
+173
+199
+43
+69
+95
+
+# IS TRUE is not reasoned with
+
+query T
+EXPLAIN SELECT id FROM pi WHERE k = 4 AND flag IS TRUE
+----
+Project (1 column(s))
+  Filter
+    SeqScan: pi (project 3/6 cols)
+
+query I rowsort
+SELECT id FROM pi WHERE k = 4 AND flag IS TRUE
+----
+108
+134
+160
+186
+30
+4
+56
+82
+
+query I rowsort
+SELECT id FROM pi_plain WHERE k = 4 AND flag IS TRUE
+----
+108
+134
+160
+186
+30
+4
+56
+82
+
+# IS NULL implied by itself
+
+query T
+EXPLAIN SELECT id FROM pi WHERE k = 14 AND status IS NULL
+----
+Project (1 column(s))
+  Filter
+    IndexScan: pi using pi_k_no_status
+
+query I rowsort
+SELECT id FROM pi WHERE k = 14 AND status IS NULL
+----
+
+query I rowsort
+SELECT id FROM pi_plain WHERE k = 14 AND status IS NULL
+----
+
+# one value of the IN list
+
+query T
+EXPLAIN SELECT id FROM pi WHERE n = 33 AND status = 'idle'
+----
+Project (1 column(s))
+  Filter
+    IndexScan: pi using pi_n_in
+
+query I rowsort
+SELECT id FROM pi WHERE n = 33 AND status = 'idle'
+----
+33
+
+query I rowsort
+SELECT id FROM pi_plain WHERE n = 33 AND status = 'idle'
+----
+33
+
+# a sub-list of the IN list
+
+query T
+EXPLAIN SELECT id FROM pi WHERE n BETWEEN 30 AND 40 AND status IN ('idle')
+----
+Project (1 column(s))
+  Filter
+    IndexScan: pi using pi_n_in
+
+query I rowsort
+SELECT id FROM pi WHERE n BETWEEN 30 AND 40 AND status IN ('idle')
+----
+31
+32
+33
+34
+36
+37
+38
+39
+
+query I rowsort
+SELECT id FROM pi_plain WHERE n BETWEEN 30 AND 40 AND status IN ('idle')
+----
+31
+32
+33
+34
+36
+37
+38
+39
+
+# a value outside the IN list
+
+query T
+EXPLAIN SELECT id FROM pi WHERE n = 35 AND status IN ('idle', 'gone')
+----
+Project (1 column(s))
+  Filter
+    SeqScan: pi (project 3/6 cols)
+
+query I rowsort
+SELECT id FROM pi WHERE n = 35 AND status IN ('idle', 'gone')
+----
+
+query I rowsort
+SELECT id FROM pi_plain WHERE n = 35 AND status IN ('idle', 'gone')
+----
+
+# a narrower range implies the wider one
+
+query T
+EXPLAIN SELECT id FROM pi WHERE k = 3 AND n > 150
+----
+Project (1 column(s))
+  Filter
+    IndexScan: pi using pi_k_big
+
+query I rowsort
+SELECT id FROM pi WHERE k = 3 AND n > 150
+----
+159
+172
+185
+198
+
+query I rowsort
+SELECT id FROM pi_plain WHERE k = 3 AND n > 150
+----
+159
+172
+185
+198
+
+# an equality inside the range
+
+query T
+EXPLAIN SELECT id FROM pi WHERE k = 3 AND n = 143
+----
+Project (1 column(s))
+  Filter
+    IndexScan: pi using pi_k_big
+
+query I rowsort
+SELECT id FROM pi WHERE k = 3 AND n = 143
+----
+
+query I rowsort
+SELECT id FROM pi_plain WHERE k = 3 AND n = 143
+----
+
+# a wider range does not
+
+query T
+EXPLAIN SELECT id FROM pi WHERE k = 3 AND n > 50
+----
+Project (1 column(s))
+  Filter
+    SeqScan: pi (project 3/6 cols)
+
+query I rowsort
+SELECT id FROM pi WHERE k = 3 AND n > 50
+----
+107
+120
+133
+146
+159
+172
+185
+198
+55
+68
+81
+94
+
+query I rowsort
+SELECT id FROM pi_plain WHERE k = 3 AND n > 50
+----
+107
+120
+133
+146
+159
+172
+185
+198
+55
+68
+81
+94
+
+# either side of an OR implying the predicate
+
+query T
+EXPLAIN SELECT id FROM pi WHERE k = 10 AND (status = 'active' OR status = 'active')
+----
+Project (1 column(s))
+  Filter
+    IndexScan: pi using pi_k_active
+
+query I rowsort
+SELECT id FROM pi WHERE k = 10 AND (status = 'active' OR status = 'active')
+----
+10
+140
+75
+
+query I rowsort
+SELECT id FROM pi_plain WHERE k = 10 AND (status = 'active' OR status = 'active')
+----
+10
+140
+75
+
+statement ok
+CREATE TABLE cq (id INT NOT NULL, status TEXT NOT NULL, due INT, worker TEXT)
+
+statement ok
+INSERT INTO cq SELECT g, CASE WHEN g % 10 = 0 THEN 'pending' ELSE 'done' END, CASE WHEN g % 30 = 0 THEN NULL ELSE 300 - g END, NULL FROM generate_series(1, 300) g
+
+statement ok
+CREATE TABLE cq_plain AS SELECT * FROM cq
+
+statement ok
+CREATE INDEX cq_due_pending ON cq (due) WHERE status = 'pending'
+
+# the claim queue: the predicate plus a range on the ordering column, read in index order
+
+query T
+EXPLAIN SELECT id FROM cq WHERE status = 'pending' AND due <= 150 ORDER BY due LIMIT 3
+----
+Limit 3
+  Project (1 column(s))
+    Filter
+      IndexScan: cq using cq_due_pending
+
+query I
+SELECT id FROM cq WHERE status = 'pending' AND due <= 150 ORDER BY due LIMIT 3
+----
+290
+280
+260
+
+query I
+SELECT id FROM cq_plain WHERE status = 'pending' AND due <= 150 ORDER BY due LIMIT 3
+----
+290
+280
+260
+
+# a bound that is not a constant: the ordered scan is not capped, the LIMIT stops it
+
+query T
+EXPLAIN SELECT id FROM cq WHERE status = 'pending' AND due <= abs(-150) ORDER BY due LIMIT 3
+----
+Limit 3
+  Project (1 column(s))
+    Filter
+      IndexScan: cq using cq_due_pending
+
+query I
+SELECT id FROM cq WHERE status = 'pending' AND due <= abs(-150) ORDER BY due LIMIT 3
+----
+290
+280
+260
+
+query I
+SELECT id FROM cq_plain WHERE status = 'pending' AND due <= abs(-150) ORDER BY due LIMIT 3
+----
+290
+280
+260
+
+# descending over a nullable column keeps the sort
+
+query T
+EXPLAIN SELECT id FROM cq WHERE status = 'pending' AND due IS NOT NULL ORDER BY due DESC LIMIT 4
+----
+Limit 4
+  Project (1 column(s))
+    Sort (1 key(s)) top-4
+      Filter
+        SeqScan: cq (project 3/4 cols)
+
+query I
+SELECT id FROM cq WHERE status = 'pending' AND due IS NOT NULL ORDER BY due DESC LIMIT 4
+----
+10
+20
+40
+50
+
+query I
+SELECT id FROM cq_plain WHERE status = 'pending' AND due IS NOT NULL ORDER BY due DESC LIMIT 4
+----
+10
+20
+40
+50
+
+# a nullable ordering column the WHERE does not prove non-NULL keeps the sort (NULL sorts last)
+
+query T
+EXPLAIN SELECT id FROM cq WHERE status = 'pending' ORDER BY due LIMIT 30
+----
+Limit 30
+  Project (1 column(s))
+    Sort (1 key(s)) top-30
+      Filter
+        SeqScan: cq (project 3/4 cols)
+
+query I
+SELECT id FROM cq WHERE status = 'pending' ORDER BY due LIMIT 30
+----
+290
+280
+260
+250
+230
+220
+200
+190
+170
+160
+140
+130
+110
+100
+80
+70
+50
+40
+20
+10
+30
+60
+90
+120
+150
+180
+210
+240
+270
+300
+
+query I
+SELECT id FROM cq_plain WHERE status = 'pending' ORDER BY due LIMIT 30
+----
+290
+280
+260
+250
+230
+220
+200
+190
+170
+160
+140
+130
+110
+100
+80
+70
+50
+40
+20
+10
+30
+60
+90
+120
+150
+180
+210
+240
+270
+300
+
+# with OFFSET
+
+query T
+EXPLAIN SELECT id FROM cq WHERE status = 'pending' AND due > 0 ORDER BY due LIMIT 2 OFFSET 3
+----
+Limit 2 offset 3
+  Project (1 column(s))
+    Filter
+      IndexScan: cq using cq_due_pending
+
+query I
+SELECT id FROM cq WHERE status = 'pending' AND due > 0 ORDER BY due LIMIT 2 OFFSET 3
+----
+250
+230
+
+query I
+SELECT id FROM cq_plain WHERE status = 'pending' AND due > 0 ORDER BY due LIMIT 2 OFFSET 3
+----
+250
+230
+
+# another status cannot use the index
+
+query T
+EXPLAIN SELECT id FROM cq WHERE status = 'done' AND due <= 5 ORDER BY due LIMIT 3
+----
+Limit 3
+  Project (1 column(s))
+    Sort (1 key(s)) top-3
+      Filter
+        SeqScan: cq (project 3/4 cols)
+
+query I
+SELECT id FROM cq WHERE status = 'done' AND due <= 5 ORDER BY due LIMIT 3
+----
+299
+298
+297
+
+query I
+SELECT id FROM cq_plain WHERE status = 'done' AND due <= 5 ORDER BY due LIMIT 3
+----
+299
+298
+297
+
+statement ok
+CREATE TABLE cqn (id INT NOT NULL, status TEXT NOT NULL, due INT NOT NULL)
+
+statement ok
+INSERT INTO cqn SELECT g, CASE WHEN g % 10 = 0 THEN 'pending' ELSE 'done' END, 300 - g FROM generate_series(1, 300) g
+
+statement ok
+CREATE TABLE cqn_plain AS SELECT * FROM cqn
+
+statement ok
+CREATE INDEX cqn_due_pending ON cqn (due) WHERE status = 'pending'
+
+# a WHERE that only repeats the predicate: the whole index in order, capped, in either direction
+
+query T
+EXPLAIN SELECT id FROM cqn WHERE status = 'pending' ORDER BY due DESC LIMIT 3
+----
+Limit 3
+  Project (1 column(s))
+    Filter
+      IndexScan: cqn using cqn_due_pending
+
+query I
+SELECT id FROM cqn WHERE status = 'pending' ORDER BY due DESC LIMIT 3
+----
+10
+20
+30
+
+query I
+SELECT id FROM cqn_plain WHERE status = 'pending' ORDER BY due DESC LIMIT 3
+----
+10
+20
+30
+
+# ascending likewise
+
+query T
+EXPLAIN SELECT id FROM cqn WHERE status = 'pending' ORDER BY due LIMIT 3
+----
+Limit 3
+  Project (1 column(s))
+    Filter
+      IndexScan: cqn using cqn_due_pending
+
+query I
+SELECT id FROM cqn WHERE status = 'pending' ORDER BY due LIMIT 3
+----
+300
+290
+280
+
+query I
+SELECT id FROM cqn_plain WHERE status = 'pending' ORDER BY due LIMIT 3
+----
+300
+290
+280
+
+# descending with a constant bound on the ordering column
+
+query T
+EXPLAIN SELECT id FROM cqn WHERE status = 'pending' AND due <= 150 ORDER BY due DESC LIMIT 3
+----
+Limit 3
+  Project (1 column(s))
+    Filter
+      IndexScan: cqn using cqn_due_pending
+
+query I
+SELECT id FROM cqn WHERE status = 'pending' AND due <= 150 ORDER BY due DESC LIMIT 3
+----
+150
+160
+170
+
+query I
+SELECT id FROM cqn_plain WHERE status = 'pending' AND due <= 150 ORDER BY due DESC LIMIT 3
+----
+150
+160
+170
+
+# descending with a bound that is not a constant keeps the sort
+
+query T
+EXPLAIN SELECT id FROM cqn WHERE status = 'pending' AND due <= abs(-150) ORDER BY due DESC LIMIT 3
+----
+Limit 3
+  Project (1 column(s))
+    Sort (1 key(s)) top-3
+      Filter
+        SeqScan: cqn
+
+query I
+SELECT id FROM cqn WHERE status = 'pending' AND due <= abs(-150) ORDER BY due DESC LIMIT 3
+----
+150
+160
+170
+
+query I
+SELECT id FROM cqn_plain WHERE status = 'pending' AND due <= abs(-150) ORDER BY due DESC LIMIT 3
+----
+150
+160
+170
+
+# descending with another condition keeps the sort
+
+query T
+EXPLAIN SELECT id FROM cqn WHERE status = 'pending' AND id > 5 ORDER BY due DESC LIMIT 3
+----
+Limit 3
+  Project (1 column(s))
+    Sort (1 key(s)) top-3
+      Filter
+        SeqScan: cqn
+
+query I
+SELECT id FROM cqn WHERE status = 'pending' AND id > 5 ORDER BY due DESC LIMIT 3
+----
+10
+20
+30
+
+query I
+SELECT id FROM cqn_plain WHERE status = 'pending' AND id > 5 ORDER BY due DESC LIMIT 3
+----
+10
+20
+30
+
+statement ok
+CREATE TABLE pj (jid INT NOT NULL, k INT)
+
+statement ok
+INSERT INTO pj SELECT g, g % 13 FROM generate_series(1, 6) g
+
+# the inner side of a join: a WHERE conjunct pushed onto it implies the predicate
+
+query T
+EXPLAIN SELECT j.jid, u.id FROM pj j JOIN pi u ON u.k = j.k WHERE u.status = 'active' AND u.k = 5
+----
+Project (2 column(s))
+  HashJoin (Inner, 1 key(s))
+    SeqScan: pj
+    Filter
+      IndexScan: pi using pi_k_active
+
+query II rowsort
+SELECT j.jid, u.id FROM pj j JOIN pi u ON u.k = j.k WHERE u.status = 'active' AND u.k = 5
+----
+5 135
+5 200
+5 5
+5 70
+
+query II rowsort
+SELECT j.jid, u.id FROM pj j JOIN pi_plain u ON u.k = j.k WHERE u.status = 'active' AND u.k = 5
+----
+5 135
+5 200
+5 5
+5 70
+
+# the partial unique index answers an equality beside other conjuncts
+
+query T
+EXPLAIN SELECT id FROM pi WHERE email = 'u8' AND k = 8
+----
+Project (1 column(s))
+  Filter
+    IndexScan: pi using pi_email
+
+query I rowsort
+SELECT id FROM pi WHERE email = 'u8' AND k = 8
+----
+8
+
+query I rowsort
+SELECT id FROM pi_plain WHERE email = 'u8' AND k = 8
+----
+8
+
+statement ok
+CREATE TABLE ex (id INT NOT NULL, name TEXT, status TEXT, a INT, b INT)
+
+statement ok
+INSERT INTO ex SELECT g, 'N' || g, CASE WHEN g % 4 = 0 THEN 'active' WHEN g % 9 = 0 THEN NULL ELSE 'x' END, g % 6, g FROM generate_series(1, 120) g
+
+statement ok
+CREATE TABLE ex_plain AS SELECT * FROM ex
+
+statement ok
+CREATE INDEX ex_lower_active ON ex (lower(name)) WHERE status = 'active'
+
+statement ok
+CREATE INDEX ex_ab ON ex (a, b) WHERE status = 'active' AND b > 10
+
+# an expression index with a predicate: the same expression plus the predicate
+
+query T
+EXPLAIN SELECT id FROM ex WHERE lower(name) = 'n8' AND status = 'active'
+----
+Project (1 column(s))
+  Filter
+    IndexScan: ex using ex_lower_active
+
+query I rowsort
+SELECT id FROM ex WHERE lower(name) = 'n8' AND status = 'active'
+----
+8
+
+query I rowsort
+SELECT id FROM ex_plain WHERE lower(name) = 'n8' AND status = 'active'
+----
+8
+
+# the expression alone is not enough
+
+query T
+EXPLAIN SELECT id FROM ex WHERE lower(name) = 'n8'
+----
+Project (1 column(s))
+  Filter
+    SeqScan: ex (project 2/5 cols)
+
+query I rowsort
+SELECT id FROM ex WHERE lower(name) = 'n8'
+----
+8
+
+query I rowsort
+SELECT id FROM ex_plain WHERE lower(name) = 'n8'
+----
+8
+
+# COLLATE "C" changes nothing (text compares by byte value)
+
+query T
+EXPLAIN SELECT id FROM ex WHERE lower(name) = 'n8' AND status = 'active' COLLATE "C"
+----
+Project (1 column(s))
+  Filter
+    IndexScan: ex using ex_lower_active
+
+query I rowsort
+SELECT id FROM ex WHERE lower(name) = 'n8' AND status = 'active' COLLATE "C"
+----
+8
+
+query I rowsort
+SELECT id FROM ex_plain WHERE lower(name) = 'n8' AND status = 'active' COLLATE "C"
+----
+8
+
+# a NULL-safe comparison is not an equality
+
+query T
+EXPLAIN SELECT id FROM ex WHERE lower(name) = 'n8' AND status IS NOT DISTINCT FROM 'active'
+----
+Project (1 column(s))
+  Filter
+    SeqScan: ex (project 3/5 cols)
+
+query I rowsort
+SELECT id FROM ex WHERE lower(name) = 'n8' AND status IS NOT DISTINCT FROM 'active'
+----
+8
+
+query I rowsort
+SELECT id FROM ex_plain WHERE lower(name) = 'n8' AND status IS NOT DISTINCT FROM 'active'
+----
+8
+
+# a two-column key with a two-conjunct predicate
+
+query T
+EXPLAIN SELECT id FROM ex WHERE a = 2 AND b > 50 AND status = 'active'
+----
+Project (1 column(s))
+  Filter
+    IndexScan: ex using ex_ab
+
+query I rowsort
+SELECT id FROM ex WHERE a = 2 AND b > 50 AND status = 'active'
+----
+104
+116
+56
+68
+80
+92
+
+query I rowsort
+SELECT id FROM ex_plain WHERE a = 2 AND b > 50 AND status = 'active'
+----
+104
+116
+56
+68
+80
+92
+
+# one conjunct missing
+
+query T
+EXPLAIN SELECT id FROM ex WHERE a = 2 AND status = 'active'
+----
+Project (1 column(s))
+  Filter
+    SeqScan: ex (project 3/5 cols)
+
+query I rowsort
+SELECT id FROM ex WHERE a = 2 AND status = 'active'
+----
+104
+116
+20
+32
+44
+56
+68
+8
+80
+92
+
+query I rowsort
+SELECT id FROM ex_plain WHERE a = 2 AND status = 'active'
+----
+104
+116
+20
+32
+44
+56
+68
+8
+80
+92
+
+# ordered by the leading key column
+
+query T
+EXPLAIN SELECT id FROM ex WHERE a = 0 AND b > 20 AND status = 'active' ORDER BY a, b LIMIT 3
+----
+Limit 3
+  Project (1 column(s))
+    Filter
+      IndexScan: ex using ex_ab
+
+query I
+SELECT id FROM ex WHERE a = 0 AND b > 20 AND status = 'active' ORDER BY a, b LIMIT 3
+----
+24
+36
+48
+
+query I
+SELECT id FROM ex_plain WHERE a = 0 AND b > 20 AND status = 'active' ORDER BY a, b LIMIT 3
+----
+24
+36
+48
+
+statement ok
+CREATE TABLE pp (id INT NOT NULL, k INT, status TEXT) PARTITION BY RANGE (id)
+
+statement ok
+CREATE TABLE pp1 PARTITION OF pp FOR VALUES FROM (0) TO (100)
+
+statement ok
+CREATE TABLE pp2 PARTITION OF pp FOR VALUES FROM (100) TO (200)
+
+statement ok
+INSERT INTO pp SELECT g, g % 10, CASE WHEN g % 4 = 0 THEN 'active' WHEN g % 7 = 0 THEN NULL ELSE 'idle' END FROM generate_series(0, 199) g
+
+statement ok
+CREATE TABLE pp_plain AS SELECT * FROM pp
+
+statement ok
+CREATE INDEX pp1_k_active ON pp1 (k) WHERE status = 'active'
+
+# a partial index on one partition serves that partition's branch
+
+query T
+EXPLAIN SELECT id FROM pp WHERE k = 4 AND status = 'active'
+----
+Project (1 column(s))
+  Filter
+    Project (3 column(s))
+      SetOperation
+        Union ALL
+          Union ALL
+            Project (3 column(s))
+              Filter
+                SeqScan: pp
+            Project (3 column(s))
+              Filter
+                IndexScan: pp1 using pp1_k_active
+          Project (3 column(s))
+            Filter
+              SeqScan: pp2
+
+query I rowsort
+SELECT id FROM pp WHERE k = 4 AND status = 'active'
+----
+104
+124
+144
+164
+184
+24
+4
+44
+64
+84
+
+query I rowsort
+SELECT id FROM pp_plain WHERE k = 4 AND status = 'active'
+----
+104
+124
+144
+164
+184
+24
+4
+44
+64
+84
+
+# and is left alone when the WHERE does not imply it
+
+query T
+EXPLAIN SELECT id FROM pp WHERE k = 4 AND status = 'idle'
+----
+Project (1 column(s))
+  Filter
+    Project (3 column(s))
+      SetOperation
+        Union ALL
+          Union ALL
+            Project (3 column(s))
+              Filter
+                SeqScan: pp
+            Project (3 column(s))
+              Filter
+                SeqScan: pp1
+          Project (3 column(s))
+            Filter
+              SeqScan: pp2
+
+query I rowsort
+SELECT id FROM pp WHERE k = 4 AND status = 'idle'
+----
+114
+134
+174
+194
+34
+54
+74
+94
+
+query I rowsort
+SELECT id FROM pp_plain WHERE k = 4 AND status = 'idle'
+----
+114
+134
+174
+194
+34
+54
+74
+94
+
+# UPDATE and DELETE find their row through a partial unique index whose predicate the WHERE implies.
+
+statement ok
+UPDATE pi SET n = n + 1000 WHERE email = 'u8'
+
+statement ok
+UPDATE pi_plain SET n = n + 1000 WHERE email = 'u8'
+
+statement ok
+DELETE FROM pi WHERE email = 'u10' AND k = 10
+
+statement ok
+DELETE FROM pi_plain WHERE email = 'u10' AND k = 10
+
+query I
+SELECT count(*) FROM (SELECT * FROM pi EXCEPT ALL SELECT * FROM pi_plain) d
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM pi_plain EXCEPT ALL SELECT * FROM pi) d
+----
+0
+
+query II rowsort
+SELECT id, n FROM pi WHERE email IN ('u8', 'u10')
+----
+8 1008
+
+# A row leaving the predicate leaves the index, and one entering it joins it.
+
+statement ok
+UPDATE pi SET status = 'idle' WHERE id = 5
+
+statement ok
+UPDATE pi SET status = 'active' WHERE id = 6
+
+statement ok
+UPDATE pi_plain SET status = 'idle' WHERE id = 5
+
+statement ok
+UPDATE pi_plain SET status = 'active' WHERE id = 6
+
+query I rowsort
+SELECT id FROM pi WHERE k = 5 AND status = 'active'
+----
+135
+200
+70
+
+query I rowsort
+SELECT id FROM pi WHERE k = 6 AND status = 'active'
+----
+110
+175
+45
+6
+
+# A prepared statement binds its parameters before planning, so each execution is planned with the
+# value it was given.
+
+statement ok
+PREPARE by_email AS SELECT id FROM pi WHERE email = $1
+
+query I
+EXECUTE by_email('u7')
+----
+7
+
+query I
+EXECUTE by_email(NULL)
+----
+
+statement ok
+PREPARE by_status AS SELECT id FROM pi WHERE k = 6 AND status = $1
+
+query I rowsort
+EXECUTE by_status('active')
+----
+110
+175
+45
+6
+
+query I rowsort
+EXECUTE by_status('idle')
+----
+123
+136
+149
+162
+188
+19
+32
+58
+71
+97
+
+query I rowsort
+SELECT id FROM pi_plain WHERE k = 6 AND status = 'idle'
+----
+123
+136
+149
+162
+188
+19
+32
+58
+71
+97
+
+# a WHERE that repeats only some of the predicate's conditions keeps rows the index does not hold,
+# so the ordered read through it is not taken
+
+statement ok
+CREATE TABLE cqs (id INT NOT NULL, status TEXT, prio INT, due INT NOT NULL)
+
+statement ok
+INSERT INTO cqs SELECT g, 'pending', g % 10, g FROM generate_series(1, 40) g
+
+statement ok
+CREATE INDEX cqs_due ON cqs (due) WHERE status = 'pending' AND prio > 5
+
+query I
+SELECT id FROM cqs WHERE status = 'pending' ORDER BY due LIMIT 3
+----
+1
+2
+3
+
+query I
+SELECT id FROM cqs WHERE status = 'pending' ORDER BY due DESC LIMIT 3
+----
+40
+39
+38
+
+query I
+SELECT id FROM cqs WHERE status = 'pending' AND prio > 5 ORDER BY due LIMIT 3
+----
+6
+7
+8
+
+query T
+EXPLAIN SELECT id FROM cqs WHERE status = 'pending' ORDER BY due LIMIT 3
+----
+Limit 3
+  Project (1 column(s))
+    Sort (1 key(s)) top-3
+      Filter
+        SeqScan: cqs (project 3/4 cols)
+
+query T
+EXPLAIN SELECT id FROM cqs WHERE status = 'pending' AND prio > 5 ORDER BY due LIMIT 3
+----
+Limit 3
+  Project (1 column(s))
+    Filter
+      IndexScan: cqs using cqs_due
+
+# a WHERE implying the predicate with a narrower condition: read in index order, not capped
+# (ascending), or sorted (descending, where the read could not stop at the LIMIT)
+
+query I
+SELECT id FROM cqs WHERE status = 'pending' AND prio > 7 ORDER BY due LIMIT 3
+----
+8
+9
+18
+
+query T
+EXPLAIN SELECT id FROM cqs WHERE status = 'pending' AND prio > 7 ORDER BY due LIMIT 3
+----
+Limit 3
+  Project (1 column(s))
+    Filter
+      IndexScan: cqs using cqs_due
+
+query I
+SELECT id FROM cqs WHERE status = 'pending' AND prio > 7 ORDER BY due DESC LIMIT 3
+----
+39
+38
+29
+
+query T
+EXPLAIN SELECT id FROM cqs WHERE status = 'pending' AND prio > 7 ORDER BY due DESC LIMIT 3
+----
+Limit 3
+  Project (1 column(s))
+    Sort (1 key(s)) top-3
+      Filter
+        SeqScan: cqs

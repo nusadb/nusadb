@@ -48,6 +48,7 @@ impl Catalog for EngineCatalog<'_> {
                 columns: def.columns,
                 key_exprs: Vec::new(),
                 unique: def.unique,
+                predicate: None,
             });
         }
         Ok(out)

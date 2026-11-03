@@ -4286,8 +4286,8 @@ fn cascade_update_children(
         let bytes = row::encode(&new, &child_types)?;
         let new_tid = engine.update(txn, child.id, tid, &bytes)?;
         // Maintain the child's secondary indexes for the rewritten row version, as `run_update`
-        // does — the old version's entries stay until VACUUM, except a partial index the row is
-        // leaving, whose stale entry is removed.
+        // does: the old version's entries stay until VACUUM, and a partial index the row is
+        // leaving has its entry dead-stamped.
         if !index_targets.is_empty() {
             remove_departed_index_entries(&index_targets, &old, tid, &new, engine, txn)?;
             insert_into_indexes(&index_targets, &new, new_tid, engine, txn)?;
@@ -5508,15 +5508,20 @@ fn backfill_index_external_sort(
     Ok(())
 }
 
-/// On UPDATE, remove a row's entry from every **partial** index it is leaving — it was indexed
+/// On UPDATE, retire a row's entry from every **partial** index it is leaving: it was indexed
 /// (`old` satisfied the predicate) but its new version is not.
 ///
 /// The append-only maintenance dead-stamps an old index entry only when a NEW entry is inserted for
 /// the same row under a different key (inside `index_insert`); a row that departs a partial
 /// predicate inserts no new entry, so without this its stale entry would linger forever and cause a
 /// spurious uniqueness conflict against a genuinely new row. A full (non-partial) index needs
-/// nothing here: a key change still inserts a new entry, which dead-stamps the old one. The partial
-/// index is never a scan candidate, so the hard removal cannot make a concurrent reader miss a row.
+/// nothing here: a key change still inserts a new entry, which dead-stamps the old one.
+///
+/// The entry must be dead-stamped, not removed: a partial index is a scan path, and a snapshot that
+/// still sees the old version (any transaction while this one is open, a REPEATABLE READ one after
+/// it commits) must still find the row through it. So the row first moves to a key of its own that
+/// no real key can equal ([`parked_key`]), which stamps its entry exactly as a key change does, and
+/// that entry, visible to no one else, is then removed.
 pub(super) fn remove_departed_index_entries(
     targets: &[IndexTarget],
     old_row: &Row,
@@ -5544,18 +5549,117 @@ pub(super) fn remove_departed_index_entries(
             continue;
         }
         if row_is_indexed(target, old_row)? && !row_is_indexed(target, new_row)? {
-            let key = entry_key(target, old_row, old_tid)?;
-            engine.index_delete(txn, target.id, &key, old_tid)?;
-            if target.guard.is_some() {
-                // An entry written before the suffix existed carries the bare key.
-                let bare = index_key_for(old_row, &target.keys)?;
-                if bare != key {
-                    engine.index_delete(txn, target.id, &bare, old_tid)?;
-                }
-            }
+            retire_entry(target, Some(old_row), old_tid, engine, txn)?;
         }
     }
     Ok(())
+}
+
+/// Dead-stamp the entry row `tid` holds in `target` (whatever its key), so snapshots that still
+/// see the entry keep finding the row while every later one does not: the row moves to its
+/// [`parked_key`], which stamps its entry exactly as a key change does, and that entry, visible to
+/// no one else, is then removed. When the row holds no entry this leaves the index as it was.
+/// `old_row`, when known, is the version the entry was written for (see below).
+fn retire_entry(
+    target: &IndexTarget,
+    old_row: Option<&Row>,
+    tid: Tid,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let parked = parked_key(tid);
+    engine.index_insert(txn, target.id, &parked, tid)?;
+    engine.index_delete(txn, target.id, &parked, tid)?;
+    if target.guard.is_some()
+        && let Some(old_row) = old_row
+    {
+        // An entry written before the suffix existed carries the bare key.
+        let key = entry_key(target, old_row, tid)?;
+        let bare = index_key_for(old_row, &target.keys)?;
+        if bare != key {
+            engine.index_delete(txn, target.id, &bare, tid)?;
+        }
+    }
+    Ok(())
+}
+
+/// Bring the entries every row of `table` holds in the indexes `ids` in line with the rows and with
+/// the indexes' keys and predicates as they resolve against the table now ([`resync_index_entries`]
+/// with nothing known of before). Rows are streamed. The caller holds the table against writers.
+pub(super) fn resync_table_indexes(
+    table: &TableSchema,
+    ids: &[nusadb_core::IndexId],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    let targets: Vec<IndexTarget> = secondary_index_targets(table, engine)?
+        .into_iter()
+        .filter(|t| ids.contains(&t.id))
+        .collect();
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let schema = column_types(table);
+    let mut scan = engine.scan(txn, table.id)?;
+    while let Some((tid, tuple)) = scan.try_next()? {
+        crate::cancel::check()?;
+        let row = row::decode(&tuple, &schema)?;
+        resync_index_entries(&targets, None, &row, tid, engine, txn)?;
+    }
+    Ok(())
+}
+
+/// Bring the entries of `row`@`tid` in every index of `targets` in line with the row as it now is
+/// and the predicates and keys as they now resolve, after a DDL statement rewrote the row or changed
+/// what an index's predicate or key means (`ALTER COLUMN ... TYPE`, `REINDEX`).
+///
+/// A row the index holds gets its entry under its current key (an entry under another key is
+/// dead-stamped by the insert, and one under the same key is left as it is). A row a partial index
+/// does not hold has its entry dead-stamped ([`retire_entry`]), so a snapshot taken before the
+/// statement still finds it while every later one does not. `before` gives the targets as they
+/// resolved before the change and the row as it was: a row that the index did not hold before
+/// needs no retiring. Without it, or for an index that did not resolve before (it was not
+/// maintained then), every row the predicate leaves out is retired.
+pub(super) fn resync_index_entries(
+    targets: &[IndexTarget],
+    before: Option<(&[IndexTarget], &Row)>,
+    row: &Row,
+    tid: Tid,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    for target in targets {
+        if row_is_indexed(target, row)? {
+            guard_unique_entry(target, row, tid, engine, txn)?;
+            engine.index_insert(txn, target.id, &entry_key(target, row, tid)?, tid)?;
+            continue;
+        }
+        let old = before.and_then(|(old_targets, old_row)| {
+            old_targets
+                .iter()
+                .find(|t| t.id == target.id)
+                .map(|t| (t, old_row))
+        });
+        match old {
+            Some((old_target, old_row)) => {
+                if row_is_indexed(old_target, old_row)? {
+                    retire_entry(old_target, Some(old_row), tid, engine, txn)?;
+                }
+            },
+            None => retire_entry(target, None, tid, engine, txn)?,
+        }
+    }
+    Ok(())
+}
+
+/// The key a row departing a partial index moves to for an instant (see
+/// [`remove_departed_index_entries`]): a leading `0xFF`, above every field tag an encoded key starts
+/// with, then the row's address, so it equals no real key and no other row's.
+fn parked_key(tid: Tid) -> [u8; 12] {
+    let mut out = [0xFF; 12];
+    out[2..10].copy_from_slice(&tid.page.0.to_be_bytes());
+    out[10..].copy_from_slice(&tid.slot.0.to_be_bytes());
+    out
 }
 
 // === UPDATE / DELETE ======================================================
@@ -5596,9 +5700,11 @@ fn join_source(
 /// qualifying row is missed and no extra row is affected. Restricting to a unique *point* lookup
 /// also bounds the result to ≤1 row, so there is no scan-order difference to reason about versus a
 /// sequential scan. Only the complete, plain-column indexes are offered as a path
-/// ([`catalog_list_indexes`] already drops partial and still-building indexes; one keyed on
-/// expressions has no key columns and is skipped here).
-fn try_point_get_rows(
+/// ([`catalog_list_indexes`] already drops still-building indexes; one keyed on expressions has no
+/// key columns and is skipped here). A partial unique index is a path only when the `WHERE`
+/// implies its predicate, exactly as for a `SELECT`; its predicate is resolved only when no index
+/// over every row already gives the point lookup.
+pub(super) fn try_point_get_rows(
     table: &TableSchema,
     filter: Option<&TypedExpr>,
     engine: &dyn StorageEngine,
@@ -5610,6 +5716,7 @@ fn try_point_get_rows(
     // Resolve the table's scannable indexes to planner metadata with key-column ordinals (mirrors
     // the analyzer's `resolve_table_indexes`, but from the executor's live catalog view).
     let mut metas: Vec<crate::planner::IndexMeta> = Vec::new();
+    let mut partial: Vec<(crate::IndexInfo, Vec<usize>)> = Vec::new();
     for info in super::catalog_list_indexes(engine, txn, &table.name)? {
         let mut columns = Vec::with_capacity(info.columns.len());
         let mut ok = true;
@@ -5620,28 +5727,48 @@ fn try_point_get_rows(
             };
             columns.push(ord);
         }
-        if ok && !columns.is_empty() {
-            metas.push(crate::planner::IndexMeta {
-                name: info.name,
-                columns,
-                key_exprs: Vec::new(),
-                unique: info.unique,
-            });
+        if !ok || columns.is_empty() {
+            continue;
         }
+        if info.predicate.is_some() {
+            // Only a unique index can give a point lookup; its predicate waits for the second pass.
+            if info.unique {
+                partial.push((info, columns));
+            }
+            continue;
+        }
+        metas.push(crate::planner::IndexMeta {
+            name: info.name,
+            columns,
+            key_exprs: Vec::new(),
+            unique: info.unique,
+            predicate: None,
+        });
     }
     // Reuse the SELECT index-selection (single source of truth for matching a predicate to an
     // index), but take only a *unique point lookup* — a `SeqScan`-superset guarantee plus the ≤1-row
     // bound. No stats are passed: an equality on a unique whole key is always cheaper than a full
     // scan, so the cost gate is unnecessary here.
-    match crate::planner::try_point_get_index(table, &metas, filter) {
-        Some(crate::planner::PhysicalOperator::IndexScan {
-            index,
-            lo,
-            hi,
-            key_columns,
-            unique_point: true,
-            ..
-        }) => Ok(Some(index_scan_table(
+    let mut found = unique_point_scan(table, &metas, filter);
+    if found.is_none() && !partial.is_empty() {
+        let predicates = super::partial_index_predicates(table);
+        let metas: Vec<crate::planner::IndexMeta> = partial
+            .into_iter()
+            .filter_map(|(info, columns)| {
+                let (predicate, _) = predicates.get(info.predicate.as_deref()?)?;
+                Some(crate::planner::IndexMeta {
+                    name: info.name,
+                    columns,
+                    key_exprs: Vec::new(),
+                    unique: true,
+                    predicate: Some(predicate),
+                })
+            })
+            .collect();
+        found = unique_point_scan(table, &metas, filter);
+    }
+    match found {
+        Some((index, lo, hi, key_columns)) => Ok(Some(index_scan_table(
             table,
             &index,
             &lo,
@@ -5650,7 +5777,34 @@ fn try_point_get_rows(
             engine,
             txn,
         )?)),
-        _ => Ok(None),
+        None => Ok(None),
+    }
+}
+
+/// A unique point lookup: the index name, its key range, and how many key columns the range bounds.
+type PointRange = (
+    String,
+    std::ops::Bound<Vec<ast::Value>>,
+    std::ops::Bound<Vec<ast::Value>>,
+    usize,
+);
+
+/// The index range of a unique point lookup `filter` maps onto among `metas`, if any.
+fn unique_point_scan(
+    table: &TableSchema,
+    metas: &[crate::planner::IndexMeta],
+    filter: &TypedExpr,
+) -> Option<PointRange> {
+    match crate::planner::try_point_get_index(table, metas, filter) {
+        Some(crate::planner::PhysicalOperator::IndexScan {
+            index,
+            lo,
+            hi,
+            key_columns,
+            unique_point: true,
+            ..
+        }) => Some((index, lo, hi, key_columns)),
+        _ => None,
     }
 }
 

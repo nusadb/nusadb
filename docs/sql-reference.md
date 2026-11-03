@@ -1160,8 +1160,81 @@ scan. A key expression or predicate that calls a function which is not immutable
 [Volatility](#volatility)). An expression involving a `TIMESTAMPTZ` or `TIMETZ` value is accepted
 but never used to answer a query, because the session's `TimeZone` setting changes its value
 (`CAST(ts AS DATE)`, `extract(hour FROM ts)`), so the key stored when a row was written need not be
-the value a later query computes. Index such a value through a stored generated column instead. A partial index keeps only the rows that satisfy its predicate,
-so it is maintained and enforces uniqueness but is never used to answer a query.
+the value a later query computes. Index such a value through a stored generated column instead.
+
+#### Partial indexes
+
+A partial index keeps only the rows its predicate is true for. The planner reads through it only
+when it can prove that every row the query may return is one of those, that is, when the query's
+`WHERE` implies the predicate. Otherwise the index could miss rows, and it is not used.
+
+```sql
+CREATE UNIQUE INDEX users_email ON users (email) WHERE email IS NOT NULL;
+CREATE INDEX jobs_due ON jobs (due_at) WHERE status = 'pending';
+
+SELECT id FROM users WHERE email = 'a@x.org';           -- uses users_email
+SELECT id FROM jobs WHERE status = 'pending' AND due_at <= now()
+ORDER BY due_at LIMIT 10;                               -- uses jobs_due, no sort
+SELECT id FROM jobs WHERE due_at <= now();              -- sequential scan
+```
+
+The predicate is split at its top-level `AND`s, and each part must follow from one `AND`-ed
+condition of the `WHERE` (two conditions are not combined, so `x >= 5 AND x <= 5` does not prove
+`x = 5`). A part follows from a condition when:
+
+- the two are the same condition, with a constant on either side of a comparison
+  (`'active' = status` proves `status = 'active'`);
+- both compare the same expression with a constant and the condition's value lies inside the part:
+  `x = 5` proves `x >= 3`, `x > 4`, `x <> 7` and `x IN (5, 6)`, `x > 10` proves `x > 5` and
+  `x >= 10`, and `x IN (1, 2)` proves what both `x = 1` and `x = 2` prove. Integers are not treated
+  as steps, so `x > 4` does not prove `x >= 5`;
+- the part is `x IS NOT NULL` and the condition is any comparison with `x` on one side, or `x IN`
+  or `x BETWEEN`, all of which are NULL rather than true when `x` is NULL;
+- a boolean column `flag` stands for `flag = true` and `NOT flag` for `flag = false`;
+- the part is `a OR b` and the condition proves `a` or proves `b`, or the condition is `a OR b`
+  and both `a` and `b` prove the part.
+
+Constants are compared only when both have one type among boolean, integer, `NUMERIC`, text,
+`DATE`, `TIME`, `TIMESTAMP` and `UUID`, and the expression has that type too. Other conditions
+(`IS TRUE`, `IS NOT DISTINCT FROM`, `LIKE`, a floating-point constant) prove a part only by being
+the same condition. Text compares by byte value whatever the collation, so `COLLATE "C"` on a
+condition changes nothing. A predicate involving a `TIMESTAMPTZ` or `TIMETZ` value is never used,
+for the reason given above for key expressions.
+
+The index must also serve the query as any index does: the `WHERE` bounds its leading key column
+(or key expression of an expression index), or the query orders by its leading key columns with a
+`LIMIT`. In the ordered case the order must be ascending: the index is read in order under the
+`WHERE`, with no sort, and the read stops once the `LIMIT` is filled, which is what a queue polled
+with `WHERE status = 'pending' AND due_at <= now() ORDER BY due_at LIMIT n` needs. In a
+`SERIALIZABLE` transaction an index read records every entry of its range, so there it reads all
+the rows the index holds in the range before the first is returned. A descending order is served
+this way only over a `NOT NULL` ordering column, and only when the `WHERE` implies the whole
+predicate while holding nothing but conditions of the predicate and at most one constant bound on
+each side of that column (the read is then capped at the `LIMIT` in either direction); otherwise it
+keeps the sort. `WHERE status = 'pending'` over an index `WHERE status = 'pending' AND prio > 5`
+does not imply the predicate, so it keeps the sort in either direction. A nullable ordering
+column qualifies only when the `WHERE` or the predicate rules out NULL, since the index keeps NULL
+first while an ascending `ORDER BY` puts it last. A `SELECT ... FOR UPDATE` or `FOR SHARE` keeps
+its sort, as for any index.
+
+With statistics (`ANALYZE`) the estimate counts only the rows the predicate keeps, so a partial
+index holding a small share of the table beats a full index on the same key, while one that holds
+most of the table loses to a sequential scan when the bound is wide. An `UPDATE` or `DELETE` whose
+`WHERE` is an equality on the whole key of a partial unique index, and implies its predicate,
+finds its row through it. A partition's own partial index serves that partition's part of a query
+on the partitioned table. A prepared statement's parameters are bound before it is planned, so
+`email = $1` uses `users_email` on every execution and `status = $1` uses a `status = 'pending'`
+index when the value is `'pending'`. A plan over a table whose only indexes are partial is kept in
+the plan cache until an index of that table is created or dropped; a plan over a table with any
+other index is not kept.
+
+The predicate means what it means for the table's columns as they are now. `ALTER COLUMN ... TYPE`
+on a column the predicate reads evaluates it again for every row under the new type, so the rows
+the index holds can change: `WHERE v > '5'` compares text while `v` is `TEXT` (`'10'` is not
+greater than `'5'`) and numbers once it is `INT`, and `5.4 > 5` stops holding when `NUMERIC`
+becomes `INT` and the value rounds to `5`. `RENAME COLUMN` renames the column in the predicate
+too, so a column added later under the old name is not the one the index filters on,
+and `DROP COLUMN` drops an index whose key or predicate reads the column.
 
 #### Unique indexes and NULL keys
 
@@ -2294,7 +2367,7 @@ ANALYZE customers;        -- refresh planner statistics for one table
 ANALYZE;                  -- every table
 VACUUM;                   -- reclaim row versions no snapshot can see
 VACUUM (FULL, ANALYZE) orders;
-REINDEX TABLE orders;     -- rebuild the indexes an earlier release built over CHAR columns (see below)
+REINDEX TABLE orders;     -- check every index of the table against its rows (see below)
 CLUSTER orders;           -- accepted for compatibility; rows are already clustered by row id, so it is a no-op
 CREATE EXTENSION IF NOT EXISTS vector;   -- accepted for compatibility; installs nothing, every type is built in
 CHECKPOINT;               -- fold the log into an image and truncate it; needs a quiet engine
@@ -2325,8 +2398,12 @@ REINDEX DATABASE mydb;           -- every table of the database
 `REINDEX INDEX` and `REINDEX TABLE` need the table's owner (or a superuser), as `CREATE INDEX`
 does; `REINDEX SCHEMA` and `REINDEX DATABASE` rebuild the tables the role owns and skip the others
 (a superuser's covers every table). `REINDEX DATABASE name` must name the connection's database,
-and `REINDEX SYSTEM` is the same as `REINDEX DATABASE`. Only those older indexes are rebuilt; any
-other index is left alone. A rebuild streams the table's rows (the index of a `PRIMARY KEY` or
+and `REINDEX SYSTEM` is the same as `REINDEX DATABASE`. Only those older indexes are rebuilt from
+scratch. Every other index the statement covers keeps its identity and is brought in line with the
+table's rows in place: each row the index should hold gets its entry under its current key, and a
+partial index stops holding a row its predicate does not accept under the columns' current types.
+An entry taken out this way stays visible to a transaction that started before the `REINDEX`, so
+such a transaction keeps reading what it read before. A rebuild streams the table's rows (the index of a `PRIMARY KEY` or
 `UNIQUE` constraint reads them a second time, to check that no key is held twice), and keeps
 everything the index was declared with: its key, `WHERE` clause, `NULLS [NOT] DISTINCT`, the
 constraint it backs with its timing, the foreign keys that reference it, and comments.

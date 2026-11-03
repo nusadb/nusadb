@@ -14,7 +14,10 @@
 //! 2. **No unversioned dependency.** A plan can bake things that change *without* bumping any table's
 //!    schema version: an inlined view/UDF body, a row-level-security policy predicate, or an index
 //!    choice (`CREATE`/`DROP INDEX` is unversioned). The recording catalog flags these during
-//!    analysis, and such plans are not cached at all (conservative, always safe).
+//!    analysis, and such plans are not cached at all (conservative, always safe). One index
+//!    dependency is re-checkable instead: for a table whose only indexes are partial, the entry
+//!    keeps the indexes the analysis listed and a hit lists them again, so any `CREATE` or
+//!    `DROP INDEX` on that table discards it.
 //! 4. **Privilege decisions are re-checked on reuse.** A privilege gate (`has_privilege` /
 //!    `owns_object`) is not baked into the plan's *shape* — it only decides whether the plan is
 //!    built at all — and it can change without any table's schema version moving (a `REVOKE` from
@@ -74,7 +77,33 @@ struct CachedPlan {
     /// that has edges). Re-checked on reuse: any new edge, attach/detach, or bound change moves the
     /// fingerprint and discards the entry. `None` for a plan that never consulted it.
     inheritance_fingerprint: Option<u64>,
+    /// The partial indexes the analysis listed for a table that has no other index (see
+    /// [`IndexListing`]), each listed again on reuse: any `CREATE` or `DROP INDEX` on such a table
+    /// changes its listing and discards the entry.
+    index_listings: Vec<IndexListing>,
     plan: PhysicalPlan,
+}
+
+/// One table's index listing a plan was made with: the table as the analysis named it (its schema
+/// when it gave one) and the indexes the catalog listed. Recorded only when every one of them is
+/// partial, so a hit can list them again and compare, instead of leaving the plan uncached as it
+/// does for a table with an index over every row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IndexListing {
+    schema: Option<String>,
+    table: String,
+    indexes: Vec<IndexInfo>,
+}
+
+impl IndexListing {
+    /// Whether the catalog still lists exactly these indexes for the table.
+    fn still_holds(&self, catalog: &dyn Catalog) -> Result<bool, Error> {
+        let now = match &self.schema {
+            Some(schema) => catalog.list_indexes_in(schema, &self.table)?,
+            None => catalog.list_indexes(&self.table)?,
+        };
+        Ok(now == self.indexes)
+    }
 }
 
 /// A per-(connection, user) cache of planned read statements. See the module docs for the
@@ -140,6 +169,8 @@ struct RecordingCatalog<'a> {
     privilege_checks: RefCell<Vec<PrivilegeCheck>>,
     /// Every ownership decision the analysis asked for, captured the same way.
     ownership_checks: RefCell<Vec<OwnershipCheck>>,
+    /// The listings of tables whose only indexes are partial, re-checked on reuse.
+    index_listings: RefCell<Vec<IndexListing>>,
 }
 
 impl<'a> RecordingCatalog<'a> {
@@ -153,6 +184,26 @@ impl<'a> RecordingCatalog<'a> {
             saw_inheritance: Cell::new(false),
             privilege_checks: RefCell::new(Vec::new()),
             ownership_checks: RefCell::new(Vec::new()),
+            index_listings: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Note that the analysis listed `indexes` for `table`. A plan that can see an index may lower
+    /// to an `IndexScan`, and index DDL bumps no schema version. When every listed index is
+    /// partial the listing is kept and compared again on reuse; any other index makes the plan
+    /// uncached (conservative: it fires even when the planner ultimately picks a seq scan).
+    fn note_indexes(&self, schema: Option<&str>, table: &str, indexes: &[IndexInfo]) {
+        if indexes.is_empty() {
+            return;
+        }
+        if indexes.iter().all(|i| i.predicate.is_some()) {
+            self.index_listings.borrow_mut().push(IndexListing {
+                schema: schema.map(str::to_owned),
+                table: table.to_owned(),
+                indexes: indexes.to_vec(),
+            });
+        } else {
+            self.saw_unversioned_dep.set(true);
         }
     }
 }
@@ -260,11 +311,7 @@ impl Catalog for RecordingCatalog<'_> {
 
     fn list_indexes(&self, table: &str) -> Result<Vec<IndexInfo>, Error> {
         let indexes = self.inner.list_indexes(table)?;
-        // A plan that can see an index may lower to an `IndexScan`; index DDL is unversioned, so do
-        // not cache it. (Conservative — fires even when the planner ultimately picks a seq scan.)
-        if !indexes.is_empty() {
-            self.saw_unversioned_dep.set(true);
-        }
+        self.note_indexes(None, table, &indexes);
         Ok(indexes)
     }
     fn rls_enabled(&self, schema: &str, name: &str) -> Result<bool, Error> {
@@ -279,10 +326,7 @@ impl Catalog for RecordingCatalog<'_> {
 
     fn list_indexes_in(&self, schema: &str, name: &str) -> Result<Vec<IndexInfo>, Error> {
         let indexes = self.inner.list_indexes_in(schema, name)?;
-        // The same rule as `list_indexes`: a plan that can see an index is not cached.
-        if !indexes.is_empty() {
-            self.saw_unversioned_dep.set(true);
-        }
+        self.note_indexes(Some(schema), name, &indexes);
         Ok(indexes)
     }
 
@@ -452,6 +496,16 @@ fn access_checks_still_hold(catalog: &dyn Catalog, entry: &CachedPlan) -> Result
     Ok(true)
 }
 
+/// Whether every table whose partial indexes the plan was made with still has exactly those.
+fn index_listings_still_hold(catalog: &dyn Catalog, entry: &CachedPlan) -> Result<bool, Error> {
+    for listing in &entry.index_listings {
+        if !listing.still_holds(catalog)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn fingerprint_unchanged(engine: &dyn StorageEngine, fingerprint: &[(TableId, u32)]) -> bool {
     fingerprint
         .iter()
@@ -546,6 +600,7 @@ pub fn plan_cached(
         if fingerprint_unchanged(engine, &entry.fingerprint)
             && inheritance_unchanged
             && access_checks_still_hold(catalog, entry)?
+            && index_listings_still_hold(catalog, entry)?
         {
             cache.hits += 1;
             return Ok(entry.plan.clone());
@@ -582,6 +637,7 @@ pub fn plan_cached(
                 privilege_checks: recorder.privilege_checks.into_inner(),
                 ownership_checks: recorder.ownership_checks.into_inner(),
                 inheritance_fingerprint,
+                index_listings: recorder.index_listings.into_inner(),
                 plan: physical.clone(),
             },
         );

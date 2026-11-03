@@ -4588,3 +4588,153 @@ mod lock_rows_changed_since_snapshot {
         );
     }
 }
+
+/// `UPDATE`/`DELETE` find their target through a partial unique index whose predicate the `WHERE`
+/// implies (a point lookup), and fall back to a scan when it does not.
+#[test]
+fn dml_point_lookup_uses_an_implied_partial_unique_index() {
+    use nusadb_btree::BtreeEngine;
+
+    struct Cat<'a>(&'a BtreeEngine);
+    impl Catalog for Cat<'_> {
+        fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
+            self.0.lookup_table(name).map_err(Into::into)
+        }
+    }
+
+    let engine = BtreeEngine::new();
+    let mut session = crate::Session::new(&engine);
+    for sql in [
+        "CREATE TABLE u (id INT NOT NULL, email TEXT, state TEXT)",
+        "INSERT INTO u SELECT g, CASE WHEN g % 3 = 0 THEN NULL ELSE 'e' || g END, \
+         CASE WHEN g % 2 = 0 THEN 'live' ELSE 'gone' END FROM generate_series(1, 50) g",
+        "CREATE UNIQUE INDEX u_email ON u (email) WHERE email IS NOT NULL",
+        "CREATE UNIQUE INDEX u_live ON u (id) WHERE state = 'live'",
+    ] {
+        session
+            .execute(plan(analyze(parse(sql).unwrap(), &Cat(&engine)).unwrap()))
+            .unwrap();
+    }
+    let found = |sql: &str| {
+        let crate::planner::LogicalPlan::Delete(delete) =
+            analyze(parse(sql).unwrap(), &Cat(&engine)).unwrap()
+        else {
+            panic!("not a DELETE: {sql}");
+        };
+        let txn = engine.begin(IsolationLevel::default()).unwrap();
+        let out =
+            super::dml::try_point_get_rows(&delete.table, delete.filter.as_ref(), &engine, txn)
+                .unwrap()
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|(_, row)| row[0].clone())
+                        .collect::<Vec<_>>()
+                });
+        engine.commit(txn).unwrap();
+        out
+    };
+    // `email = 'e5'` implies `email IS NOT NULL`: a point lookup through `u_email`.
+    assert_eq!(
+        found("DELETE FROM u WHERE email = 'e5'"),
+        Some(vec![Value::Int(5)])
+    );
+    // `state = 'live'` beside `id = 8` implies `u_live`'s predicate.
+    assert_eq!(
+        found("DELETE FROM u WHERE id = 8 AND state = 'live'"),
+        Some(vec![Value::Int(8)])
+    );
+    // Without the predicate the partial index could miss the row: a scan.
+    assert_eq!(found("DELETE FROM u WHERE id = 8"), None);
+    assert_eq!(found("DELETE FROM u WHERE email IS NULL"), None);
+}
+
+/// `REINDEX INDEX` and `REINDEX TABLE` bring a partial index back to exactly the rows its predicate
+/// accepts: an entry for a row it should not hold is dead-stamped, and a row it should hold gets
+/// its entry back. The index is damaged here by writing entries behind the SQL layer's back.
+#[test]
+fn reindex_repairs_partial_index_membership() {
+    use nusadb_btree::BtreeEngine;
+
+    struct Cat<'a>(&'a BtreeEngine);
+    impl Catalog for Cat<'_> {
+        fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
+            self.0.lookup_table(name).map_err(Into::into)
+        }
+        fn list_indexes(&self, table: &str) -> Result<Vec<crate::IndexInfo>, Error> {
+            let txn = self.0.begin(IsolationLevel::default())?;
+            let out = super::catalog_list_indexes(self.0, txn, table);
+            self.0.commit(txn)?;
+            out
+        }
+    }
+
+    let engine = BtreeEngine::new();
+    let mut session = crate::Session::new(&engine);
+    let mut exec = |sql: &str| {
+        session
+            .execute(plan(analyze(parse(sql).unwrap(), &Cat(&engine)).unwrap()))
+            .unwrap()
+    };
+    exec("CREATE TABLE r (id INT NOT NULL, v INT, k INT NOT NULL)");
+    exec("INSERT INTO r VALUES (1, 10, 1), (2, 1, 2), (3, NULL, 3), (4, 20, 4)");
+    exec("CREATE INDEX r_i ON r (k) WHERE v > 5");
+
+    let ids = |result: ExecutionResult| -> Vec<Value> {
+        let (_, rows) = rows_of(result);
+        let mut out: Vec<Value> = rows.into_iter().map(|r| r[0].clone()).collect();
+        out.sort_by_key(|v| match v {
+            Value::Int(i) => *i,
+            _ => i64::MAX,
+        });
+        out
+    };
+    let damage = || {
+        let table = engine.lookup_table("r").unwrap().unwrap();
+        let index = engine.lookup_index("r_i").unwrap().unwrap();
+        let txn = engine.begin(IsolationLevel::default()).unwrap();
+        let mut scan = engine.scan(txn, table.id).unwrap();
+        let mut tids = HashMap::new();
+        while let Some((tid, tuple)) = scan.try_next().unwrap() {
+            let row = super::row::decode(&tuple, &super::column_types(&table)).unwrap();
+            if let Value::Int(id) = row[0] {
+                tids.insert(id, tid);
+            }
+        }
+        drop(scan);
+        let key = |k: i64| super::index_key::encode_index_key(&[Value::Int(k)]).unwrap();
+        // Row 2 (v = 1) gets an entry it should not have, under a key ahead of every other.
+        engine.index_insert(txn, index, &key(0), tids[&2]).unwrap();
+        // Row 4 (v = 20) loses the entry it should have.
+        engine.index_delete(txn, index, &key(4), tids[&4]).unwrap();
+        engine.commit(txn).unwrap();
+    };
+
+    let top = "SELECT id FROM r WHERE v > 5 ORDER BY k LIMIT 1";
+    let all = "SELECT id FROM r WHERE v > 5 AND k >= 0";
+    for reindex in ["REINDEX INDEX r_i", "REINDEX TABLE r"] {
+        damage();
+        // The damage shows: the capped ordered read meets row 2 first, and row 4 is missing.
+        assert_eq!(ids(exec(top)), Vec::<Value>::new(), "{reindex}");
+        assert_eq!(ids(exec(all)), vec![Value::Int(1)], "{reindex}");
+        // A REPEATABLE READ transaction open across the REINDEX keeps reading what it read: the
+        // entry the REINDEX takes out is dead-stamped, not removed.
+        let mut reader = crate::Session::new(&engine);
+        let mut read = |sql: &str| {
+            reader
+                .execute(plan(analyze(parse(sql).unwrap(), &Cat(&engine)).unwrap()))
+                .unwrap()
+        };
+        read("BEGIN ISOLATION LEVEL REPEATABLE READ");
+        assert_eq!(ids(read(top)), Vec::<Value>::new(), "{reindex}");
+        exec(reindex);
+        assert_eq!(ids(exec(top)), vec![Value::Int(1)], "{reindex}");
+        assert_eq!(
+            ids(exec(all)),
+            vec![Value::Int(1), Value::Int(4)],
+            "{reindex}"
+        );
+        assert_eq!(ids(read(top)), Vec::<Value>::new(), "{reindex}");
+        read("COMMIT");
+        assert_eq!(ids(read(top)), vec![Value::Int(1)], "{reindex}");
+    }
+}
