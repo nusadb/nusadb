@@ -810,33 +810,47 @@ fn from_ref_is_real_table(
     Ok(lookup_table_ref(base.schema.as_deref(), &base.name, catalog)?.is_some())
 }
 
-/// Resolve a single auxiliary relation for `UPDATE ... FROM` / `DELETE ... USING`: a named
-/// table, or a `(VALUES ...)` / `(SELECT ...)` / set-operation derived table. Returns the relation's
-/// schema and, for a derived source, the inlined plan that produces its rows (`None` for a named
-/// table, which the executor scans directly). A `LATERAL` source is rejected — there is no left-hand
-/// scope here for it to correlate to. The named table is looked up without the `resolve_table` RLS
-/// refusal; the caller applies the UPDATE/DELETE-FROM RLS guard against the returned schema.
+/// A resolved auxiliary relation: its schema, the inlined plan of a derived source (`None` for a
+/// named table, which the executor scans directly), and whether the session may read each of its
+/// columns, parallel to the schema's columns.
+pub(super) type AuxRelation = (TableSchema, Option<SelectPlan>, Vec<bool>);
+
+/// Resolve a single auxiliary relation for `UPDATE ... FROM` / `DELETE ... USING` / `MERGE ...
+/// USING`: a named table, or a `(VALUES ...)` / `(SELECT ...)` / set-operation derived table. A
+/// `LATERAL` source is rejected, since there is no left-hand scope here for it to correlate to. The
+/// named table is looked up without the `resolve_table` RLS refusal; the caller applies the
+/// UPDATE/DELETE-FROM RLS guard against the returned schema.
+///
+/// A named table needs SELECT on some column to be read at all, and each of its columns is readable
+/// only with SELECT on it, as in a `SELECT`'s `FROM`: the caller puts the returned per-column grants
+/// on the columns it brings into scope, so a reference to a column the session may not read is
+/// refused wherever the statement makes it. A derived source's columns were checked when its body
+/// was analyzed.
 pub(super) fn resolve_aux_relation(
     base: &ast::TableRef,
     catalog: &dyn Catalog,
-) -> Result<(TableSchema, Option<SelectPlan>), Error> {
+) -> Result<AuxRelation, Error> {
     if base.lateral {
         return Err(Error::Unsupported(
             "a LATERAL source in UPDATE ... FROM / DELETE ... USING is not supported".to_owned(),
         ));
     }
+    let derived = |schema: TableSchema, plan: SelectPlan| {
+        let readable = vec![true; schema.columns.len()];
+        (schema, Some(plan), readable)
+    };
     if let Some(set_op) = &base.set_op {
         let plan = analyze_set_op_table((**set_op).clone(), catalog)?;
         let schema = cte_schema(&base.name, &base.column_aliases, &plan)?;
-        Ok((schema, Some(plan)))
+        Ok(derived(schema, plan))
     } else if let Some(values) = &base.values {
         let plan = analyze_values_table(values, catalog)?;
         let schema = cte_schema(&base.name, &base.column_aliases, &plan)?;
-        Ok((schema, Some(plan)))
+        Ok(derived(schema, plan))
     } else if let Some(subquery) = &base.subquery {
         let plan = apply_ordinality(analyze_select((**subquery).clone(), catalog)?, base)?;
         let schema = cte_schema(&base.name, &base.column_aliases, &plan)?;
-        Ok((schema, Some(plan)))
+        Ok(derived(schema, plan))
     } else {
         // A named aux table resolves through the search path / its explicit qualifier.
         let schema =
@@ -849,6 +863,7 @@ pub(super) fn resolve_aux_relation(
         // privilege on the statement's target says nothing about the tables it reads to decide
         // what to write.
         super::dcl::require_read_access(catalog, &schema)?;
+        let readable = super::column_select_grants(&schema, catalog)?;
         // Read the source as an inheritance parent too (unless `ONLY`): a parent used as an
         // UPDATE/DELETE source must contribute its descendants' rows, exactly like a FROM base or a
         // JOIN input — otherwise the write would silently see only the parent's own rows.
@@ -856,13 +871,13 @@ pub(super) fn resolve_aux_relation(
             let descendants = catalog
                 .inheritance_descendants(&super::qualified_display(&schema.schema, &schema.name))?;
             if !descendants.is_empty() {
-                // The source's columns are not checked one by one where the statement reads them,
-                // so the parent's branch is checked for all of them.
-                let plan = expand_inheritance(&schema, &descendants, None, false, catalog)?;
-                return Ok((schema, Some(plan)));
+                // The source's columns are checked against the parent where the statement reads
+                // them, through `readable`.
+                let plan = expand_inheritance(&schema, &descendants, None, true, catalog)?;
+                return Ok((schema, Some(plan), readable));
             }
         }
-        Ok((schema, None))
+        Ok((schema, None, readable))
     }
 }
 

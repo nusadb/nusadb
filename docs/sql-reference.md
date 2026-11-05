@@ -2921,8 +2921,10 @@ Privileges: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `T
 `SELECT`, `INSERT`, `UPDATE` and `REFERENCES` may name columns in parentheses. Role attributes:
 `LOGIN` / `NOLOGIN` and `SUPERUSER` / `NOSUPERUSER`; the attribute is recorded in `nusadb_roles`, and
 grants are what restrict a role. A role that lacks a privilege is refused with `42501`, and reading a
-column outside its column grant is refused the same way even through `SELECT *`. The bootstrap
-superuser `nusadb-root` bypasses every check.
+column outside its column grant is refused the same way even through `SELECT *`. That holds for the
+source of an `UPDATE ... FROM`, `DELETE ... USING` or `MERGE ... USING` too: each of its columns the
+statement reads needs `SELECT` on that column. The bootstrap superuser `nusadb-root` bypasses every
+check.
 
 Creating a table, view, materialized view, sequence, function, procedure, type or domain needs
 `CREATE` on the schema it lands in. A schema's owner (the role that created it) always has it, and

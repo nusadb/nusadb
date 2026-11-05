@@ -807,4 +807,13 @@ fn column_grants_on_a_partitioned_source_of_a_write_are_checked() {
         )),
         vec![Some("x".to_owned())]
     );
+    // The granted columns of the parent read, as for any other source.
+    assert_eq!(
+        count(&ok_as(
+            &engine,
+            "alice",
+            "UPDATE t_other SET v = 'y' FROM p WHERE p.id = t_other.id AND p.k = 1"
+        )),
+        1
+    );
 }

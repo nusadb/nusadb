@@ -1027,7 +1027,7 @@ pub(super) fn analyze_update(
     )?;
     let mut from_table: Option<TableSchema> = None;
     let mut from_plan: Option<Box<SelectPlan>> = None;
-    if let Some((schema, qualifier, plan)) = from {
+    if let Some((qualifier, (schema, plan, readable))) = from {
         // A FROM source is a de-facto join: like SELECT's RLS+JOIN refusal, a non-superuser must not
         // read an RLS-protected source table (its rows would otherwise leak through the SET values or
         // WHERE predicate). Fail closed. A derived source's schema name is
@@ -1040,17 +1040,7 @@ pub(super) fn analyze_update(
             )));
         }
         reject_repeated_qualifier(upd.alias.as_deref().unwrap_or(&table.name), &qualifier)?;
-        scope.extend(schema.columns.iter().map(|def| ScopedColumn {
-            qualifier: qualifier.clone(),
-            def: def.clone(),
-            qualified_only: false,
-            // Composite field access on a secondary UPDATE/DELETE source is out of first-cut scope.
-            composite_type: None,
-            // A secondary source has already passed a table-wide SELECT check (`resolve_aux_relation`),
-            // so its columns are readable; column-scoped SELECT does not gate a join source here.
-            select_granted: true,
-            enum_type: None,
-        }));
+        scope.extend(aux_scope(&schema, &qualifier, &readable));
         from_plan = plan.map(Box::new);
         from_table = Some(schema);
     }
@@ -1125,13 +1115,12 @@ pub(super) fn analyze_update(
 }
 
 /// Resolve an `UPDATE ... FROM` / `DELETE ... USING` clause to its single source relation: the
-/// schema, the qualifier (alias, else table name) its columns are referenced by, and — for a derived
-/// source (`(VALUES ...)` / `(SELECT ...)` / set operation) — the inlined plan that produces its rows
-/// (`None` for a named table). A join (multiple comma sources) is rejected.
+/// qualifier (alias, else table name) its columns are referenced by, and the relation as
+/// [`resolve_aux_relation`] resolves it. A join (multiple comma sources) is rejected.
 fn resolve_update_from(
     from: ast::FromClause,
     catalog: &dyn Catalog,
-) -> Result<(TableSchema, String, Option<SelectPlan>), Error> {
+) -> Result<(String, super::select::AuxRelation), Error> {
     if !from.joins.is_empty() {
         return Err(Error::Unsupported(
             "UPDATE ... FROM / DELETE ... USING with a join is not yet supported (use a single \
@@ -1141,8 +1130,27 @@ fn resolve_update_from(
     }
     let base = from.base;
     let qualifier = base.alias.clone().unwrap_or_else(|| base.name.clone());
-    let (table, plan) = resolve_aux_relation(&base, catalog)?;
-    Ok((table, qualifier, plan))
+    Ok((qualifier, resolve_aux_relation(&base, catalog)?))
+}
+
+/// The scope of an `UPDATE ... FROM` / `DELETE ... USING` / `MERGE ... USING` source under
+/// `qualifier`: each column readable as far as the session may `SELECT` it (`readable`, parallel to
+/// the columns).
+fn aux_scope(table: &TableSchema, qualifier: &str, readable: &[bool]) -> Vec<ScopedColumn> {
+    table
+        .columns
+        .iter()
+        .zip(readable)
+        .map(|(def, &select_granted)| ScopedColumn {
+            qualifier: qualifier.to_owned(),
+            def: def.clone(),
+            qualified_only: false,
+            // Composite field access on a secondary UPDATE/DELETE source is out of first-cut scope.
+            composite_type: None,
+            select_granted,
+            enum_type: None,
+        })
+        .collect()
 }
 
 /// Analyze a single-table `DELETE`. `via` is the parent the target is reached through, as for
@@ -1208,7 +1216,7 @@ pub(super) fn analyze_delete(
     )?;
     let mut using_table: Option<TableSchema> = None;
     let mut using_plan: Option<Box<SelectPlan>> = None;
-    if let Some((schema, qualifier, plan)) = using {
+    if let Some((qualifier, (schema, plan, readable))) = using {
         // A USING source is a de-facto join: like SELECT's RLS+JOIN refusal, a non-superuser must not
         // read an RLS-protected source table (its rows would otherwise leak through the WHERE
         // predicate). Fail closed. A derived source's schema name is its
@@ -1221,17 +1229,7 @@ pub(super) fn analyze_delete(
             )));
         }
         reject_repeated_qualifier(del.alias.as_deref().unwrap_or(&table.name), &qualifier)?;
-        scope.extend(schema.columns.iter().map(|def| ScopedColumn {
-            qualifier: qualifier.clone(),
-            def: def.clone(),
-            qualified_only: false,
-            // Composite field access on a secondary UPDATE/DELETE source is out of first-cut scope.
-            composite_type: None,
-            // A secondary source has already passed a table-wide SELECT check (`resolve_aux_relation`),
-            // so its columns are readable; column-scoped SELECT does not gate a join source here.
-            select_granted: true,
-            enum_type: None,
-        }));
+        scope.extend(aux_scope(&schema, &qualifier, &readable));
         using_plan = plan.map(Box::new);
         using_table = Some(schema);
     }
@@ -1289,7 +1287,7 @@ pub(super) fn analyze_merge(m: ast::Merge, catalog: &dyn Catalog) -> Result<Merg
     // operation) — resolved uniformly, exactly as `UPDATE ... FROM` / `DELETE ... USING` do. A
     // derived source carries an inlined plan the executor materializes; a plain table has `None` and
     // is scanned. `LATERAL` stays unsupported (rejected inside `resolve_aux_relation`).
-    let (source, source_plan) = resolve_aux_relation(&m.source, catalog)?;
+    let (source, source_plan, source_readable) = resolve_aux_relation(&m.source, catalog)?;
     // MERGE always reads the target — the `ON` condition matches against its rows — and then writes
     // it in whichever ways its WHEN arms name. Require exactly those: SELECT unconditionally, plus
     // INSERT / UPDATE / DELETE per the arms present. Without this a role with no privileges at all
@@ -1335,7 +1333,7 @@ pub(super) fn analyze_merge(m: ast::Merge, catalog: &dyn Catalog) -> Result<Merg
         .clone()
         .unwrap_or_else(|| source.name.clone());
     let mut scope = scope_of_aliased(&table, &target_qual);
-    scope.extend(scope_of_aliased(&source, &source_qual));
+    scope.extend(aux_scope(&source, &source_qual, &source_readable));
 
     let on = analyze_expr(&m.on, &scope, catalog, Some(ColumnType::Bool))?;
     if on.ty != ColumnType::Bool {

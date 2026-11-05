@@ -1085,6 +1085,62 @@ fn column_select_grant_satisfies_a_filtered_delete() {
     denied_as(&engine, "clerk", "DELETE FROM t WHERE secret = 99");
 }
 
+/// A column-scoped SELECT on the source of an `UPDATE ... FROM`, a `DELETE ... USING` or a
+/// `MERGE ... USING` admits reads of the granted columns only, wherever the statement reads them.
+#[test]
+fn column_select_grant_on_a_write_source_admits_only_the_named_columns() {
+    let engine = column_fixture();
+    root(&engine, "CREATE TABLE dst (a INT, v INT)");
+    root(&engine, "INSERT INTO dst VALUES (1, 0)");
+    root(&engine, "GRANT ALL ON dst TO clerk");
+    root(&engine, "GRANT SELECT (a, b) ON t TO clerk");
+
+    for sql in [
+        "UPDATE dst SET v = t.secret FROM t WHERE t.a = dst.a",
+        "UPDATE dst SET v = 1 FROM t WHERE t.secret = 99 AND t.a = dst.a",
+        "DELETE FROM dst USING t WHERE t.secret = 99 AND t.a = dst.a",
+        "MERGE INTO dst d USING t s ON s.secret = 99 AND d.a = s.a WHEN MATCHED THEN UPDATE SET v \
+         = 1",
+        "MERGE INTO dst d USING t s ON d.a = s.a WHEN MATCHED THEN UPDATE SET v = s.secret",
+        "MERGE INTO dst d USING t s ON d.a = s.a WHEN MATCHED AND s.secret = 99 THEN UPDATE SET v \
+         = 1",
+        "MERGE INTO dst d USING t s ON d.a = s.a WHEN NOT MATCHED THEN INSERT VALUES (s.a, \
+         s.secret)",
+    ] {
+        denied_as(&engine, "clerk", sql);
+    }
+    assert_eq!(
+        rows(ok_as(&engine, ROOT, "SELECT v FROM dst")),
+        vec![vec![Value::Int(0)]]
+    );
+
+    // The granted columns read, and a source read for no column needs SELECT on some column only.
+    ok_as(&engine, "clerk", "UPDATE dst SET v = 3 FROM t");
+    ok_as(
+        &engine,
+        "clerk",
+        "DELETE FROM dst USING t WHERE t.a = dst.a AND t.b = 0",
+    );
+    ok_as(
+        &engine,
+        "clerk",
+        "MERGE INTO dst d USING t s ON d.a = s.a WHEN MATCHED THEN UPDATE SET v = s.b",
+    );
+    assert_eq!(
+        rows(ok_as(&engine, ROOT, "SELECT v FROM dst")),
+        vec![vec![Value::Int(2)]]
+    );
+    ok_as(
+        &engine,
+        "clerk",
+        "UPDATE dst SET v = t.b + 1 FROM t WHERE t.a = dst.a",
+    );
+    assert_eq!(
+        rows(ok_as(&engine, ROOT, "SELECT v FROM dst")),
+        vec![vec![Value::Int(3)]]
+    );
+}
+
 #[test]
 fn no_column_grant_still_denies_the_whole_table() {
     let engine = column_fixture();
