@@ -2924,8 +2924,11 @@ grants are what restrict a role. A role that lacks a privilege is refused with `
 column outside its column grant is refused the same way even through `SELECT *`. That holds for
 writes too: a column an `UPDATE` or `DELETE` reads from its target, in a `SET` expression, the
 `WHERE`, `RETURNING` or a correlated subquery, needs `SELECT` on that column, and so does each column
-read from the source of an `UPDATE ... FROM`, `DELETE ... USING` or `MERGE ... USING`. A write that
-reads no column of its target (`UPDATE t SET c = 1`) needs no `SELECT` at all. The columns a
+read from the source of an `UPDATE ... FROM`, `DELETE ... USING` or `MERGE ... USING`. An `INSERT`
+needs `SELECT` on the columns its `RETURNING` hands back, on the columns of its `ON CONFLICT`
+arbiter, and on those its `DO UPDATE` reads (`excluded.col` included), and `DO UPDATE` needs
+`UPDATE` on the columns it sets. A write that reads no column of its target (`UPDATE t SET c = 1`,
+`INSERT` without `RETURNING`) needs no `SELECT` at all. The columns a
 row-level security policy reads need no `SELECT`. The bootstrap superuser `nusadb-root` bypasses
 every check.
 

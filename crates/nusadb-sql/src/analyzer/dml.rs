@@ -41,18 +41,17 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
         .filter_map(|&i| table.columns.get(i).map(|c| c.name.as_str()))
         .collect();
     super::dcl::require_column_privilege(catalog, &table, &insert_columns, ast::Privilege::Insert)?;
+    // A column the statement reads back, through RETURNING or an `ON CONFLICT` clause, needs
+    // SELECT on it: RETURNING hands back stored values (a default, a trigger's change, or the
+    // existing row an upsert updated), and an arbiter reads the existing rows.
+    let readable = target_readable(&table, &table, catalog)?;
     // RETURNING projects the inserted rows: resolve it against the table's columns.
-    let returning = analyze_returning(
-        &ins.returning,
-        &table,
-        &vec![true; table.columns.len()],
-        catalog,
-    )?;
+    let returning = analyze_returning(&ins.returning, &table, &readable, catalog)?;
     // `ON CONFLICT`: `DO NOTHING` skips conflicting rows; `DO UPDATE` upserts the existing
     // row. Resolved against the target table (DO UPDATE also resolves the arbiter + EXCLUDED scope).
     let on_conflict = match ins.on_conflict {
         None => None,
-        Some(conflict) => Some(analyze_on_conflict(conflict, &table, catalog)?),
+        Some(conflict) => Some(analyze_on_conflict(conflict, &table, &readable, catalog)?),
     };
     let target_columns: Vec<ColumnDef> = targets
         .iter()
@@ -178,6 +177,7 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
 fn analyze_on_conflict(
     conflict: ast::OnConflict,
     table: &TableSchema,
+    readable: &[bool],
     catalog: &dyn Catalog,
 ) -> Result<OnConflictPlan, Error> {
     let ast::ConflictAction::DoUpdate {
@@ -189,20 +189,26 @@ fn analyze_on_conflict(
         // resolved and validated (a bad arbiter is rejected even when no row collides, as the
         // reference engine does).
         return Ok(OnConflictPlan::DoNothing {
-            target: resolve_conflict_target(conflict.target, table)?,
+            target: resolve_conflict_target(conflict.target, table, catalog)?,
         });
     };
-    let Some(target) = resolve_conflict_target(conflict.target, table)? else {
+    let Some(target) = resolve_conflict_target(conflict.target, table, catalog)? else {
         return Err(Error::InvalidStatement(
             "ON CONFLICT DO UPDATE requires a conflict target — \
              `ON CONFLICT (columns)` or `ON CONFLICT ON CONSTRAINT name`"
                 .to_owned(),
         ));
     };
+    // `DO UPDATE` updates the existing row: it needs UPDATE on the table, or on each column it sets.
+    let set_columns: Vec<&str> = assignments.iter().map(|a| a.column.as_str()).collect();
+    super::dcl::require_column_privilege(catalog, table, &set_columns, ast::Privilege::Update)?;
     // The combined scope: the existing row's columns (ordinals `[0, n)`) plus the proposed row as
     // `EXCLUDED` (ordinals `[n, 2n)`). `EXCLUDED` is reachable only via its qualifier, so a bare
-    // column in the SET/WHERE refers to the existing (target) row.
-    let scope = upsert_scope(table);
+    // column in the SET/WHERE refers to the existing (target) row. Both copies of a column are
+    // readable only with SELECT on it.
+    let mut scope = upsert_scope(table);
+    let both: Vec<bool> = readable.iter().chain(readable).copied().collect();
+    gate_target_scope(&mut scope, &both);
     let mut typed = Vec::with_capacity(assignments.len());
     let mut seen = HashSet::new();
     for assignment in assignments {
@@ -248,10 +254,22 @@ fn analyze_on_conflict(
 /// column name to its ordinal (the executor still checks those ordinals form a declared key); `ON
 /// CONFLICT ON CONSTRAINT name` carries the name through (the executor looks it up). `None` (no
 /// target) yields `None` — valid only for `DO NOTHING`.
+///
+/// The arbiter reads the existing rows to find a conflict, so it needs SELECT on the columns it
+/// compares: the target's columns and the columns its `WHERE` reads, or the key of the named
+/// constraint (every column of the table when the name is not a key the catalog lists).
 fn resolve_conflict_target(
     target: Option<ast::ConflictTarget>,
     table: &TableSchema,
+    catalog: &dyn Catalog,
 ) -> Result<Option<ConflictArbiter>, Error> {
+    let require_read = |ordinals: &[usize]| {
+        let names: Vec<&str> = ordinals
+            .iter()
+            .filter_map(|&i| table.columns.get(i).map(|c| c.name.as_str()))
+            .collect();
+        super::dcl::require_column_privilege(catalog, table, &names, ast::Privilege::Select)
+    };
     match target {
         None => Ok(None),
         Some(ast::ConflictTarget::Columns(cols)) => {
@@ -260,6 +278,7 @@ fn resolve_conflict_target(
                 let (index, _) = find_column(&table.columns, name, &table.name)?;
                 ordinals.push(index);
             }
+            require_read(&ordinals)?;
             Ok(Some(ConflictArbiter::Columns(ordinals)))
         },
         Some(ast::ConflictTarget::ColumnsWhere { columns, predicate }) => {
@@ -279,9 +298,28 @@ fn resolve_conflict_target(
                     found: typed.ty,
                 });
             }
+            let mut read = ordinals.clone();
+            crate::planner::collect_columns(&typed, &mut read);
+            require_read(&read)?;
             Ok(Some(ConflictArbiter::ColumnsWhere(ordinals, predicate)))
         },
-        Some(ast::ConflictTarget::Constraint(name)) => Ok(Some(ConflictArbiter::Constraint(name))),
+        Some(ast::ConflictTarget::Constraint(name)) => {
+            // A key constraint is backed by an index of its name; an expression key, or a name the
+            // catalog does not list, reads every column as far as this check knows.
+            let key = catalog
+                .list_indexes_in(&table.schema, &table.name)?
+                .into_iter()
+                .find(|index| index.name == name && index.key_exprs.is_empty());
+            let read: Vec<usize> = table
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| key.as_ref().is_none_or(|k| k.columns.contains(&c.name)))
+                .map(|(i, _)| i)
+                .collect();
+            require_read(&read)?;
+            Ok(Some(ConflictArbiter::Constraint(name)))
+        },
     }
 }
 

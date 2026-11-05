@@ -1108,6 +1108,85 @@ fn column_reads_anywhere_in_a_write_need_select_on_the_column() {
     assert!(rows(ok_as(&engine, ROOT, "SELECT a FROM t")).is_empty());
 }
 
+/// An `INSERT` that reads rows back, through `RETURNING` or an `ON CONFLICT` clause, needs SELECT
+/// on each column it reads, and an `ON CONFLICT DO UPDATE` needs UPDATE on each column it sets.
+#[test]
+fn reading_back_through_an_insert_needs_select_on_the_columns_read() {
+    let engine = BtreeEngine::new();
+    root(
+        &engine,
+        "CREATE TABLE u (id INT PRIMARY KEY, v TEXT, secret TEXT)",
+    );
+    root(&engine, "INSERT INTO u VALUES (1, 'sec', 's1')");
+    root(&engine, "CREATE ROLE clerk LOGIN");
+    root(&engine, "CREATE ROLE writer LOGIN");
+    root(
+        &engine,
+        "GRANT INSERT, SELECT (id), UPDATE (v) ON u TO clerk",
+    );
+    root(&engine, "GRANT INSERT ON u TO writer");
+    for sql in [
+        "INSERT INTO u (id, v) VALUES (2, 'n') RETURNING secret",
+        "INSERT INTO u (id, v) VALUES (2, 'n') RETURNING *",
+        "INSERT INTO u (id, v) VALUES (1, 'n') ON CONFLICT (id) DO UPDATE SET v = 'y' RETURNING \
+         secret",
+        "INSERT INTO u (id, v) VALUES (1, 'n') ON CONFLICT (id) DO UPDATE SET v = u.secret",
+        "INSERT INTO u (id, v) VALUES (1, 'n') ON CONFLICT (id) DO UPDATE SET v = 'y' WHERE \
+         u.secret = 's1'",
+        "INSERT INTO u (id, v) VALUES (1, 'n') ON CONFLICT (id) DO UPDATE SET v = excluded.v",
+        "INSERT INTO u (id, v) VALUES (1, 'n') ON CONFLICT (id) DO UPDATE SET secret = 'q'",
+    ] {
+        denied_as(&engine, "clerk", sql);
+    }
+    for sql in [
+        "INSERT INTO u (id, v) VALUES (3, 'n') RETURNING id",
+        "INSERT INTO u (id, v) VALUES (1, 'n') ON CONFLICT (id) DO NOTHING",
+        "INSERT INTO u (id, v) VALUES (1, 'n') ON CONFLICT ON CONSTRAINT u_pkey DO NOTHING",
+        "INSERT INTO u (id, v) VALUES (1, 'n') ON CONFLICT (id) DO UPDATE SET v = 'y'",
+    ] {
+        denied_as(&engine, "writer", sql);
+    }
+    assert_eq!(
+        rows(ok_as(&engine, ROOT, "SELECT id, v, secret FROM u")),
+        vec![vec![
+            Value::Int(1),
+            Value::Text("sec".to_owned()),
+            Value::Text("s1".to_owned())
+        ]]
+    );
+
+    // A conflict with no arbiter reads no column; the granted ones read back.
+    ok_as(
+        &engine,
+        "writer",
+        "INSERT INTO u (id, v) VALUES (1, 'n') ON CONFLICT DO NOTHING",
+    );
+    assert_eq!(
+        rows(ok_as(
+            &engine,
+            "clerk",
+            "INSERT INTO u (id, v) VALUES (2, 'n') RETURNING id"
+        )),
+        vec![vec![Value::Int(2)]]
+    );
+    assert_eq!(
+        rows(ok_as(
+            &engine,
+            "clerk",
+            "INSERT INTO u (id, v) VALUES (1, 'n') ON CONFLICT (id) DO UPDATE SET v = 'y' \
+             RETURNING id"
+        )),
+        vec![vec![Value::Int(1)]]
+    );
+    assert_eq!(
+        rows(ok_as(&engine, ROOT, "SELECT v, secret FROM u WHERE id = 1")),
+        vec![vec![
+            Value::Text("y".to_owned()),
+            Value::Text("s1".to_owned())
+        ]]
+    );
+}
+
 /// A row-level-security policy reads the columns it names on the table's terms: a role whose
 /// column grant leaves them out is filtered by the policy, not refused.
 #[test]
