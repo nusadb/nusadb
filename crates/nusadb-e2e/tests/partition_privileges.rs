@@ -27,6 +27,8 @@ use nusadb_sql::{Catalog, ExecutionResult, PolicyDef, Session, analyze, parse, p
 struct RoleCatalog<'a> {
     engine: &'a BtreeEngine,
     user: &'a str,
+    /// The session's search path; empty for the default (`public`).
+    path: &'a [&'a str],
 }
 
 impl RoleCatalog<'_> {
@@ -54,6 +56,14 @@ impl Catalog for RoleCatalog<'_> {
         self.engine
             .lookup_table_in(schema, name)
             .map_err(Into::into)
+    }
+
+    fn search_path(&self) -> Vec<String> {
+        if self.path.is_empty() {
+            vec![nusadb_core::PUBLIC_SCHEMA.to_owned()]
+        } else {
+            self.path.iter().map(|s| (*s).to_owned()).collect()
+        }
     }
 
     fn is_superuser(&self) -> bool {
@@ -154,8 +164,18 @@ const ROOT: &str = "nusadb-root";
 
 /// Run `sql` as `user`, returning the result or the error text.
 fn as_role(engine: &BtreeEngine, user: &str, sql: &str) -> Result<ExecutionResult, String> {
+    as_role_in(engine, user, &[], sql)
+}
+
+/// Run `sql` as `user` under the search path `path`, returning the result or the error text.
+fn as_role_in(
+    engine: &BtreeEngine,
+    user: &str,
+    path: &[&str],
+    sql: &str,
+) -> Result<ExecutionResult, String> {
     let stmt = parse(sql).map_err(|e| e.to_string())?;
-    let logical = analyze(stmt, &RoleCatalog { engine, user }).map_err(|e| e.to_string())?;
+    let logical = analyze(stmt, &RoleCatalog { engine, user, path }).map_err(|e| e.to_string())?;
     let mut session = Session::new(engine);
     session.set_current_user(user);
     session.execute(plan(logical)).map_err(|e| e.to_string())
@@ -816,4 +836,46 @@ fn column_grants_on_a_partitioned_source_of_a_write_are_checked() {
         )),
         1
     );
+}
+
+/// A parent reaches the partitions recorded under it, whatever the session's search path: a table
+/// of a partition's name in a schema ahead of the partition's own is neither read nor written, so a
+/// write on the parent cannot reach a table its privileges do not cover.
+#[test]
+fn a_parent_reaches_its_own_partitions_whatever_the_search_path() {
+    let engine = fixture();
+    root(&engine, "CREATE SCHEMA other");
+    root(
+        &engine,
+        "CREATE TABLE other.g_p202610 (g_id BIGINT, k BIGINT, s TEXT, d DATE, v BIGINT)",
+    );
+    root(
+        &engine,
+        "INSERT INTO other.g_p202610 VALUES (9, 9, 'z', '2026-10-09', 9)",
+    );
+    root(&engine, "GRANT SELECT, UPDATE, DELETE ON g TO app");
+    let path = ["other", "public"];
+    let ok_in = |sql: &str| {
+        as_role_in(&engine, "app", &path, sql)
+            .unwrap_or_else(|e| panic!("`{sql}` as app should succeed: {e}"))
+    };
+
+    assert_eq!(
+        count(&ok_in("UPDATE g SET v = v + 10 WHERE g_id IN (1, 9)")),
+        1
+    );
+    assert_eq!(count(&ok_in("DELETE FROM g WHERE g_id = 9")), 0);
+    assert_eq!(
+        ids(root(&engine, "SELECT g_id FROM other.g_p202610")),
+        vec![9]
+    );
+    assert_eq!(
+        rows(root(&engine, "SELECT v FROM other.g_p202610")),
+        vec![vec![Value::Int(9)]]
+    );
+    assert_eq!(
+        rows(root(&engine, "SELECT v FROM g_p202610")),
+        vec![vec![Value::Int(11)]]
+    );
+    assert_eq!(ids(ok_in("SELECT g_id FROM g ORDER BY g_id")), vec![1, 2]);
 }

@@ -803,12 +803,14 @@ pub(super) fn analyze_update_stmt(
     // row-level security.
     let parent_table = plan.table.clone();
     for descendant in descendants {
-        // The descendant is a schema-qualified edge key; split it so the sub-plan targets exactly
-        // the recorded table (not a search-path lookalike).
+        // The descendant is a schema-qualified edge key, bare for `public`; split it and name the
+        // schema explicitly so the sub-plan targets exactly the recorded table. A bare name would
+        // resolve through the session's search path and could reach a lookalike in another schema,
+        // which would then be written with the parent's privileges.
         let (sub_schema, sub_name) = super::split_qualified(&descendant);
         let mut sub = upd.clone();
         sub.only = true;
-        sub.schema = sub_schema.map(str::to_owned);
+        sub.schema = Some(sub_schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA).to_owned());
         sub_name.clone_into(&mut sub.table);
         let mut sub_plan = analyze_update(sub, catalog, Some(&parent_table))?;
         // Reached through the parent: a bound-leaving new image moves to its sibling partition.
@@ -838,7 +840,7 @@ pub(super) fn analyze_delete_stmt(
         let (sub_schema, sub_name) = super::split_qualified(&descendant);
         let mut sub = del.clone();
         sub.only = true;
-        sub.schema = sub_schema.map(str::to_owned);
+        sub.schema = Some(sub_schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA).to_owned());
         sub_name.clone_into(&mut sub.table);
         plan.propagate
             .push(analyze_delete(sub, catalog, Some(&parent_table))?);

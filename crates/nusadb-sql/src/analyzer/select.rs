@@ -439,7 +439,10 @@ fn branch_filter(
 /// is a schema-qualified edge key (bare = `public`), split back into an explicit qualifier so the
 /// branch reads exactly the recorded table.
 fn inheritance_branch(cols: &[String], table: &str) -> ast::Select {
+    // A bare key is a `public` table: name the schema, so the branch reads the recorded table and
+    // not a lookalike the session's search path would reach first.
     let (schema, name) = super::split_qualified(table);
+    let schema = Some(schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA));
     ast::Select {
         with: Vec::new(),
         distinct: None,
