@@ -6944,6 +6944,26 @@ pub(super) fn run_truncate(
     // table it just resolved.
     let mut by_id: HashMap<nusadb_core::TableId, TableSchema> = HashMap::new();
     by_id.insert(root.id, root.clone());
+    // A partitioned table has no rows of its own, so `ONLY` would empty nothing: refused, as the
+    // reference engine does, rather than reported as done.
+    if plan.only
+        && super::partition::has_any(engine, txn)?
+        && super::partition::parent_key_parts(
+            engine,
+            txn,
+            &crate::analyzer::qualified_display(&root.schema, &root.name),
+        )?
+        .is_some()
+    {
+        return Err(Error::Coded {
+            message: format!(
+                "cannot truncate only a partitioned table \"{}\"; leave out ONLY, or truncate its \
+                 partitions directly",
+                root.name
+            ),
+            sqlstate: "42809", // wrong_object_type
+        });
+    }
     // The rows of a partitioned or inheritance parent include its descendants' rows, so they are
     // emptied too, as part of the statement on the parent (whose privilege was checked), unless
     // `ONLY` names the parent's own rows.

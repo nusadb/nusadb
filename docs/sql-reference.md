@@ -858,7 +858,8 @@ Worth knowing:
   prunes partitions using `WHERE` conditions of the shape `key = / < / <= / > / >= constant` and
   `key BETWEEN a AND b`, which shows in `EXPLAIN` as fewer scanned partitions.
 - `DROP TABLE` on the parent drops the whole partition tree with it, and `TRUNCATE` on the parent
-  empties every partition.
+  empties every partition. `TRUNCATE ONLY` on the parent is refused (`42809`), since the parent
+  has no rows of its own; `TRUNCATE ONLY` on a partition empties that partition alone.
 - Privileges are checked on the table a statement names. A role granted `SELECT`, `INSERT`,
   `UPDATE`, `DELETE` or `TRUNCATE` on the parent (or `SELECT` / `UPDATE` on some of its columns)
   reads and writes every partition through it, including `INSERT ... ON CONFLICT`, an `UPDATE`

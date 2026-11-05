@@ -73,6 +73,36 @@ SELECT count(*) FROM ev WHERE region = 150
 ----
 0
 
+# A partitioned parent has no rows of its own: TRUNCATE ONLY on it is refused rather than reported
+# as done, TRUNCATE ONLY on a partition empties that partition, and TRUNCATE on the parent empties
+# them all.
+statement ok
+INSERT INTO ev VALUES (4, 150)
+
+statement error cannot truncate only a partitioned table
+TRUNCATE ONLY ev
+
+query I
+SELECT count(*) FROM ev
+----
+3
+
+statement ok
+TRUNCATE ONLY ev_lo
+
+query I
+SELECT id FROM ev
+----
+4
+
+statement ok
+TRUNCATE ev
+
+query I
+SELECT count(*) FROM ev
+----
+0
+
 # Dropping a partitioned parent drops its partitions with it (they exist only as parts of the
 # parent), no CASCADE needed.
 statement ok
