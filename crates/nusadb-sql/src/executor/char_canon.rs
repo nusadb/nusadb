@@ -539,7 +539,8 @@ fn reindex_tables(
             for table in user_tables(schema.as_deref())? {
                 for def in engine.list_indexes_as_of(txn, table.id)? {
                     if candidates.contains(&def.name) {
-                        return Ok(vec![(table, Some(def.name))]);
+                        // An index on a partitioned table brings its partitions' indexes along.
+                        return super::partition_index::with_children(table, def.name, engine, txn);
                     }
                 }
             }

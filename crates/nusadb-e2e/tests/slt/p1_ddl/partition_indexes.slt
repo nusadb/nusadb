@@ -1,0 +1,242 @@
+# An index on a partitioned table is built on each of its partitions: on the partitions that exist
+# when it is created, at every level of sub-partitioning, and on every partition created or
+# attached later. A partition's index is named after the partition and the key
+# (<partition>_<column>_idx, `expr` for a key expression, numbered when the name is taken). It
+# follows the partitioned table's index: DROP INDEX on that drops the partitions' indexes, while
+# dropping one of them on its own is refused.
+
+statement ok
+CREATE TABLE g (g_id BIGINT NOT NULL, k BIGINT, s TEXT, d DATE NOT NULL, v BIGINT NOT NULL, CONSTRAINT g_pkey PRIMARY KEY (g_id)) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE g_p202610 PARTITION OF g FOR VALUES FROM ('2026-10-01') TO ('2026-11-01')
+
+statement ok
+CREATE TABLE g_p202611 PARTITION OF g FOR VALUES FROM ('2026-11-01') TO ('2026-12-01') PARTITION BY RANGE (v)
+
+statement ok
+CREATE TABLE g_p202611_lo PARTITION OF g_p202611 FOR VALUES FROM (0) TO (5000)
+
+# A name the partition's index would take is already in use: it is numbered.
+statement ok
+CREATE INDEX g_p202610_v_idx ON g_p202610 (k)
+
+statement ok
+INSERT INTO g SELECT i, i % 50, 'x', DATE '2026-10-01' + (i % 45), i FROM generate_series(1, 4999) AS i
+
+statement ok
+CREATE INDEX g_v_idx ON g (v)
+
+statement ok
+CREATE INDEX g_kp_idx ON g (k) WHERE v > 10
+
+statement ok
+CREATE INDEX g_e_idx ON g ((v * 2))
+
+# A partition created later gets the indexes too.
+statement ok
+CREATE TABLE g_p202611_hi PARTITION OF g_p202611 FOR VALUES FROM (5000) TO (100000)
+
+statement ok
+INSERT INTO g SELECT i, i % 50, 'y', DATE '2026-11-01' + (i % 30), i FROM generate_series(5000, 6000) AS i
+
+query TT
+SELECT table_name, index_name FROM information_schema.statistics WHERE table_name LIKE 'g%' AND index_name <> 'g_pkey' AND index_name NOT LIKE '%_pkey' GROUP BY table_name, index_name ORDER BY 1, 2
+----
+g g_kp_idx
+g g_v_idx
+g_p202610 g_p202610_k_idx
+g_p202610 g_p202610_v_idx
+g_p202610 g_p202610_v_idx1
+g_p202611 g_p202611_k_idx
+g_p202611 g_p202611_v_idx
+g_p202611_hi g_p202611_hi_k_idx
+g_p202611_hi g_p202611_hi_v_idx
+g_p202611_lo g_p202611_lo_k_idx
+g_p202611_lo g_p202611_lo_v_idx
+
+# The partition's own index on k kept its name and is not the partitioned table's.
+query T
+SELECT column_name FROM information_schema.statistics WHERE index_name = 'g_p202610_v_idx1'
+----
+v
+
+# Every partition is read through its index.
+query T
+EXPLAIN SELECT k FROM g WHERE v = 42
+----
+Project (1 column(s))
+  Filter
+    Project (5 column(s))
+      SetOperation
+        Union ALL
+          Union ALL
+            Union ALL
+              Union ALL
+                Project (5 column(s))
+                  Filter
+                    IndexScan: g using g_v_idx
+                Project (5 column(s))
+                  Filter
+                    IndexScan: g_p202610 using g_p202610_v_idx1
+              Project (5 column(s))
+                Filter
+                  IndexScan: g_p202611 using g_p202611_v_idx
+            Project (5 column(s))
+              Filter
+                IndexScan: g_p202611_lo using g_p202611_lo_v_idx
+          Project (5 column(s))
+            Filter
+              IndexScan: g_p202611_hi using g_p202611_hi_v_idx
+
+query II
+SELECT g_id, k FROM g WHERE v IN (42, 5500) ORDER BY g_id
+----
+42 42
+5500 0
+
+# The partial index holds exactly the rows its predicate accepts.
+query I
+SELECT count(*) FROM g WHERE k = 7 AND v > 10
+----
+119
+
+query I
+SELECT count(*) FROM g WHERE k + 0 = 7 AND v + 0 > 10
+----
+119
+
+query I
+SELECT count(*) FROM g WHERE v * 2 = 84
+----
+1
+
+# Dropping a partition's index on its own is refused; the expression index exists on every
+# partition, named with `expr`.
+statement error cannot drop index "g_p202610_v_idx1" because index "g_v_idx" on partitioned table "g" requires it
+DROP INDEX g_p202610_v_idx1
+
+statement error cannot drop index "g_p202610_expr_idx" because index "g_e_idx"
+DROP INDEX g_p202610_expr_idx
+
+statement error cannot drop index "g_p202611_lo_expr_idx" because index "g_p202611_expr_idx" on partitioned table "g_p202611"
+DROP INDEX g_p202611_lo_expr_idx
+
+# A table attached later adopts an equivalent index of its own and gets the others built over its
+# rows; sub-partitions of an attached partitioned table are covered too.
+statement ok
+CREATE TABLE g_p202612 (g_id BIGINT NOT NULL, k BIGINT, s TEXT, d DATE NOT NULL, v BIGINT NOT NULL) PARTITION BY RANGE (v)
+
+statement ok
+CREATE TABLE g_p202612_a PARTITION OF g_p202612 FOR VALUES FROM (0) TO (100000)
+
+statement ok
+CREATE INDEX own_v ON g_p202612_a (v)
+
+statement ok
+INSERT INTO g_p202612 VALUES (90000, 3, 'z', '2026-12-05', 77)
+
+statement ok
+ALTER TABLE g ATTACH PARTITION g_p202612 FOR VALUES FROM ('2026-12-01') TO ('2027-01-01')
+
+query TT
+SELECT table_name, index_name FROM information_schema.statistics WHERE table_name LIKE 'g_p202612%' GROUP BY table_name, index_name ORDER BY 1, 2
+----
+g_p202612 g_p202612_k_idx
+g_p202612 g_p202612_pkey
+g_p202612 g_p202612_v_idx
+g_p202612_a g_p202612_a_k_idx
+g_p202612_a g_p202612_a_pkey
+g_p202612_a own_v
+
+statement error cannot drop index "own_v" because index "g_p202612_v_idx"
+DROP INDEX own_v
+
+query I
+SELECT g_id FROM g WHERE v = 77 ORDER BY g_id
+----
+77
+90000
+
+# REINDEX on the partitioned table, or on its index, rebuilds the partitions' indexes too.
+statement ok
+REINDEX INDEX g_v_idx
+
+statement ok
+REINDEX TABLE g
+
+query I
+SELECT g_id FROM g WHERE v = 77 ORDER BY g_id
+----
+77
+90000
+
+# A detached table keeps its indexes, now its own: dropping its index drops the index of its
+# partition that was adopted for it.
+statement ok
+ALTER TABLE g DETACH PARTITION g_p202612
+
+statement ok
+DROP INDEX g_p202612_v_idx
+
+query TT
+SELECT table_name, index_name FROM information_schema.statistics WHERE table_name LIKE 'g_p202612%' AND index_name NOT LIKE '%_pkey' GROUP BY table_name, index_name ORDER BY 1, 2
+----
+g_p202612 g_p202612_k_idx
+g_p202612_a g_p202612_a_k_idx
+
+# DROP INDEX on the partitioned table drops its partitions' indexes, at every level; an index a
+# partition declared itself stays.
+statement ok
+DROP INDEX g_v_idx
+
+query TT
+SELECT table_name, index_name FROM information_schema.statistics WHERE table_name LIKE 'g%' AND index_name LIKE '%v_idx%' GROUP BY table_name, index_name ORDER BY 1, 2
+----
+g_p202610 g_p202610_v_idx
+
+query I
+SELECT g_id FROM g WHERE v = 42
+----
+42
+
+# Recreating it builds it again, under the same names.
+statement ok
+CREATE INDEX g_v_idx ON g (v)
+
+query TT
+SELECT table_name, index_name FROM information_schema.statistics WHERE table_name LIKE 'g%' AND index_name LIKE '%v_idx%' GROUP BY table_name, index_name ORDER BY 1, 2
+----
+g g_v_idx
+g_p202610 g_p202610_v_idx
+g_p202610 g_p202610_v_idx1
+g_p202611 g_p202611_v_idx
+g_p202611_hi g_p202611_hi_v_idx
+g_p202611_lo g_p202611_lo_v_idx
+
+# A partition dropped as a table takes its indexes along, and one created under the same name
+# gets them again.
+statement ok
+DROP TABLE g_p202610
+
+statement ok
+CREATE TABLE g_p202610 PARTITION OF g FOR VALUES FROM ('2026-10-01') TO ('2026-11-01')
+
+query TT
+SELECT table_name, index_name FROM information_schema.statistics WHERE table_name = 'g_p202610' AND index_name NOT LIKE '%_pkey' GROUP BY table_name, index_name ORDER BY 1, 2
+----
+g_p202610 g_p202610_k_idx
+g_p202610 g_p202610_v_idx
+
+# A partitioned table whose index predates its partitions' (a database written by an earlier
+# release): its partitions are read by a scan, with the same results.
+statement ok
+DELETE FROM nusadb_partition_indexes WHERE index_name = 'g_p202611_lo_v_idx'
+
+statement ok
+DROP INDEX g_p202611_lo_v_idx
+
+query I
+SELECT g_id FROM g WHERE v = 4000
+----
+4000

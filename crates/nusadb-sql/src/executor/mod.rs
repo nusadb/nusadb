@@ -160,6 +160,7 @@ mod move_skip;
 mod object_schema;
 pub mod ops;
 mod partition;
+mod partition_index;
 mod procedure;
 mod recursive;
 pub mod scan;

@@ -572,6 +572,11 @@ fn slt_p1_partition_constraint_names() {
 }
 
 #[test]
+fn slt_p1_partition_indexes() {
+    run_slt("tests/slt/p1_ddl/partition_indexes.slt");
+}
+
+#[test]
 fn slt_p1_partition_upsert() {
     run_slt("tests/slt/p1_ddl/partition_upsert.slt");
 }

@@ -365,6 +365,13 @@ pub(super) fn run_create_table(
             engine,
             txn,
         )?;
+        // The partitioned table's indexes are built on the new partition.
+        if let (Some(parent), Some(partition)) = (
+            engine.lookup_table_as_of_in(txn, &part.parent_schema, &part.parent)?,
+            engine.lookup_table_as_of_in(txn, &def.schema, &def.name)?,
+        ) {
+            super::partition_index::joined(&parent, &partition, engine, txn)?;
+        }
     }
     Ok(ExecutionResult::Created(id))
 }
@@ -2188,6 +2195,7 @@ fn drop_table_with(
                     && !backing.contains(&id)
                 {
                     engine.drop_index(txn, id)?;
+                    super::partition_index::forget(engine, txn, &def.name)?;
                 }
             }
             for constraint in &constraints {
@@ -2834,23 +2842,41 @@ pub(super) fn run_create_index(
         crate::notice::skipped_existing("42P07", &format!("relation \"{}\"", plan.def.name));
         return Ok(ExecutionResult::IndexCreated);
     }
+    build_index(&plan.def, engine, txn)?;
+    // An index on a partitioned table is built on each of its partitions too.
     if let Some(table) = dml::schema_by_id(engine, txn, plan.def.table)? {
-        index_key::require_key_types(&table, &plan.def.columns, &plan.def.key_exprs)?;
+        super::partition_index::created_on(&table, &plan.def, engine, txn)?;
     }
-    engine.create_index(txn, &plan.def)?;
+    Ok(ExecutionResult::IndexCreated)
+}
+
+/// Create the B-tree index `def` and fill it with the rows its table already holds.
+///
+/// # Errors
+/// A key type the index cannot hold, a name already taken, and the build's own errors (a
+/// duplicate for a unique index).
+pub(super) fn build_index(
+    def: &nusadb_core::IndexDef,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<(), Error> {
+    if let Some(table) = dml::schema_by_id(engine, txn, def.table)? {
+        index_key::require_key_types(&table, &def.columns, &def.key_exprs)?;
+    }
+    engine.create_index(txn, def)?;
     // The index holds the table now: the backfill reads every committed row, not the snapshot
     // taken before the lock, which would miss a writer that committed in between.
     let _fresh = fresh_reads(engine, txn)?;
     // Backfill existing rows so an index created on a populated table is not missing them (which
     // would make a later index scan return wrong results).
     if let (Some(id), Some(table)) = (
-        engine.lookup_index(&plan.def.name)?,
-        dml::schema_by_id(engine, txn, plan.def.table)?,
-    ) && let Some(target) = dml::build_index_target(id, &table, &plan.def)
+        engine.lookup_index(&def.name)?,
+        dml::schema_by_id(engine, txn, def.table)?,
+    ) && let Some(target) = dml::build_index_target(id, &table, def)
     {
         // A new index backs no constraint: a unique one is guarded like on any later write.
         let target = target.with_guard(super::unique_index::guard_for(
-            &plan.def,
+            def,
             id,
             &table,
             &std::collections::HashSet::new(),
@@ -2862,7 +2888,7 @@ pub(super) fn run_create_index(
         // materializing the whole table's rows or entries at once.
         dml::backfill_index(&target, &table, engine, txn)?;
     }
-    Ok(ExecutionResult::IndexCreated)
+    Ok(())
 }
 
 pub(super) fn run_drop_index(
@@ -2873,6 +2899,13 @@ pub(super) fn run_drop_index(
     // The table the index is on, whose comments are re-checked once the index is gone.
     let owners = super::comment::index_owners(engine, txn, None, &plan.name)?;
     if let Some(id) = engine.lookup_index(&plan.name)? {
+        // An index on a partitioned table takes its partitions' indexes with it, and a partition's
+        // index stays while the partitioned table's index needs it.
+        for (schema, name) in &owners {
+            if let Some(table) = engine.lookup_table_as_of_in(txn, schema, name)? {
+                super::partition_index::dropping(&table, &plan.name, engine, txn)?;
+            }
+        }
         engine.drop_index(txn, id)?;
     } else {
         // Not an engine B-tree index — it may be a `USING hnsw` vector index, recorded in
@@ -3357,6 +3390,9 @@ pub(super) fn run_alter_table(
             // A key the parent enforces across its partitions: the attached rows' keys must not
             // meet an equal key in another partition.
             super::global_unique::validate_attached(&partition, engine, txn)?;
+            // The partitioned table's indexes: an equivalent index of the attached table is
+            // adopted, a missing one is built over its rows.
+            super::partition_index::joined(&parent, &partition, engine, txn)?;
             return Ok(ExecutionResult::Altered);
         },
         // DETACH PARTITION: confirm the child really is a partition of this parent, then sever just
@@ -3385,6 +3421,10 @@ pub(super) fn run_alter_table(
                 engine.lookup_table_as_of_in(txn, &partition_schema, &partition)?
             {
                 lock_one_for_validation(detached.id, engine, txn)?;
+                // The detached table keeps its indexes as its own.
+                if let Some(parent) = engine.lookup_table_as_of_in(txn, &parent_schema, &parent)? {
+                    super::partition_index::detached(&parent, &detached, engine, txn)?;
+                }
             }
             super::partition::remove_partition_entry(engine, txn, &partition_key)?;
             super::inheritance::remove_edge(engine, txn, &partition_key, &parent_key)?;

@@ -894,6 +894,37 @@ INSERT INTO ledger (region) VALUES (1);     -- id 1, status 'open'
 INSERT INTO ledger_1 (region) VALUES (1);   -- id 2, status 'open'
 ```
 
+An index created on a partitioned table is built on each of its partitions, at every level of
+sub-partitioning, and on every partition created (`PARTITION OF`) or attached (`ATTACH PARTITION`)
+later, so a query through the parent reads each partition through its own index. A partial index
+keeps its `WHERE` clause and an expression index its expressions. A partition's index is named
+after the partition and the key, `<partition>_<column>_idx` (`expr` for a key expression), with a
+number appended when that name is taken (`orders_q1_total_idx1`). An attached table that already
+has an equivalent index (same method, key, `WHERE` clause and `INCLUDE` columns) keeps it in place
+of a new one.
+
+```sql
+CREATE TABLE orders (id BIGINT NOT NULL, placed DATE NOT NULL, total INT)
+  PARTITION BY RANGE (placed);
+CREATE TABLE orders_q1 PARTITION OF orders FOR VALUES FROM ('2026-01-01') TO ('2026-04-01');
+CREATE INDEX orders_total ON orders (total);   -- also builds orders_q1_total_idx
+CREATE TABLE orders_q2 PARTITION OF orders FOR VALUES FROM ('2026-04-01') TO ('2026-07-01');
+                                               -- gets orders_q2_total_idx
+DROP INDEX orders_q1_total_idx;
+-- ERROR 2BP01: cannot drop index "orders_q1_total_idx" because index "orders_total" on
+--              partitioned table "orders" requires it; drop "orders_total" instead
+```
+
+`DROP INDEX` on the partitioned table's index drops its partitions' indexes too, and `REINDEX
+INDEX` / `REINDEX TABLE` on it rebuilds them. A detached partition keeps its indexes as its own.
+The partitions' indexes are ordinary indexes of each partition in `information_schema.statistics`.
+An index created on a partitioned table by an earlier release covers no partition: queries stay
+correct but read the partitions by a scan, and a partition created or attached from now on gets
+its index. Drop the index and create it again to build it on the existing partitions. A unique
+index cannot be created on a partitioned table (declare a `UNIQUE` constraint instead). A
+`USING hnsw` vector index on a partitioned table is not built on its partitions, so a nearest
+neighbour query through it reads them by a scan: create the vector index on each partition.
+
 A partitioned parent may declare a `PRIMARY KEY` / `UNIQUE` constraint. Each partition inherits it
 at `CREATE TABLE ... PARTITION OF` and at `ATTACH PARTITION` (existing rows are validated first,
 and a nullable primary-key column in the attached table is refused). When the key includes every

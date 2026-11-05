@@ -311,6 +311,7 @@ pub(super) fn drop_column_dependents(
             && index_names_column(&def, &column)
         {
             engine.drop_index(txn, id)?;
+            super::partition_index::forget(engine, txn, &def.name)?;
         }
     }
     for c in &constraints {
