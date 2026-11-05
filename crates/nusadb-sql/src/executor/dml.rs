@@ -3028,7 +3028,10 @@ fn run_copy_query_to(
     };
     let logical = crate::analyze(ast::Statement::Select(query.clone()), &catalog)?;
     let physical = crate::plan(logical);
-    let ExecutionResult::Rows { columns, rows, .. } = super::execute_in_txn(physical, engine, txn)?
+    // Run it as `user` too: the thread may last have run another connection's statement, and
+    // `CURRENT_USER` (and every row-level security predicate that reads it) must see the COPY user.
+    let ExecutionResult::Rows { columns, rows, .. } =
+        super::execute_in_txn_as(physical, engine, txn, user)?
     else {
         return Err(Error::Internal(
             "COPY (query) TO STDOUT: the query did not produce a row set".to_owned(),
