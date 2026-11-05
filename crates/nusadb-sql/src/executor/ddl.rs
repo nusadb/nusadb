@@ -643,6 +643,74 @@ fn partition_constraint_name(partition: &str, parent: &str, name: &str) -> Strin
     )
 }
 
+/// Which kind of constraint [`declared_constraint_name`] traces.
+#[derive(Clone, Copy)]
+pub(super) enum CopiedConstraint {
+    /// A `CHECK` constraint.
+    Check,
+    /// A `FOREIGN KEY` the table declares as the referencing side.
+    ForeignKey,
+}
+
+/// The name a violation of `table`'s constraint `name` reports. A partition enforces each `CHECK`
+/// and `FOREIGN KEY` of its partitioned parent through a copy named after the partition
+/// ([`partition_constraint_name`]), but the constraint is the one the parent declares, so a
+/// violation names it as declared: the copy is traced up the partition chain, through every level
+/// whose copy it is, to the table that declared it. A constraint the table declares itself (or
+/// one that only stands in for a parent's) keeps its own name. Read only when a violation is
+/// reported, so a write that passes pays nothing.
+pub(super) fn declared_constraint_name(
+    table: &TableSchema,
+    name: &str,
+    kind: CopiedConstraint,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<String, Error> {
+    const MAX_DEPTH: usize = 64;
+    let mut declared = name.to_owned();
+    if !super::partition::has_any(engine, txn)? {
+        return Ok(declared);
+    }
+    let mut key = crate::analyzer::qualified_display(&table.schema, &table.name);
+    for _ in 0..MAX_DEPTH {
+        let Some(parent_key) = super::partition::partition_parent(engine, txn, &key)? else {
+            break;
+        };
+        let (parent_schema, parent_name) = crate::analyzer::split_qualified(&parent_key);
+        let Some(parent) = engine.lookup_table_as_of_in(
+            txn,
+            parent_schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA),
+            parent_name,
+        )?
+        else {
+            break;
+        };
+        let names: Vec<String> = match kind {
+            CopiedConstraint::Check => engine
+                .list_constraints_as_of(txn, parent.id)?
+                .into_iter()
+                .filter(|c| c.kind == nusadb_core::ConstraintKind::Check)
+                .map(|c| c.name)
+                .collect(),
+            CopiedConstraint::ForeignKey => engine
+                .list_foreign_keys_as_of(txn, parent.id)?
+                .into_iter()
+                .filter(|fk| fk.child_table == parent.id)
+                .map(|fk| fk.name)
+                .collect(),
+        };
+        let Some(source) = names
+            .into_iter()
+            .find(|source| partition_constraint_name(&key, &parent_key, source) == declared)
+        else {
+            break;
+        };
+        declared = source;
+        key = parent_key;
+    }
+    Ok(declared)
+}
+
 /// The `CHECK` half of [`propagate_parent_constraints`].
 fn propagate_parent_checks(
     def: &nusadb_core::TableDef,

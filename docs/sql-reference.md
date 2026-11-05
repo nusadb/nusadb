@@ -960,7 +960,15 @@ declared in `CREATE TABLE` or added later with `ALTER TABLE ... ADD CONSTRAINT`,
 the rows already in the partitions (and refuses the statement when one breaks it). Each partition
 carries a copy named after it (`fact_v_check` on `fact` is `fact_01_v_check` on `fact_01`): the
 copy cannot be dropped on its own (`42P16`), dropping the constraint on the parent drops every
-copy, and a partition that is detached keeps its copies as its own constraints. A `UNIQUE` or
+copy, and a partition that is detached keeps its copies as its own constraints. A violation names
+the constraint as the parent declared it, whether the row is written through the parent or straight
+into a partition, at any depth of sub-partitioning (`23514 new row for "fact_01" violates check
+constraint "fact_v_check"`, and the same for a foreign key, on either side of it). The catalogs
+(`information_schema.table_constraints` and the other constraint views) list each partition's copy
+under its own name, the name `ALTER TABLE` on the partition and `COMMENT ON CONSTRAINT` use. A
+table attached with an equivalent constraint of its own keeps it, and a violation names that one.
+A `UNIQUE` or `PRIMARY KEY` copy is reported by its own name, the name of the partition's index
+that found the duplicate. A `UNIQUE` or
 `PRIMARY KEY` added this way that leaves out a partition-key column is enforced across the
 partitions, as above.
 

@@ -1581,17 +1581,18 @@ fn check_foreign_key(
     )?;
     for (k, from_child) in missing {
         if children.holds(&child, &child_ordinals, &k, engine, txn)? {
+            let declared = super::dml::fk_declared_name(&child, &fk.name, engine, txn)?;
             let message = if from_child {
                 format!(
-                    "insert or update on \"{}\" violates foreign key \"{}\": no matching row in \
-                     \"{}\"",
-                    child.name, fk.name, parent.name
+                    "insert or update on \"{}\" violates foreign key \"{declared}\": no matching \
+                     row in \"{}\"",
+                    child.name, parent.name
                 )
             } else {
                 format!(
-                    "update or delete on \"{}\" violates foreign key \"{}\": a row in \"{}\" \
-                     still references the removed key",
-                    parent.name, fk.name, child.name
+                    "update or delete on \"{}\" violates foreign key \"{declared}\": a row in \
+                     \"{}\" still references the removed key",
+                    parent.name, child.name
                 )
             };
             return Err(nusadb_core::Error::ConstraintViolation(message).into());

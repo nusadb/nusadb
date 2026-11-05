@@ -2206,7 +2206,7 @@ fn upsert_rows(
                 hit_checks = Some(compile_checks(table, engine, txn)?);
             }
             if let Some(checks) = &hit_checks {
-                enforce_compiled_checks(checks, table, std::slice::from_ref(&prow))?;
+                enforce_compiled_checks(checks, table, std::slice::from_ref(&prow), engine, txn)?;
             }
             // Evaluate SET / WHERE against `existing ++ EXCLUDED(proposed)`.
             let mut combined = erow.clone();
@@ -4104,13 +4104,32 @@ fn check_fk_children(
             if !present {
                 return Err(nusadb_core::Error::ConstraintViolation(format!(
                     "insert or update on \"{}\" violates foreign key \"{}\": no matching row in \"{}\"",
-                    table.name, fk.name, parent.name
+                    table.name,
+                    fk_declared_name(table, &fk.name, engine, txn)?,
+                    parent.name
                 ))
                 .into());
             }
         }
     }
     Ok(())
+}
+
+/// The name a violation of the foreign key `name` that `child` declares reports: a partition's copy
+/// of its partitioned parent's key is named as the parent declared it.
+pub(super) fn fk_declared_name(
+    child: &TableSchema,
+    name: &str,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+) -> Result<String, Error> {
+    super::ddl::declared_constraint_name(
+        child,
+        name,
+        super::ddl::CopiedConstraint::ForeignKey,
+        engine,
+        txn,
+    )
 }
 
 /// A [`Catalog`](crate::analyzer::Catalog) that resolves nothing — used to re-analyze a stored
@@ -4137,7 +4156,7 @@ pub(super) fn enforce_check_on_write(
     txn: TxnId,
 ) -> Result<(), Error> {
     let checks = compile_checks(table, engine, txn)?;
-    enforce_compiled_checks(&checks, table, rows)
+    enforce_compiled_checks(&checks, table, rows, engine, txn)
 }
 
 /// The `CHECK` constraints of `table`, each with its predicate analyzed against the table's
@@ -4174,18 +4193,29 @@ pub(super) fn compile_checks(
         .collect()
 }
 
-/// [`enforce_check_on_write`] with the checks [`compile_checks`] returned.
+/// [`enforce_check_on_write`] with the checks [`compile_checks`] returned. A violation names the
+/// constraint as it was declared: a partition's copy of its partitioned parent's `CHECK` reports
+/// the parent's name.
 pub(super) fn enforce_compiled_checks(
     checks: &[(String, crate::planner::TypedExpr)],
     table: &TableSchema,
     rows: &[Row],
+    engine: &dyn StorageEngine,
+    txn: TxnId,
 ) -> Result<(), Error> {
     for row in rows {
         for (name, predicate) in checks {
             if matches!(eval::eval(predicate, row)?, ast::Value::Bool(false)) {
+                let declared = super::ddl::declared_constraint_name(
+                    table,
+                    name,
+                    super::ddl::CopiedConstraint::Check,
+                    engine,
+                    txn,
+                )?;
                 return Err(nusadb_core::Error::ConstraintViolation(format!(
-                    "new row for \"{}\" violates check constraint \"{}\"",
-                    table.name, name
+                    "new row for \"{}\" violates check constraint \"{declared}\"",
+                    table.name
                 ))
                 .into());
             }
@@ -4354,7 +4384,7 @@ fn cascade_update_children(
             });
         }
         // The action's new values (and a trigger's) must satisfy the child's CHECK constraints.
-        enforce_compiled_checks(&checks, child, std::slice::from_ref(&new))?;
+        enforce_compiled_checks(&checks, child, std::slice::from_ref(&new), engine, txn)?;
         super::exclusion::enforce_compiled(
             &exclusions,
             child,
@@ -4603,18 +4633,18 @@ impl DeleteWalk {
             if referencing.is_empty() {
                 continue;
             }
-            let violation = || {
-                format!(
+            let violation = || -> Result<String, Error> {
+                Ok(format!(
                     "delete on \"{}\" violates foreign key \"{}\": {} dependent row(s) in \"{}\"",
                     table.name,
-                    fk.name,
+                    fk_declared_name(&child, &fk.name, engine, txn)?,
                     referencing.len(),
                     child.name
-                )
+                ))
             };
             match fk.on_delete {
                 nusadb_core::FkAction::Restrict => {
-                    return Err(nusadb_core::Error::ConstraintViolation(violation()).into());
+                    return Err(nusadb_core::Error::ConstraintViolation(violation()?).into());
                 },
                 // A deferred key settles at commit: queue the keys that are still referenced.
                 nusadb_core::FkAction::NoAction
@@ -4635,7 +4665,7 @@ impl DeleteWalk {
                 },
                 nusadb_core::FkAction::NoAction => {
                     let message = self.messages.len();
-                    self.messages.push(violation());
+                    self.messages.push(violation()?);
                     self.blocked.extend(
                         referencing
                             .iter()
@@ -4960,7 +4990,7 @@ fn parent_update_step(
                     return Err(nusadb_core::Error::ConstraintViolation(format!(
                         "update on \"{}\" violates foreign key \"{}\": {} dependent row(s) in \"{}\"",
                         table.name,
-                        fk.name,
+                        fk_declared_name(&child, &fk.name, engine, txn)?,
                         referencing.len(),
                         child.name
                     ))

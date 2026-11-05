@@ -1,0 +1,136 @@
+# A partition enforces its partitioned parent's CHECK and FOREIGN KEY constraints through copies
+# named after the partition. A violation names the constraint as the parent declared it, however
+# the row arrives (through the parent, straight into the partition, at any level of
+# sub-partitioning). A UNIQUE / PRIMARY KEY copy has an index of its own and is reported by its own
+# name. The catalogs list each partition's copies under their own names.
+
+statement ok
+CREATE TABLE ref_t (id BIGINT PRIMARY KEY)
+
+statement ok
+INSERT INTO ref_t VALUES (1), (2)
+
+statement ok
+CREATE TABLE g (g_id BIGINT NOT NULL, k BIGINT, d DATE NOT NULL, v BIGINT NOT NULL, r BIGINT, CONSTRAINT g_v_ck CHECK (v >= 0), CONSTRAINT g_r_fk FOREIGN KEY (r) REFERENCES ref_t (id), CONSTRAINT g_nat_key UNIQUE (k, d)) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE g_p202610 PARTITION OF g FOR VALUES FROM ('2026-10-01') TO ('2026-11-01')
+
+statement ok
+CREATE TABLE g_p202611 PARTITION OF g FOR VALUES FROM ('2026-11-01') TO ('2026-12-01') PARTITION BY RANGE (v)
+
+statement ok
+CREATE TABLE g_p202611_a PARTITION OF g_p202611 FOR VALUES FROM (-1000) TO (1000)
+
+statement error violates check constraint "g_v_ck"
+INSERT INTO g VALUES (1, 1, '2026-10-05', -1, NULL)
+
+statement error violates check constraint "g_v_ck"
+INSERT INTO g_p202610 VALUES (1, 1, '2026-10-05', -1, NULL)
+
+# A sub-partition's copy is a copy of a copy: it still reports the top-level name.
+statement error violates check constraint "g_v_ck"
+INSERT INTO g VALUES (2, 2, '2026-11-05', -1, NULL)
+
+statement error violates check constraint "g_v_ck"
+INSERT INTO g_p202611_a VALUES (2, 2, '2026-11-05', -1, NULL)
+
+statement error violates foreign key "g_r_fk"
+INSERT INTO g VALUES (1, 1, '2026-10-05', 1, 7)
+
+statement error violates foreign key "g_r_fk"
+INSERT INTO g VALUES (2, 2, '2026-11-05', 1, 7)
+
+statement ok
+INSERT INTO g VALUES (1, 1, '2026-10-05', 1, 1), (2, 2, '2026-11-05', 1, 2)
+
+statement error violates check constraint "g_v_ck"
+UPDATE g SET v = -5 WHERE g_id = 1
+
+statement error violates check constraint "g_v_ck"
+UPDATE g SET v = -5 WHERE g_id = 2
+
+statement error violates foreign key "g_r_fk"
+UPDATE g SET r = 9 WHERE g_id = 2
+
+# The referenced side names it the same way.
+statement error violates foreign key "g_r_fk"
+DELETE FROM ref_t WHERE id = 2
+
+statement error violates foreign key "g_r_fk"
+DELETE FROM ref_t WHERE id = 1
+
+# A UNIQUE copy is reported by the partition's own name.
+statement error unique constraint "g_p202610_nat_key"
+INSERT INTO g VALUES (3, 1, '2026-10-05', 1, NULL)
+
+# Upsert and COPY-like multi-row paths report the declared name too.
+statement error violates check constraint "g_v_ck"
+INSERT INTO g VALUES (1, 1, '2026-10-05', -9, NULL) ON CONFLICT (k, d) DO UPDATE SET v = excluded.v
+
+# A constraint added to the parent later is named the same way on its partitions.
+statement ok
+ALTER TABLE g ADD CONSTRAINT g_k_ck CHECK (k < 100)
+
+statement error violates check constraint "g_k_ck"
+INSERT INTO g VALUES (4, 100, '2026-10-06', 1, NULL)
+
+statement error violates check constraint "g_k_ck"
+INSERT INTO g VALUES (4, 100, '2026-11-06', 1, NULL)
+
+# A table attached with an equivalent CHECK of its own keeps it: that is the constraint it reports.
+statement ok
+CREATE TABLE g_p202612 (g_id BIGINT NOT NULL, k BIGINT, d DATE NOT NULL, v BIGINT NOT NULL, r BIGINT, CONSTRAINT own_v CHECK (v >= 0))
+
+statement ok
+ALTER TABLE g ATTACH PARTITION g_p202612 FOR VALUES FROM ('2026-12-01') TO ('2027-01-01')
+
+statement error violates check constraint "own_v"
+INSERT INTO g VALUES (9, 9, '2026-12-05', -1, NULL)
+
+# The catalogs list the copies under the partition's names.
+query TTT
+SELECT table_name, constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name IN ('g', 'g_p202610') AND constraint_type IN ('CHECK', 'FOREIGN KEY') AND constraint_name NOT LIKE '%not_null%' ORDER BY 1, 2
+----
+g g_k_ck CHECK
+g g_r_fk FOREIGN KEY
+g g_v_ck CHECK
+g_p202610 g_p202610_k_ck CHECK
+g_p202610 g_p202610_r_fk FOREIGN KEY
+g_p202610 g_p202610_v_ck CHECK
+
+# A detached partition keeps its copies as constraints of its own, reported by their own names.
+statement ok
+ALTER TABLE g DETACH PARTITION g_p202610
+
+statement error violates check constraint "g_p202610_v_ck"
+INSERT INTO g_p202610 VALUES (5, 5, '2026-10-05', -1, NULL)
+
+# A deferred foreign key reports the declared name at COMMIT.
+statement ok
+CREATE TABLE dg (id BIGINT NOT NULL, d INT NOT NULL, r BIGINT, CONSTRAINT dg_r_fk FOREIGN KEY (r) REFERENCES ref_t (id) DEFERRABLE INITIALLY DEFERRED) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE dg_1 PARTITION OF dg FOR VALUES FROM (0) TO (100)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO dg VALUES (1, 1, 77)
+
+statement error violates foreign key "dg_r_fk"
+COMMIT
+
+# Partitions in another schema.
+statement ok
+CREATE SCHEMA app
+
+statement ok
+CREATE TABLE app.m (id INT NOT NULL, v INT NOT NULL, CONSTRAINT m_v_ck CHECK (v > 0)) PARTITION BY RANGE (id)
+
+statement ok
+CREATE TABLE app.m_1 PARTITION OF app.m FOR VALUES FROM (0) TO (100)
+
+statement error violates check constraint "m_v_ck"
+INSERT INTO app.m VALUES (1, 0)

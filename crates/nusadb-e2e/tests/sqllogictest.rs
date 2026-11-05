@@ -567,6 +567,11 @@ fn slt_p2_upsert_nulls_not_distinct() {
 }
 
 #[test]
+fn slt_p1_partition_constraint_names() {
+    run_slt("tests/slt/p1_ddl/partition_constraint_names.slt");
+}
+
+#[test]
 fn slt_p1_partition_upsert() {
     run_slt("tests/slt/p1_ddl/partition_upsert.slt");
 }
