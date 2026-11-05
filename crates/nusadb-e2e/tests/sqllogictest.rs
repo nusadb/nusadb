@@ -562,6 +562,11 @@ fn slt_p1_partition_update_key_guard() {
 }
 
 #[test]
+fn slt_p2_upsert_nulls_not_distinct() {
+    run_slt("tests/slt/p2_dml/upsert_nulls_not_distinct.slt");
+}
+
+#[test]
 fn slt_p1_partition_upsert() {
     run_slt("tests/slt/p1_ddl/partition_upsert.slt");
 }

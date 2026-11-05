@@ -132,11 +132,12 @@ pub(super) struct ArbiterKey {
 }
 
 impl ArbiterKey {
-    /// An arbiter over a key constraint's columns (full, `NULL` keys never collide).
-    pub(super) const fn columns(ordinals: Vec<usize>) -> Self {
+    /// An arbiter over a key constraint's columns: a full key, where two `NULL` keys collide only
+    /// under `NULLS NOT DISTINCT`, exactly as the constraint itself compares them.
+    pub(super) const fn constraint(ordinals: Vec<usize>, nulls_not_distinct: bool) -> Self {
         Self {
             ordinals,
-            nulls_not_distinct: false,
+            nulls_not_distinct,
             predicate: None,
         }
     }

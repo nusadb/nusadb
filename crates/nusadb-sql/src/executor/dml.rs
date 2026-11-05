@@ -216,10 +216,13 @@ fn insert_into_partition_tree(
         .into_iter()
         .map(|(leaf, rows)| (leaf, as_values(rows)))
         .collect();
+    // `ON CONFLICT ON CONSTRAINT` names the constraint the statement's table declares; each leaf
+    // arbitrates on its own copy of it.
+    let arbiters = LeafArbiters::new(&plan.table, plan.on_conflict.as_ref(), engine, txn)?;
     // An arbiter that leaves out a partitioning column may find its conflict in another
     // partition than the one the row routes to: the row then goes to that partition's upsert.
-    if let Some(OnConflictPlan::DoUpdate { target, .. }) = &plan.on_conflict {
-        buckets = send_upserts_to_global_conflicts(&all_columns, target, buckets, engine, txn)?;
+    if let Some(OnConflictPlan::DoUpdate { .. }) = &plan.on_conflict {
+        buckets = send_upserts_to_global_conflicts(&all_columns, &arbiters, buckets, engine, txn)?;
     }
     let mut deferred = deferred;
     let mut inserted = Vec::new();
@@ -233,16 +236,16 @@ fn insert_into_partition_tree(
         // was sent to its conflict's leaf above.
         let written = match &plan.on_conflict {
             Some(OnConflictPlan::DoUpdate {
-                target,
                 assignments,
                 filter,
+                ..
             }) => upsert_rows(
                 &leaf,
                 &all_columns,
                 rows,
                 plan.rls_check.as_ref(),
                 RowSource::Complete,
-                target,
+                &arbiters.on(&leaf)?,
                 assignments,
                 filter.as_ref(),
                 engine,
@@ -251,11 +254,8 @@ fn insert_into_partition_tree(
             )?,
             other => {
                 // A `DO NOTHING` with a stated target must name a real unique/primary-key arbiter.
-                if let Some(OnConflictPlan::DoNothing {
-                    target: Some(target),
-                }) = other
-                {
-                    resolve_arbiter(&leaf, target, engine, txn)?;
+                if let Some(OnConflictPlan::DoNothing { target: Some(_) }) = other {
+                    resolve_arbiter(&leaf, &arbiters.on(&leaf)?, engine, txn)?;
                 }
                 insert_rows_with_unique(
                     &leaf,
@@ -395,6 +395,86 @@ fn route_rows_to_leaves(
     Ok(resolved)
 }
 
+/// The `ON CONFLICT` target of a write through a partitioned table, as each partition it reaches
+/// arbitrates on it. A target given by columns applies to every partition as it is. `ON CONFLICT ON
+/// CONSTRAINT name` names a constraint of the table the statement names, and a partition enforces
+/// that constraint through its own copy, which carries a name of its own; a partition that already
+/// declared an equivalent key when it joined kept that key instead of a copy, and arbitrates on the
+/// key's columns.
+struct LeafArbiters {
+    /// The table the statement names.
+    named: nusadb_core::TableId,
+    /// The stated target, `None` without one.
+    target: Option<ConflictArbiter>,
+    /// For `ON CONSTRAINT`: the copy each partition below holds.
+    copies: Vec<(nusadb_core::TableId, String)>,
+    /// The named constraint's columns, for a partition that holds no copy.
+    columns: Vec<String>,
+}
+
+impl LeafArbiters {
+    fn new(
+        named: &TableSchema,
+        on_conflict: Option<&OnConflictPlan>,
+        engine: &dyn StorageEngine,
+        txn: TxnId,
+    ) -> Result<Self, Error> {
+        let target = match on_conflict {
+            Some(OnConflictPlan::DoUpdate { target, .. }) => Some(target.clone()),
+            Some(OnConflictPlan::DoNothing { target }) => target.clone(),
+            None => None,
+        };
+        let mut copies = Vec::new();
+        let mut columns = Vec::new();
+        if let Some(ConflictArbiter::Constraint(name)) = &target {
+            let declared = engine
+                .list_constraints_as_of(txn, named.id)?
+                .into_iter()
+                .find(|c| {
+                    &c.name == name
+                        && matches!(
+                            c.kind,
+                            nusadb_core::ConstraintKind::PrimaryKey
+                                | nusadb_core::ConstraintKind::Unique
+                        )
+                })
+                .ok_or_else(|| Error::Coded {
+                    message: format!(
+                        "constraint \"{name}\" for table \"{}\" does not exist",
+                        named.name
+                    ),
+                    sqlstate: "42704", // undefined_object
+                })?;
+            columns = declared.columns;
+            copies = super::ddl::partition_copies(named.id, name, engine, txn)?;
+        }
+        Ok(Self {
+            named: named.id,
+            target,
+            copies,
+            columns,
+        })
+    }
+
+    /// The target as `leaf` arbitrates on it.
+    fn on(&self, leaf: &TableSchema) -> Result<ConflictArbiter, Error> {
+        match &self.target {
+            Some(ConflictArbiter::Constraint(_)) if leaf.id != self.named => Ok(self
+                .copies
+                .iter()
+                .find(|(table, _)| *table == leaf.id)
+                .map_or_else(
+                    || constraint_ordinals(leaf, &self.columns).map(ConflictArbiter::Columns),
+                    |(_, copy)| Ok(ConflictArbiter::Constraint(copy.clone())),
+                )?),
+            Some(target) => Ok(target.clone()),
+            None => Err(Error::Internal(
+                "an ON CONFLICT arbiter was asked of a statement without one".to_owned(),
+            )),
+        }
+    }
+}
+
 /// Where an upsert key was placed: scope table, scope constraint, key hash.
 type PlacedSlot = (nusadb_core::TableId, String, u64);
 
@@ -416,7 +496,7 @@ type UpsertBuckets = Vec<(TableSchema, Vec<Vec<Option<ast::Value>>>)>;
 /// is still checked across the partitions when the statement ends.
 fn send_upserts_to_global_conflicts(
     columns: &[usize],
-    target: &ConflictArbiter,
+    arbiters: &LeafArbiters,
     buckets: UpsertBuckets,
     engine: &dyn StorageEngine,
     txn: TxnId,
@@ -430,7 +510,7 @@ fn send_upserts_to_global_conflicts(
     for (leaf, rows) in buckets {
         // Only a key constraint is enforced across partitions; a unique index arbiter (full or
         // partial) is the partition's own.
-        let arbiter = resolve_arbiter(&leaf, target, engine, txn)?;
+        let arbiter = resolve_arbiter(&leaf, &arbiters.on(&leaf)?, engine, txn)?;
         let mut wanted = arbiter.ordinals.clone();
         wanted.sort_unstable();
         let globals = super::global_unique::leaf_globals(&leaf, engine, txn)?;
@@ -2091,11 +2171,11 @@ fn upsert_rows(
     let mut hit_checks = None;
 
     for prow in proposed {
-        // ON CONFLICT arbiter matching treats a NULL key as distinct (standard `NULLS DISTINCT`); a
-        // NULLS-NOT-DISTINCT arbiter's NULL duplicate is still caught by the NULL-aware uniqueness
-        // enforcement on the resulting insert.
+        // The arbiter compares keys as its constraint or index does: a key holding a NULL never
+        // collides under `NULLS DISTINCT`, and collides with an equal key (NULL matching NULL)
+        // under `NULLS NOT DISTINCT`, so the upsert updates the row that holds it.
         let Some(key) = arbiter.key(&prow)? else {
-            // A NULL arbiter key never collides (NULLs are distinct), and a row a partial index's
+            // A NULL key of a `NULLS DISTINCT` arbiter never collides, and a row a partial index's
             // predicate rejects is not in it → plain insert.
             order.push((false, inserts.len()));
             inserts.push(prow);
@@ -2388,8 +2468,9 @@ fn resolve_arbiter(
             if deferrable(constraint) {
                 return Err(refuse_deferrable(constraint));
             }
-            constraint_ordinals(table, &constraint.columns)
-                .map(super::unique_index::ArbiterKey::columns)
+            constraint_ordinals(table, &constraint.columns).map(|ordinals| {
+                super::unique_index::ArbiterKey::constraint(ordinals, constraint.nulls_not_distinct)
+            })
         },
         ConflictArbiter::Columns(ordinals) | ConflictArbiter::ColumnsWhere(ordinals, _) => {
             let mut wanted = ordinals.clone();
@@ -2403,8 +2484,12 @@ fn resolve_arbiter(
                         deferrable_match.get_or_insert(constraint);
                         continue;
                     }
-                    return constraint_ordinals(table, &constraint.columns)
-                        .map(super::unique_index::ArbiterKey::columns);
+                    return constraint_ordinals(table, &constraint.columns).map(|ordinals| {
+                        super::unique_index::ArbiterKey::constraint(
+                            ordinals,
+                            constraint.nulls_not_distinct,
+                        )
+                    });
                 }
             }
             // No key constraint: a unique index over the columns (a partial one only when the

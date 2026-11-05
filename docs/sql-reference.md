@@ -584,7 +584,20 @@ INSERT INTO nnd (a) VALUES (NULL);
 ```
 
 `UNIQUE NULLS NOT DISTINCT` treats NULL keys as equal, so at most one NULL row exists per key; it
-also works through `ALTER TABLE ... ADD`.
+also works through `ALTER TABLE ... ADD`. `ON CONFLICT` compares keys the same way: a proposed row
+whose key holds a NULL conflicts with the row holding the equal key, so `DO UPDATE` updates that
+row and `DO NOTHING` skips the proposed one, whether the target names the columns or the
+constraint (`ON CONFLICT ON CONSTRAINT`). Two proposed rows of one statement with the same NULL key
+are a row affected twice for `DO UPDATE` (refused), and `DO NOTHING` keeps the first. Under the
+default `NULLS DISTINCT` a key holding a NULL never conflicts, and the row is inserted.
+
+```sql
+CREATE TABLE h (id INT PRIMARY KEY, k INT NOT NULL, s TEXT, n INT NOT NULL,
+  CONSTRAINT h_nat_key UNIQUE NULLS NOT DISTINCT (k, s));
+INSERT INTO h VALUES (1, 1, NULL, 1);
+INSERT INTO h VALUES (2, 1, NULL, 5) ON CONFLICT (k, s) DO UPDATE SET n = h.n + excluded.n;
+-- row 1 now has n = 6
+```
 
 `ON DELETE SET NULL` may name the referencing columns it sets. The other columns of the key keep
 their values, which suits a composite key that pairs a tenant column with a row id:
@@ -871,9 +884,10 @@ at `CREATE TABLE ... PARTITION OF` and at `ATTACH PARTITION` (existing rows are 
 and a nullable primary-key column in the attached table is refused). When the key includes every
 partition-key column, equal keys always route to the same partition and each partition's copy
 enforces it alone. `INSERT ... ON CONFLICT` works on the parent: rows route to their partition
-first, then the upsert action runs against that leaf. A `DO UPDATE` that would move the row out of
-its partition is refused; a plain `UPDATE` through the parent moves it (see the partitioning
-section).
+first, then the upsert action runs against that leaf. `ON CONFLICT ON CONSTRAINT` names the
+parent's constraint, and each partition arbitrates on its own copy of it. A `DO UPDATE` that would
+move the row out of its partition is refused; a plain `UPDATE` through the parent moves it (see the
+partitioning section).
 
 #### Keys across partitions
 

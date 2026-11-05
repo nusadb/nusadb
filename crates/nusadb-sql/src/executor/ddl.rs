@@ -845,7 +845,7 @@ fn drop_partition_copies(
 
 /// The copies the partitions below `table` hold of its constraint `name`, as `(partition, copy
 /// name)`, top-down. Each level's copy is named after its own parent's.
-fn partition_copies(
+pub(super) fn partition_copies(
     table: nusadb_core::TableId,
     name: &str,
     engine: &dyn StorageEngine,

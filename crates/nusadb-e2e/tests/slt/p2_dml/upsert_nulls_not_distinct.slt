@@ -1,0 +1,161 @@
+# ON CONFLICT on a UNIQUE NULLS NOT DISTINCT key: a key holding NULL collides with an equal key
+# (NULL matching NULL), so DO UPDATE updates the row that holds it and DO NOTHING skips the row.
+# Under the default NULLS DISTINCT a NULL key never collides and the row is inserted.
+
+statement ok
+CREATE TABLE h (h_id BIGINT NOT NULL, k BIGINT NOT NULL, s TEXT, n BIGINT NOT NULL, CONSTRAINT h_pkey PRIMARY KEY (h_id), CONSTRAINT h_nat_key UNIQUE NULLS NOT DISTINCT (k, s))
+
+statement ok
+INSERT INTO h VALUES (1, 1, NULL, 1)
+
+statement ok
+INSERT INTO h VALUES (2, 1, NULL, 5) ON CONFLICT (k, s) DO UPDATE SET n = h.n + excluded.n
+
+query IIII
+SELECT h_id, k, s IS NULL, n FROM h
+----
+1 1 1 6
+
+statement ok
+INSERT INTO h VALUES (3, 1, NULL, 5) ON CONFLICT ON CONSTRAINT h_nat_key DO UPDATE SET n = h.n + excluded.n
+
+query II
+SELECT h_id, n FROM h
+----
+1 11
+
+# DO NOTHING, with the columns, the constraint, or no target.
+statement ok
+INSERT INTO h VALUES (4, 1, NULL, 5) ON CONFLICT (k, s) DO NOTHING
+
+statement ok
+INSERT INTO h VALUES (4, 1, NULL, 5) ON CONFLICT ON CONSTRAINT h_nat_key DO NOTHING
+
+statement ok
+INSERT INTO h VALUES (4, 1, NULL, 5) ON CONFLICT DO NOTHING
+
+# The WHERE of DO UPDATE sees the row that holds the NULL key.
+statement ok
+INSERT INTO h VALUES (5, 1, NULL, 5) ON CONFLICT (k, s) DO UPDATE SET n = 0 WHERE h.n > 100
+
+query II
+SELECT h_id, n FROM h
+----
+1 11
+
+# Two rows of one statement on the same NULL key: DO UPDATE may not affect a row twice, DO NOTHING
+# keeps the first.
+statement error cannot affect one row a second time
+INSERT INTO h VALUES (6, 2, NULL, 1), (7, 2, NULL, 2) ON CONFLICT (k, s) DO UPDATE SET n = excluded.n
+
+statement ok
+INSERT INTO h VALUES (6, 2, NULL, 1), (7, 2, NULL, 2) ON CONFLICT (k, s) DO NOTHING
+
+query II
+SELECT h_id, n FROM h ORDER BY h_id
+----
+1 11
+6 1
+
+# RETURNING reports the updated row.
+query IIII
+INSERT INTO h VALUES (8, 2, NULL, 9) ON CONFLICT (k, s) DO UPDATE SET n = excluded.n RETURNING h_id, k, s IS NULL, n
+----
+6 2 1 9
+
+# NULLS DISTINCT (the default): the NULL key does not collide, so the row is inserted.
+statement ok
+CREATE TABLE nd (id INT PRIMARY KEY, a INT, b TEXT, n INT, UNIQUE (a, b))
+
+statement ok
+INSERT INTO nd VALUES (1, 1, NULL, 1)
+
+statement ok
+INSERT INTO nd VALUES (2, 1, NULL, 5) ON CONFLICT (a, b) DO UPDATE SET n = nd.n + excluded.n
+
+query II
+SELECT id, n FROM nd ORDER BY id
+----
+1 1
+2 5
+
+# A unique index NULLS NOT DISTINCT, full and partial, arbitrates the same way.
+statement ok
+CREATE TABLE fi (id INT PRIMARY KEY, a INT, b TEXT, flag BOOLEAN, n INT)
+
+statement ok
+CREATE UNIQUE INDEX fi_ab ON fi (a, b) NULLS NOT DISTINCT WHERE flag
+
+statement ok
+INSERT INTO fi VALUES (1, 1, NULL, true, 1)
+
+statement ok
+INSERT INTO fi VALUES (2, 1, NULL, true, 5) ON CONFLICT (a, b) WHERE flag DO UPDATE SET n = fi.n + excluded.n
+
+statement ok
+INSERT INTO fi VALUES (3, 1, NULL, true, 5) ON CONFLICT (a, b) WHERE flag DO NOTHING
+
+# Outside the predicate the row holds no key and is inserted.
+statement ok
+INSERT INTO fi VALUES (4, 1, NULL, false, 5) ON CONFLICT (a, b) WHERE flag DO UPDATE SET n = fi.n + excluded.n
+
+query II
+SELECT id, n FROM fi ORDER BY id
+----
+1 6
+4 5
+
+# A partitioned table: the key includes the partition key, so each partition's copy arbitrates.
+statement ok
+CREATE TABLE g (g_id BIGINT NOT NULL, k BIGINT, s TEXT, d DATE NOT NULL, v BIGINT NOT NULL, CONSTRAINT g_pkey PRIMARY KEY (g_id), CONSTRAINT g_v_ck CHECK (v >= 0), CONSTRAINT g_nat_key UNIQUE NULLS NOT DISTINCT (k, s, d)) PARTITION BY RANGE (d)
+
+statement ok
+CREATE TABLE g_p202610 PARTITION OF g FOR VALUES FROM ('2026-10-01') TO ('2026-11-01')
+
+statement ok
+CREATE TABLE g_p202611 PARTITION OF g FOR VALUES FROM ('2026-11-01') TO ('2026-12-01')
+
+statement ok
+INSERT INTO g VALUES (1, 1, NULL, '2026-10-05', 1), (2, 1, NULL, '2026-11-05', 1)
+
+statement ok
+INSERT INTO g VALUES (3, 1, NULL, '2026-10-05', 5) ON CONFLICT (k, s, d) DO UPDATE SET v = g.v + excluded.v
+
+# ON CONSTRAINT names the partitioned table's constraint; each partition uses its own copy.
+statement ok
+INSERT INTO g VALUES (4, 1, NULL, '2026-10-05', 5), (5, 1, NULL, '2026-11-05', 7) ON CONFLICT ON CONSTRAINT g_nat_key DO UPDATE SET v = g.v + excluded.v
+
+statement ok
+INSERT INTO g VALUES (6, 1, NULL, '2026-10-05', 5) ON CONFLICT ON CONSTRAINT g_nat_key DO NOTHING
+
+statement ok
+INSERT INTO g VALUES (6, 1, NULL, '2026-11-05', 5) ON CONFLICT (k, s, d) DO NOTHING
+
+query II
+SELECT g_id, v FROM g ORDER BY g_id
+----
+1 11
+2 8
+
+statement error constraint "nope" for table "g" does not exist
+INSERT INTO g VALUES (6, 1, NULL, '2026-10-05', 5) ON CONFLICT ON CONSTRAINT nope DO NOTHING
+
+# Writing to the partition directly arbitrates on its own copy, by its own name.
+statement ok
+INSERT INTO g_p202610 VALUES (7, 1, NULL, '2026-10-05', 1) ON CONFLICT (k, s, d) DO UPDATE SET v = 0
+
+query II
+SELECT g_id, v FROM g ORDER BY g_id
+----
+1 0
+2 8
+
+# A key enforced across the partitions (it leaves the partition key out) is named the same way.
+statement ok
+INSERT INTO g VALUES (2, 9, 'z', '2026-10-09', 1) ON CONFLICT ON CONSTRAINT g_pkey DO UPDATE SET v = 50
+
+query II
+SELECT g_id, v FROM g ORDER BY g_id
+----
+1 0
+2 50
