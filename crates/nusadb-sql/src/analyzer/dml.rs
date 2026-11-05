@@ -46,7 +46,7 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
     // existing row an upsert updated), and an arbiter reads the existing rows.
     let readable = target_readable(&table, &table, catalog)?;
     // RETURNING projects the inserted rows: resolve it against the table's columns.
-    let returning = analyze_returning(&ins.returning, &table, &readable, catalog)?;
+    let returning = analyze_returning(&ins.returning, &table, &table.name, &readable, catalog)?;
     // `ON CONFLICT`: `DO NOTHING` skips conflicting rows; `DO UPDATE` upserts the existing
     // row. Resolved against the target table (DO UPDATE also resolves the arbiter + EXCLUDED scope).
     let on_conflict = match ins.on_conflict {
@@ -360,13 +360,14 @@ fn reject_conflict_subquery(expr: &TypedExpr) -> Result<(), Error> {
 pub(super) fn analyze_returning(
     returning: &[ast::SelectItem],
     table: &TableSchema,
+    qualifier: &str,
     readable: &[bool],
     catalog: &dyn Catalog,
 ) -> Result<Vec<Projection>, Error> {
     if returning.is_empty() {
         return Ok(Vec::new());
     }
-    let mut scope = scope_of(table);
+    let mut scope = scope_of_aliased(table, qualifier);
     gate_target_scope(&mut scope, readable);
     let mut aggregates = Vec::new();
     let source_len = scope.len();
@@ -938,8 +939,11 @@ pub(super) fn analyze_update(
     // `UPDATE t SET c = 1` reads nothing and needs only UPDATE, which keeps a write-only role
     // write-only.
     let readable = target_readable(&table, &access, catalog)?;
+    // The statement names the target by its alias, else by the table it names: the parent, for a
+    // sub-plan reached through it.
+    let target_qual = upd.alias.clone().unwrap_or_else(|| access.name.clone());
     // RETURNING projects the updated rows, resolved against the table's (post-update) columns.
-    let returning = analyze_returning(&upd.returning, &table, &readable, catalog)?;
+    let returning = analyze_returning(&upd.returning, &table, &target_qual, &readable, catalog)?;
     // UPDATE ... FROM: resolve a single named FROM table and extend the scope with it, so the
     // SET values and WHERE may reference its columns (at ordinals `target_width + j` of the
     // concatenated `target ++ from` row the executor evaluates against).
@@ -951,12 +955,7 @@ pub(super) fn analyze_update(
     // alias (which shadows the table name), so build the scope under the alias qualifier. Built via
     // `base_scope` (ungated) so composite/enum columns carry their type names — `(col).field` in the
     // WHERE / SET expressions resolves exactly as it does in a SELECT.
-    let mut scope = base_scope(
-        &table,
-        upd.alias.as_deref().unwrap_or(&table.name),
-        catalog,
-        false,
-    )?;
+    let mut scope = base_scope(&table, &target_qual, catalog, false)?;
     gate_target_scope(&mut scope, &readable);
     let mut from_table: Option<TableSchema> = None;
     let mut from_plan: Option<Box<SelectPlan>> = None;
@@ -972,7 +971,7 @@ pub(super) fn analyze_update(
                 schema.name
             )));
         }
-        reject_repeated_qualifier(upd.alias.as_deref().unwrap_or(&table.name), &qualifier)?;
+        reject_repeated_qualifier(&target_qual, &qualifier)?;
         scope.extend(aux_scope(&schema, &qualifier, &readable));
         from_plan = plan.map(Box::new);
         from_table = Some(schema);
@@ -1119,8 +1118,10 @@ pub(super) fn analyze_delete(
     super::dcl::require_table_privilege(catalog, &access, ast::Privilege::Delete)?;
     // As for UPDATE: every column of the target the statement reads needs SELECT on it.
     let readable = target_readable(&table, &access, catalog)?;
+    // As for UPDATE: the target goes by its alias, else by the table the statement names.
+    let target_qual = del.alias.clone().unwrap_or_else(|| access.name.clone());
     // RETURNING projects the deleted rows, resolved against the table's columns.
-    let returning = analyze_returning(&del.returning, &table, &readable, catalog)?;
+    let returning = analyze_returning(&del.returning, &table, &target_qual, &readable, catalog)?;
     // DELETE ... USING: resolve a single named source table and extend the scope, so the
     // WHERE may reference its columns (at ordinals `target_width + j` of `target ++ using`). Reuses
     // the same single-named-table resolution as UPDATE ... FROM.
@@ -1132,12 +1133,7 @@ pub(super) fn analyze_delete(
     // the alias, which shadows the table name — so build the target scope under the alias qualifier,
     // exactly as `UPDATE t AS x` does. Built via `base_scope` (ungated) so composite/enum columns
     // carry their type names — `(col).field` in the WHERE resolves exactly as in a SELECT.
-    let mut scope = base_scope(
-        &table,
-        del.alias.as_deref().unwrap_or(&table.name),
-        catalog,
-        false,
-    )?;
+    let mut scope = base_scope(&table, &target_qual, catalog, false)?;
     gate_target_scope(&mut scope, &readable);
     let mut using_table: Option<TableSchema> = None;
     let mut using_plan: Option<Box<SelectPlan>> = None;
@@ -1153,7 +1149,7 @@ pub(super) fn analyze_delete(
                 schema.name
             )));
         }
-        reject_repeated_qualifier(del.alias.as_deref().unwrap_or(&table.name), &qualifier)?;
+        reject_repeated_qualifier(&target_qual, &qualifier)?;
         scope.extend(aux_scope(&schema, &qualifier, &readable));
         using_plan = plan.map(Box::new);
         using_table = Some(schema);
@@ -1427,6 +1423,7 @@ pub(super) fn analyze_instead_of_insert(
     let returning = analyze_returning(
         &ins.returning,
         &schema,
+        &schema.name,
         &vec![true; schema.columns.len()],
         catalog,
     )?;
@@ -1535,6 +1532,7 @@ pub(super) fn analyze_instead_of_update(
     let returning = analyze_returning(
         &upd.returning,
         &schema,
+        &schema.name,
         &vec![true; schema.columns.len()],
         catalog,
     )?;
@@ -1575,6 +1573,7 @@ pub(super) fn analyze_instead_of_delete(
     let returning = analyze_returning(
         &del.returning,
         &schema,
+        &schema.name,
         &vec![true; schema.columns.len()],
         catalog,
     )?;

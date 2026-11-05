@@ -73,6 +73,23 @@ SELECT count(*) FROM ev WHERE region = 150
 ----
 0
 
+# The parent's name, or the statement's alias, qualifies the rows of every partition it reaches.
+statement ok
+UPDATE ev SET id = 9 WHERE ev.region = 10
+
+query II
+UPDATE ev AS e SET id = e.id + 1 WHERE e.region = 10 RETURNING e.id, e.region
+----
+10  10
+
+query I
+DELETE FROM ev WHERE ev.id = 10 RETURNING ev.region
+----
+10
+
+statement ok
+INSERT INTO ev VALUES (3, 10)
+
 # A partitioned parent has no rows of its own: TRUNCATE ONLY on it is refused rather than reported
 # as done, TRUNCATE ONLY on a partition empties that partition, and TRUNCATE on the parent empties
 # them all.

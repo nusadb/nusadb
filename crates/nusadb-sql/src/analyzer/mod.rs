@@ -2294,11 +2294,6 @@ pub(crate) struct ScopedColumn {
     select_granted: bool,
 }
 
-/// Build the scope for a single table (the common, non-join case).
-fn scope_of(table: &TableSchema) -> Vec<ScopedColumn> {
-    scope_of_aliased(table, &table.name)
-}
-
 /// Build a base-table `SELECT` scope, enriching each column with its user-defined composite type
 /// name (from the per-column composite catalog) so `(col).field` and composite comparisons can
 /// recognise a composite column whose physical type is `TEXT`. A non-composite column carries
@@ -2364,9 +2359,9 @@ fn column_select_grants(table: &TableSchema, catalog: &dyn Catalog) -> Result<Ve
         .collect()
 }
 
-/// Like [`scope_of`] but with an explicit `qualifier` (an alias) for the columns — for the secondary
-/// table of `UPDATE ... FROM` / `DELETE ... USING` / `MERGE`, where the same table may appear under
-/// an alias.
+/// The scope of a single table, its columns qualified by `qualifier` (the table's name or an
+/// alias): a write's target and its RETURNING, and the secondary table of `UPDATE ... FROM` /
+/// `DELETE ... USING` / `MERGE`, where the same table may appear under an alias.
 pub(crate) fn scope_of_aliased(table: &TableSchema, qualifier: &str) -> Vec<ScopedColumn> {
     table
         .columns
