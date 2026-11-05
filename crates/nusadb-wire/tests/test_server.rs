@@ -6351,3 +6351,139 @@ async fn int_and_date_tagged_parameters_meet_bigint_and_timestamp_columns() {
     drop(conn);
     handle.await.unwrap().unwrap();
 }
+
+/// A role granted privileges on a partitioned table reads and writes its partitions through it,
+/// over the wire, and COPY follows the same rule: loading through the parent needs `INSERT` on the
+/// parent only, reading a partition by name needs a grant on that partition, and a table-wise copy
+/// of the partitioned table itself, which stores no rows, is refused in favour of the query form.
+#[tokio::test]
+async fn a_partitioned_table_is_accessed_through_the_grants_on_it() {
+    /// Drain a simple query to its `ReadyForQuery`, returning its error message, if any, and the
+    /// rows it sent as text.
+    async fn run(
+        conn: &mut Connection<tokio::io::DuplexStream>,
+        sql: &str,
+    ) -> Result<Vec<String>, String> {
+        query(conn, sql).await;
+        let mut rows = Vec::new();
+        let mut error = None;
+        loop {
+            match next(conn).await {
+                BackendMessage::Error { message, .. } => error = Some(message),
+                BackendMessage::DataRow { values } => rows.push(
+                    values
+                        .iter()
+                        .map(|v| {
+                            v.as_deref()
+                                .map_or_else(|| "NULL".into(), String::from_utf8_lossy)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                BackendMessage::CopyData { data } => {
+                    rows.push(String::from_utf8_lossy(&data).into_owned());
+                },
+                BackendMessage::ReadyForQuery(_) => break,
+                _ => {},
+            }
+        }
+        error.map_or(Ok(rows), Err)
+    }
+
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::spawn(handle_client(server, Arc::clone(&engine)));
+    let mut conn = Connection::new(client);
+    conn.write_frame(
+        &FrontendMessage::Startup {
+            major: 1,
+            minor: 0,
+            user: "nusadb-root".to_owned(),
+            database: "d".to_owned(),
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next(&mut conn).await, BackendMessage::AuthOk);
+    consume_until_ready(&mut conn).await;
+
+    for sql in [
+        "CREATE TABLE g (g_id BIGINT NOT NULL, d DATE NOT NULL, v BIGINT NOT NULL) PARTITION BY \
+         RANGE (d)",
+        "CREATE TABLE g_p202610 PARTITION OF g FOR VALUES FROM ('2026-10-01') TO ('2026-11-01')",
+        "CREATE TABLE g_p202611 PARTITION OF g FOR VALUES FROM ('2026-11-01') TO ('2026-12-01')",
+        "INSERT INTO g VALUES (1, '2026-10-05', 1)",
+        "CREATE ROLE probe_app LOGIN",
+        "GRANT SELECT, INSERT, UPDATE ON g TO probe_app",
+        "SET ROLE probe_app",
+    ] {
+        run(&mut conn, sql)
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+    }
+
+    assert_eq!(
+        run(&mut conn, "SELECT g_id FROM g ORDER BY g_id").await,
+        Ok(vec!["1".to_owned()])
+    );
+    run(&mut conn, "UPDATE g SET v = 2 WHERE g_id = 1")
+        .await
+        .unwrap();
+
+    // COPY FROM through the parent routes the rows to the partitions.
+    query(&mut conn, "COPY g FROM STDIN").await;
+    assert!(matches!(
+        next(&mut conn).await,
+        BackendMessage::CopyInResponse { .. }
+    ));
+    conn.write_frame(
+        &FrontendMessage::CopyData {
+            data: b"2\t2026-10-06\t3\n3\t2026-11-06\t4\n".to_vec(),
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    conn.write_frame(&FrontendMessage::CopyDone.encode().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(next(&mut conn).await, cc("COPY 2"));
+    assert_eq!(
+        next(&mut conn).await,
+        BackendMessage::ReadyForQuery(TxnStatus::Idle)
+    );
+    assert_eq!(
+        run(
+            &mut conn,
+            "COPY (SELECT g_id, v FROM g ORDER BY g_id) TO STDOUT"
+        )
+        .await,
+        Ok(vec!["1\t2\n2\t3\n3\t4\n".to_owned()])
+    );
+
+    // A table-wise copy of the partitioned table would put out nothing: refused.
+    let refused = run(&mut conn, "COPY g TO STDOUT").await.unwrap_err();
+    assert!(
+        refused.contains("cannot copy from partitioned table"),
+        "{refused}"
+    );
+
+    // Naming a partition directly needs a grant on it.
+    for sql in [
+        "SELECT g_id FROM g_p202610",
+        "UPDATE g_p202610 SET v = 0",
+        "COPY g_p202610 TO STDOUT",
+    ] {
+        let denied = run(&mut conn, sql).await.unwrap_err();
+        assert!(denied.contains("permission denied"), "{sql}: {denied}");
+    }
+
+    conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
+        .await
+        .unwrap();
+    drop(conn);
+    handle.await.unwrap().unwrap();
+}

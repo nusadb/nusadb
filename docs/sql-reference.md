@@ -857,7 +857,22 @@ Worth knowing:
   takes its column's type. The partition key may therefore come from a default too. The planner
   prunes partitions using `WHERE` conditions of the shape `key = / < / <= / > / >= constant` and
   `key BETWEEN a AND b`, which shows in `EXPLAIN` as fewer scanned partitions.
-- `DROP TABLE` on the parent drops the whole partition tree with it.
+- `DROP TABLE` on the parent drops the whole partition tree with it, and `TRUNCATE` on the parent
+  empties every partition.
+- Privileges are checked on the table a statement names. A role granted `SELECT`, `INSERT`,
+  `UPDATE`, `DELETE` or `TRUNCATE` on the parent (or `SELECT` / `UPDATE` on some of its columns)
+  reads and writes every partition through it, including `INSERT ... ON CONFLICT`, an `UPDATE`
+  that moves a row to another partition, `COPY ... FROM` and a foreign key check, without any grant
+  on the partitions. Naming a partition directly, anywhere in a statement, checks the partition's
+  own grants: a grant on the parent does not open its partitions to direct access, and a grant on a
+  partition does not open the parent.
+- Row-level security works the same way: a statement on the parent applies the parent's policies to
+  the rows of every partition, and a partition's own policies apply only when the partition is
+  named directly. That includes a partition named inside a statement on the parent, such as in a
+  subquery of an `UPDATE` on the parent or in one of the parent's policies: it is read under its
+  own grants and policies.
+- `COPY parent TO STDOUT` is refused (`42809`), since the parent stores no rows of its own; use
+  `COPY (SELECT ... FROM parent) TO STDOUT`.
 - Parent and partitions may live in different schemas; qualified names work everywhere.
 
 A partition created with `PARTITION OF` takes everything the parent declares about its columns:
@@ -1007,7 +1022,13 @@ SELECT name FROM ONLY cities;                 -- Bandung
 UPDATE cities SET pop = pop + 1;              -- reaches capitals too
 UPDATE ONLY cities SET pop = 0;               -- just the parent's own rows
 DELETE FROM cities WHERE pop = 0;             -- likewise propagates; ONLY restricts
+TRUNCATE cities;                              -- empties capitals too
+TRUNCATE ONLY cities;                         -- just the parent's own rows
 ```
+
+As for a partitioned table, a statement on the parent is checked against the parent's privileges
+and applies the parent's row-level security policies to every descendant's rows; a child named
+directly, even inside a statement on the parent, is checked against its own grants and policies.
 
 A child may redeclare an inherited column only with the same type; `NOT NULL` holds only if every
 copy has it. Dropping a parent that still has children is refused (`2BP01`); `DROP TABLE ...

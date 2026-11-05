@@ -849,10 +849,10 @@ pub struct DropSequence {
     pub if_exists: bool,
 }
 
-/// `TRUNCATE [TABLE] name [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT]`.
+/// `TRUNCATE [TABLE] [ONLY] name [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT]`.
 ///
-/// Only a single-table form is modelled. Multi-table truncation, `ONLY`, and
-/// partition lists are out of scope for the v1 parser surface and rejected with
+/// Only a single-table form is modelled. Multi-table truncation and partition lists are out of
+/// scope for the v1 parser surface and rejected with
 /// [`Error::Unsupported`](crate::error::Error::Unsupported).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TruncateTable {
@@ -861,6 +861,8 @@ pub struct TruncateTable {
     pub schema: Option<String>,
     /// Target table name (the last, unqualified component).
     pub name: String,
+    /// `ONLY`: empty the named table alone, not the tables that inherit from it.
+    pub only: bool,
     /// `true` = `RESTART IDENTITY`, `false` = `CONTINUE IDENTITY` or unspecified.
     pub restart_identity: bool,
     /// `true` = `CASCADE`: also empty every table that references this one through a FOREIGN

@@ -1164,18 +1164,14 @@ pub(super) fn convert_sequence_option(
 
 // === TRUNCATE =============================================================
 
-/// Lower `TRUNCATE [TABLE] name [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT]`.
-/// Only a single-table, non-partitioned form is modelled.
+/// Lower `TRUNCATE [TABLE] [ONLY] name [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE |
+/// RESTRICT]`. Only a single-table, non-partitioned form is modelled.
 pub(super) fn convert_truncate(
     table_names: &[sql::TruncateTableTarget],
     has_partitions: bool,
-    only: bool,
     identity: Option<&sql::TruncateIdentityOption>,
     cascade: Option<&sql::CascadeOption>,
 ) -> Result<ast::TruncateTable, Error> {
-    if only {
-        return unsupported("TRUNCATE TABLE ONLY");
-    }
     if has_partitions {
         return unsupported("TRUNCATE TABLE with PARTITION");
     }
@@ -1191,6 +1187,7 @@ pub(super) fn convert_truncate(
             Ok(ast::TruncateTable {
                 schema,
                 name,
+                only: one.only,
                 restart_identity,
                 cascade,
             })

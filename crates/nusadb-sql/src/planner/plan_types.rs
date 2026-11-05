@@ -2172,6 +2172,9 @@ pub struct TruncateCascadePlan {
     pub schema: String,
     /// Target table name.
     pub table: String,
+    /// `TRUNCATE ONLY`: the named table alone. Without it, the tables that inherit from it (the
+    /// partitions of a partitioned table) are emptied too.
+    pub only: bool,
     /// `TRUNCATE ... RESTART IDENTITY`, applied to every table in the cascade closure — not just
     /// the one named in the statement, since every one of them is emptied by this same statement.
     pub restart_identity: bool,

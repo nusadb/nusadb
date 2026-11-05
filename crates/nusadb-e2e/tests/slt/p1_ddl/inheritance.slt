@@ -116,6 +116,42 @@ SELECT count(*) FROM cities WHERE name = 'Jakarta'
 ----
 0
 
+# TRUNCATE on a parent empties its descendants too; TRUNCATE ONLY empties the parent's own rows and
+# leaves the descendants' rows alone.
+statement ok
+CREATE TABLE tp (a INT)
+
+statement ok
+CREATE TABLE tc (b INT) INHERITS (tp)
+
+statement ok
+INSERT INTO tp VALUES (1)
+
+statement ok
+INSERT INTO tc VALUES (2, 20)
+
+statement ok
+TRUNCATE ONLY tp
+
+query I
+SELECT a FROM tp ORDER BY a
+----
+2
+
+statement ok
+INSERT INTO tp VALUES (1)
+
+statement ok
+TRUNCATE tp
+
+query I
+SELECT count(*) FROM tp
+----
+0
+
+statement ok
+DROP TABLE tp CASCADE
+
 # Dropping an inheritance parent that still has children is refused without CASCADE (the children
 # are independent tables that would be orphaned); CASCADE drops them, transitively.
 statement error

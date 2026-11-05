@@ -2949,6 +2949,25 @@ pub(super) fn run_copy_to(
     }
 
     let table = lookup_copy_table(copy, engine, txn)?;
+    // A partitioned table stores no rows of its own, so copying it table-wise would put out
+    // nothing: refused, as the reference engine does, in favour of `COPY (SELECT ...) TO`, which
+    // reads the partitions through the table (and is checked as a query on it).
+    if super::partition::has_any(engine, txn)?
+        && super::partition::parent_key_parts(
+            engine,
+            txn,
+            &crate::analyzer::qualified_display(&table.schema, &table.name),
+        )?
+        .is_some()
+    {
+        return Err(Error::Coded {
+            message: format!(
+                "cannot copy from partitioned table \"{}\"; use COPY (SELECT ...) TO",
+                table.name
+            ),
+            sqlstate: "42809", // wrong_object_type
+        });
+    }
     let columns = resolve_copy_columns(copy, &table)?;
     let rows = scan_rows(&table, engine, txn)?;
     let names: Vec<&str> = columns
@@ -6925,6 +6944,24 @@ pub(super) fn run_truncate(
     // table it just resolved.
     let mut by_id: HashMap<nusadb_core::TableId, TableSchema> = HashMap::new();
     by_id.insert(root.id, root.clone());
+    // The rows of a partitioned or inheritance parent include its descendants' rows, so they are
+    // emptied too, as part of the statement on the parent (whose privilege was checked), unless
+    // `ONLY` names the parent's own rows.
+    let mut roots = vec![root.id];
+    if !plan.only && super::inheritance::has_any(engine, txn)? {
+        for key in super::inheritance::descendants(
+            engine,
+            txn,
+            &crate::analyzer::qualified_display(&root.schema, &root.name),
+        )? {
+            let (schema, name) = crate::analyzer::split_qualified(&key);
+            let table = engine
+                .lookup_table_as_of_in(txn, schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA), name)?
+                .ok_or_else(|| Error::TableNotFound { name: key.clone() })?;
+            roots.push(table.id);
+            by_id.insert(table.id, table);
+        }
+    }
     let order = if plan.cascade {
         for (schema, name) in engine.list_tables_qualified_as_of(txn)? {
             if let Some(table) = engine.lookup_table_as_of_in(txn, &schema, &name)? {
@@ -6933,10 +6970,12 @@ pub(super) fn run_truncate(
         }
         let mut visited = HashSet::new();
         let mut order = Vec::new();
-        collect_cascade_closure(root.id, engine, txn, &mut visited, &mut order)?;
+        for id in &roots {
+            collect_cascade_closure(*id, engine, txn, &mut visited, &mut order)?;
+        }
         order
     } else {
-        vec![root.id]
+        roots
     };
     // A closure member that cannot be resolved is an error, never a skip: silently truncating
     // only part of the closure would report success for work that was not done.

@@ -46,6 +46,7 @@ mod dml;
 mod expr;
 mod select;
 mod typecheck;
+mod via_parent;
 mod window;
 use ddl::*;
 use dml::*;
@@ -1083,6 +1084,7 @@ pub fn analyze(stmt: ast::Statement, catalog: &dyn Catalog) -> Result<LogicalPla
             Ok(LogicalPlan::TruncateCascade(TruncateCascadePlan {
                 schema: table.schema,
                 table: table.name,
+                only: t.only,
                 restart_identity: t.restart_identity,
                 cascade: t.cascade,
             }))

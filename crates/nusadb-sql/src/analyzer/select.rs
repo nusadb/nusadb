@@ -234,12 +234,19 @@ fn analyze_set_op_table(so: ast::SetOperation, catalog: &dyn Catalog) -> Result<
 /// Expand a query on an inheritance parent into a `SELECT <cols> FROM ONLY parent UNION ALL SELECT
 /// <cols> FROM ONLY d1 UNION ALL ...` over the parent and each descendant, projected to the parent's
 /// columns by name (so a descendant's extra columns drop and the order is the parent's). Each branch
-/// scans `ONLY` its table — no re-expansion — and is analyzed as an ordinary `SELECT`, so per-table
-/// privilege and row-level security apply per branch. The result is inlined like a derived table.
+/// scans `ONLY` its table, so none is expanded again. The branches are reached through the parent:
+/// their privileges are the parent's, which the caller checks, and the parent's row-level security
+/// filters every branch. The result is inlined like a derived table.
+///
+/// `cover_parent` says the caller checks the query's column reads against the parent itself, so the
+/// generated read of every column of the parent's own branch is not checked again. A caller that
+/// does not check the parent's columns passes `false`, and the parent's branch then needs SELECT on
+/// every column of the parent.
 fn expand_inheritance(
     parent: &TableSchema,
     descendants: &[String],
     branch_filter: Option<&ast::Expr>,
+    cover_parent: bool,
     catalog: &dyn Catalog,
 ) -> Result<SelectPlan, Error> {
     let cols: Vec<String> = parent.columns.iter().map(|c| c.name.clone()).collect();
@@ -259,15 +266,62 @@ fn expand_inheritance(
             right: Box::new(branch(descendant)),
         };
     }
-    analyze_set_op_table(
+    // The branches are reached through the parent, whose privileges the enclosing query checks
+    // (per column, against the columns it really reads). The generated branches name their own
+    // table and nothing else, so the name-keyed answers of `ViaParent` reach no other reference.
+    let via_parent = super::via_parent::ViaParent::new(catalog, parent, descendants, cover_parent);
+    let mut plan = analyze_set_op_table(
         ast::SetOperation {
             with: Vec::new(),
             body,
             order_by: Vec::new(),
             limit: None,
         },
-        catalog,
-    )
+        &via_parent,
+    )?;
+    // The parent's row-level security covers every branch's rows. Its policies are analyzed under
+    // the plain catalog, so a table a policy reads is checked and filtered as itself.
+    if !catalog.is_superuser() && catalog.rls_enabled(&parent.schema, &parent.name)? {
+        let set_op = plan.set_op_source.as_deref_mut().ok_or_else(|| {
+            Error::Internal("an inheritance expansion analyzed without its union".to_owned())
+        })?;
+        add_parent_rls(&mut set_op.tree, parent, catalog)?;
+    }
+    Ok(plan)
+}
+
+/// AND the parent's `SELECT` policies into the `WHERE` of every branch of its expansion. A branch
+/// reads one table whose columns include the parent's, so a policy written against the parent
+/// resolves against the branch's row, under the parent's name.
+fn add_parent_rls(
+    tree: &mut SetOpTree<SelectPlan>,
+    parent: &TableSchema,
+    catalog: &dyn Catalog,
+) -> Result<(), Error> {
+    match tree {
+        SetOpTree::Leaf(branch) => {
+            let table = branch.table.as_ref().ok_or_else(|| {
+                Error::Internal("an inheritance branch analyzed without its table".to_owned())
+            })?;
+            let scope = super::base_scope(table, &parent.name, catalog, false)?;
+            let policy = build_rls_predicate(
+                &parent.schema,
+                &parent.name,
+                ast::PolicyCommand::Select,
+                &scope,
+                catalog,
+            )?;
+            branch.filter = Some(match branch.filter.take() {
+                None => policy,
+                Some(existing) => and_exprs(existing, policy),
+            });
+            Ok(())
+        },
+        SetOpTree::Node { left, right, .. } => {
+            add_parent_rls(left, parent, catalog)?;
+            add_parent_rls(right, parent, catalog)
+        },
+    }
 }
 
 /// The conjuncts of `filter` (the query's `WHERE`) that each branch of an inheritance expansion can
@@ -727,7 +781,7 @@ fn resolve_join_input(
         let descendants = catalog
             .inheritance_descendants(&super::qualified_display(&schema.schema, &schema.name))?;
         if !descendants.is_empty() {
-            let plan = expand_inheritance(&schema, &descendants, None, catalog)?;
+            let plan = expand_inheritance(&schema, &descendants, None, true, catalog)?;
             return Ok((schema, Some(Box::new(plan))));
         }
     }
@@ -802,7 +856,9 @@ pub(super) fn resolve_aux_relation(
             let descendants = catalog
                 .inheritance_descendants(&super::qualified_display(&schema.schema, &schema.name))?;
             if !descendants.is_empty() {
-                let plan = expand_inheritance(&schema, &descendants, None, catalog)?;
+                // The source's columns are not checked one by one where the statement reads them,
+                // so the parent's branch is checked for all of them.
+                let plan = expand_inheritance(&schema, &descendants, None, false, catalog)?;
                 return Ok((schema, Some(plan)));
             }
         }
@@ -937,6 +993,7 @@ pub(super) fn resolve_from(
                         &schema,
                         &kept,
                         pushed.as_ref(),
+                        true,
                         catalog,
                     )?)
                 }

@@ -735,20 +735,25 @@ fn reject_inheritance_write(
 
 /// Analyze an `UPDATE`, propagating to inheritance/partition descendants when the target is a parent
 /// and `ONLY` was not given: the write becomes the parent's own (`ONLY`) update plus one
-/// `UPDATE ONLY <descendant>` sub-plan per transitive descendant, each analyzed in its own right (so
-/// each table's own row-level security and column resolution apply). An ordinary/`ONLY`/non-parent
-/// update analyzes as a single table.
+/// `UPDATE ONLY <descendant>` sub-plan per transitive descendant. Each sub-plan's target is reached
+/// through the parent, so its privileges and row-level security are the parent's; every other
+/// table the statement reads (a subquery, a `FROM` source, a policy), including the same
+/// descendant named again, is checked as itself. An ordinary/`ONLY`/non-parent update analyzes as a
+/// single table.
 pub(super) fn analyze_update_stmt(
     upd: ast::Update,
     catalog: &dyn Catalog,
 ) -> Result<UpdatePlan, Error> {
     let descendants = write_descendants(upd.only, upd.schema.as_deref(), &upd.table, catalog)?;
     if descendants.is_empty() {
-        return analyze_update(upd, catalog);
+        return analyze_update(upd, catalog, None);
     }
     let mut parent = upd.clone();
     parent.only = true;
-    let mut plan = analyze_update(parent, catalog)?;
+    let mut plan = analyze_update(parent, catalog, None)?;
+    // Each descendant is reached through the parent: its target takes the parent's privileges and
+    // row-level security.
+    let parent_table = plan.table.clone();
     for descendant in descendants {
         // The descendant is a schema-qualified edge key; split it so the sub-plan targets exactly
         // the recorded table (not a search-path lookalike).
@@ -757,7 +762,7 @@ pub(super) fn analyze_update_stmt(
         sub.only = true;
         sub.schema = sub_schema.map(str::to_owned);
         sub_name.clone_into(&mut sub.table);
-        let mut sub_plan = analyze_update(sub, catalog)?;
+        let mut sub_plan = analyze_update(sub, catalog, Some(&parent_table))?;
         // Reached through the parent: a bound-leaving new image moves to its sibling partition.
         sub_plan.partition_via_parent = true;
         plan.propagate.push(sub_plan);
@@ -773,11 +778,13 @@ pub(super) fn analyze_delete_stmt(
 ) -> Result<DeletePlan, Error> {
     let descendants = write_descendants(del.only, del.schema.as_deref(), &del.table, catalog)?;
     if descendants.is_empty() {
-        return analyze_delete(del, catalog);
+        return analyze_delete(del, catalog, None);
     }
     let mut parent = del.clone();
     parent.only = true;
-    let mut plan = analyze_delete(parent, catalog)?;
+    let mut plan = analyze_delete(parent, catalog, None)?;
+    // As in `analyze_update_stmt`: each descendant's target is reached through the parent.
+    let parent_table = plan.table.clone();
     for descendant in descendants {
         // As in `analyze_update_stmt`: split the qualified edge key into the sub-plan's target.
         let (sub_schema, sub_name) = super::split_qualified(&descendant);
@@ -785,7 +792,8 @@ pub(super) fn analyze_delete_stmt(
         sub.only = true;
         sub.schema = sub_schema.map(str::to_owned);
         sub_name.clone_into(&mut sub.table);
-        plan.propagate.push(analyze_delete(sub, catalog)?);
+        plan.propagate
+            .push(analyze_delete(sub, catalog, Some(&parent_table))?);
     }
     Ok(plan)
 }
@@ -941,11 +949,18 @@ fn reject_repeated_qualifier(target: &str, source: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Analyze a single-table `UPDATE`. `via` is the parent the target is reached through, for a
+/// sub-plan of an `UPDATE` on that parent: the target then takes the parent's privileges and
+/// row-level security, and nothing else in the statement does.
 #[allow(
     clippy::too_many_lines,
     reason = "flat UPDATE analysis: RLS, assignment typing, FROM sources, RETURNING"
 )]
-pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<UpdatePlan, Error> {
+pub(super) fn analyze_update(
+    upd: ast::Update,
+    catalog: &dyn Catalog,
+    via: Option<&TableSchema>,
+) -> Result<UpdatePlan, Error> {
     // The system-catalog namespace is reserved: a user UPDATE of e.g. `nusadb_policies`
     // could widen a policy's USING predicate and bypass RLS.
     enforce_system_catalog(&upd.table, catalog)?;
@@ -966,9 +981,16 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
         "UPDATE",
         catalog,
     )?;
+    // The table whose privileges and row-level security govern the target.
+    let access = via.unwrap_or(&table).clone();
     // UPDATE needs the privilege on the table, or a column-scoped UPDATE grant on each SET column.
     let update_columns: Vec<&str> = upd.assignments.iter().map(|a| a.column.as_str()).collect();
-    super::dcl::require_column_privilege(catalog, &table, &update_columns, ast::Privilege::Update)?;
+    super::dcl::require_column_privilege(
+        catalog,
+        &access,
+        &update_columns,
+        ast::Privilege::Update,
+    )?;
     // A `WHERE` or `RETURNING` reads the target's rows to decide what to change or to hand back, so
     // it needs SELECT too. An unconditional `UPDATE t SET c = 1` reads nothing and needs only
     // UPDATE — the standard distinction, and the one that keeps a write-only role write-only. A
@@ -978,7 +1000,7 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
     if upd.filter.is_some() || !upd.returning.is_empty() {
         require_where_returning_read(
             catalog,
-            &table,
+            &access,
             upd.filter.as_ref(),
             &upd.returning,
             upd.from.is_some(),
@@ -1061,28 +1083,29 @@ pub(super) fn analyze_update(upd: ast::Update, catalog: &dyn Catalog) -> Result<
     // USING grant (AND-injected into the filter, like DELETE), and only to values their WITH CHECK
     // admit (`rls_check`, evaluated against each post-update row by the executor). Default-deny
     // FALSE on both sides when no policy applies.
-    let rls_check = if !catalog.is_superuser() && catalog.rls_enabled(&table.schema, &table.name)? {
-        let using = build_rls_predicate(
-            &table.schema,
-            &table.name,
-            ast::PolicyCommand::Update,
-            &scope,
-            catalog,
-        )?;
-        filter = Some(match filter {
-            None => using,
-            Some(existing) => and_exprs(existing, using),
-        });
-        Some(build_rls_check_predicate(
-            &table.schema,
-            &table.name,
-            ast::PolicyCommand::Update,
-            &scope,
-            catalog,
-        )?)
-    } else {
-        None
-    };
+    let rls_check =
+        if !catalog.is_superuser() && catalog.rls_enabled(&access.schema, &access.name)? {
+            let using = build_rls_predicate(
+                &access.schema,
+                &access.name,
+                ast::PolicyCommand::Update,
+                &scope,
+                catalog,
+            )?;
+            filter = Some(match filter {
+                None => using,
+                Some(existing) => and_exprs(existing, using),
+            });
+            Some(build_rls_check_predicate(
+                &access.schema,
+                &access.name,
+                ast::PolicyCommand::Update,
+                &scope,
+                catalog,
+            )?)
+        } else {
+            None
+        };
     Ok(UpdatePlan {
         table,
         from: from_table,
@@ -1122,7 +1145,13 @@ fn resolve_update_from(
     Ok((table, qualifier, plan))
 }
 
-pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<DeletePlan, Error> {
+/// Analyze a single-table `DELETE`. `via` is the parent the target is reached through, as for
+/// [`analyze_update`].
+pub(super) fn analyze_delete(
+    del: ast::Delete,
+    catalog: &dyn Catalog,
+    via: Option<&TableSchema>,
+) -> Result<DeletePlan, Error> {
     // The system-catalog namespace is reserved: a user DELETE on e.g. `nusadb_rls` would
     // switch row-level security off for the affected tables.
     enforce_system_catalog(&del.table, catalog)?;
@@ -1144,13 +1173,15 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
         "DELETE",
         catalog,
     )?;
-    super::dcl::require_table_privilege(catalog, &table, ast::Privilege::Delete)?;
+    // The table whose privileges and row-level security govern the target.
+    let access = via.unwrap_or(&table).clone();
+    super::dcl::require_table_privilege(catalog, &access, ast::Privilege::Delete)?;
     // As for UPDATE: a `WHERE` or `RETURNING` reads rows, so it additionally needs SELECT — satisfied
     // by a column-level grant when only granted columns are read, else table-wide.
     if del.filter.is_some() || !del.returning.is_empty() {
         require_where_returning_read(
             catalog,
-            &table,
+            &access,
             del.filter.as_ref(),
             &del.returning,
             del.using.is_some(),
@@ -1208,10 +1239,10 @@ pub(super) fn analyze_delete(del: ast::Delete, catalog: &dyn Catalog) -> Result<
     // Row-level security: a non-superuser may only delete rows the DELETE/ALL policies grant.
     // DELETE has no WITH CHECK, so injecting the USING predicate is complete (default-deny FALSE
     // when no policy applies, like SELECT).
-    if !catalog.is_superuser() && catalog.rls_enabled(&table.schema, &table.name)? {
+    if !catalog.is_superuser() && catalog.rls_enabled(&access.schema, &access.name)? {
         let policy = build_rls_predicate(
-            &table.schema,
-            &table.name,
+            &access.schema,
+            &access.name,
             ast::PolicyCommand::Delete,
             &scope,
             catalog,
@@ -1886,7 +1917,7 @@ fn update_through_view(
     upd.filter = and_filters(upd.filter.take(), view.filter);
     upd.schema = view.base_schema;
     upd.table = view.base_table;
-    let mut plan = analyze_update(upd, catalog)?;
+    let mut plan = analyze_update(upd, catalog, None)?;
     // WITH CHECK OPTION: each post-update row must still be visible through the view (satisfy its
     // `WHERE`), enforced against the post-update row at execution.
     if check_option {
@@ -1916,5 +1947,5 @@ fn delete_through_view(
     del.filter = and_filters(del.filter.take(), view.filter);
     del.schema = view.base_schema;
     del.table = view.base_table;
-    analyze_delete(del, catalog)
+    analyze_delete(del, catalog, None)
 }

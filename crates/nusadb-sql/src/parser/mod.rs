@@ -6145,12 +6145,11 @@ pub(super) fn convert_statement(stmt: sql::Statement) -> Result<ast::Statement, 
             if t.on_cluster.is_some() {
                 return unsupported("TRUNCATE ... ON CLUSTER");
             }
-            // sqlparser 0.62 no longer models `ONLY` on TRUNCATE; `t.table` (the optional `TABLE`
-            // keyword) is cosmetic.
+            // `ONLY` is modelled per target table; `t.table` (the optional `TABLE` keyword) is
+            // cosmetic.
             convert_truncate(
                 &t.table_names,
                 t.partitions.is_some(),
-                false,
                 t.identity.as_ref(),
                 t.cascade.as_ref(),
             )
