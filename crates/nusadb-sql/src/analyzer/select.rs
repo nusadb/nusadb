@@ -1305,6 +1305,16 @@ fn combine_rls_policies(
     pick: impl Fn(&PolicyDef) -> Option<String>,
 ) -> Result<TypedExpr, Error> {
     let user = catalog.current_user();
+    // A policy reads the row on the table's terms, not the session's: the session needs no SELECT
+    // on the columns a policy predicate reads (it may hold a column grant that leaves them out).
+    let scope: Vec<ScopedColumn> = scope
+        .iter()
+        .map(|col| ScopedColumn {
+            select_granted: true,
+            ..col.clone()
+        })
+        .collect();
+    let scope = scope.as_slice();
     let mut permissive: Option<TypedExpr> = None;
     let mut restrictive: Option<TypedExpr> = None;
     for policy in catalog.lookup_policies(schema, table)? {

@@ -2589,8 +2589,12 @@ fn resolve_scoped_or_outer(
             let stack = stack.borrow();
             let barrier = OUTER_BARRIER.get();
             for (depth, frame) in stack.iter().enumerate().rev() {
-                let Ok((ordinal, ty)) = resolve_scoped(frame, qualifier, name) else {
-                    continue;
+                let (ordinal, ty) = match resolve_scoped(frame, qualifier, name) {
+                    Ok(found) => found,
+                    // The column is there but the session may not read it: a permission error,
+                    // not a column the query does not have.
+                    Err(denied @ Error::PermissionDenied(_)) => return Err(denied),
+                    Err(_) => continue,
                 };
                 // Below the barrier the column does exist, and this reference is refused on
                 // purpose rather than because it could not be executed — say so, instead of

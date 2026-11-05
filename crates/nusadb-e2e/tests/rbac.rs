@@ -163,6 +163,18 @@ impl Catalog for RbacCatalog<'_> {
     fn lookup_view_columns(&self, name: &str) -> Result<Vec<String>, nusadb_sql::Error> {
         self.with_txn(|txn| nusadb_sql::lookup_view_columns(self.engine, txn, name))
     }
+
+    fn rls_enabled(&self, schema: &str, name: &str) -> Result<bool, nusadb_sql::Error> {
+        self.with_txn(|txn| nusadb_sql::rls_table_enabled(self.engine, txn, schema, name))
+    }
+
+    fn lookup_policies(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Vec<nusadb_sql::PolicyDef>, nusadb_sql::Error> {
+        self.with_txn(|txn| nusadb_sql::lookup_policies_for(self.engine, txn, schema, name))
+    }
 }
 
 /// The bootstrap superuser, used for every setup statement.
@@ -1044,11 +1056,78 @@ fn column_select_grant_satisfies_a_filtered_update() {
         "clerk",
         "UPDATE t SET b = 5 WHERE a = 1 RETURNING *",
     );
-    // A subquery predicate is indeterminate, so it conservatively falls back to table-wide SELECT.
-    denied_as(
+    // A subquery that reads only the granted column is covered too.
+    ok_as(
         &engine,
         "clerk",
         "UPDATE t SET b = 5 WHERE a = (SELECT max(a) FROM t)",
+    );
+}
+
+/// A column of the target read on the right-hand side of a `SET`, or in a subquery correlated to
+/// the target row, needs SELECT on it like a column read in the `WHERE`.
+#[test]
+fn column_reads_anywhere_in_a_write_need_select_on_the_column() {
+    let engine = column_fixture();
+    root(&engine, "CREATE TABLE o (x INT)");
+    root(&engine, "INSERT INTO o VALUES (99)");
+    root(&engine, "GRANT SELECT ON o TO clerk");
+    root(&engine, "GRANT UPDATE (b), DELETE ON t TO clerk");
+    root(&engine, "GRANT SELECT (a) ON t TO clerk");
+    for sql in [
+        "UPDATE t SET b = CASE WHEN secret = 99 THEN 1 ELSE 0 END",
+        "UPDATE t SET b = secret",
+        "UPDATE t AS x SET b = x.secret",
+        "UPDATE t SET b = b + 1",
+        "UPDATE t SET b = 1 RETURNING b",
+        "UPDATE t SET b = 1 WHERE EXISTS (SELECT 1 FROM o WHERE o.x = t.secret)",
+        "DELETE FROM t WHERE EXISTS (SELECT 1 FROM o WHERE o.x = t.secret)",
+    ] {
+        denied_as(&engine, "clerk", sql);
+    }
+    assert_eq!(
+        rows(ok_as(&engine, ROOT, "SELECT a, b, secret FROM t")),
+        vec![vec![Value::Int(1), Value::Int(2), Value::Int(99)]]
+    );
+    // What reads only the granted column, or no column of the target, needs nothing more.
+    ok_as(&engine, "clerk", "UPDATE t SET b = a + 1");
+    ok_as(
+        &engine,
+        "clerk",
+        "UPDATE t SET b = 2 WHERE (SELECT count(*) FROM o) = 1 RETURNING a",
+    );
+    assert_eq!(
+        rows(ok_as(&engine, ROOT, "SELECT a, b, secret FROM t")),
+        vec![vec![Value::Int(1), Value::Int(2), Value::Int(99)]]
+    );
+    ok_as(
+        &engine,
+        "clerk",
+        "DELETE FROM t WHERE a = (SELECT max(a) FROM t)",
+    );
+    assert!(rows(ok_as(&engine, ROOT, "SELECT a FROM t")).is_empty());
+}
+
+/// A row-level-security policy reads the columns it names on the table's terms: a role whose
+/// column grant leaves them out is filtered by the policy, not refused.
+#[test]
+fn a_policy_reads_columns_outside_a_column_grant() {
+    let engine = column_fixture();
+    root(&engine, "INSERT INTO t VALUES (2, 3, 0)");
+    root(&engine, "GRANT SELECT (a, b), UPDATE (b) ON t TO clerk");
+    root(&engine, "ALTER TABLE t ENABLE ROW LEVEL SECURITY");
+    root(&engine, "CREATE POLICY visible ON t USING (secret = 99)");
+    assert_eq!(
+        rows(ok_as(&engine, "clerk", "SELECT a FROM t")),
+        vec![vec![Value::Int(1)]]
+    );
+    ok_as(&engine, "clerk", "UPDATE t SET b = 7 WHERE a > 0");
+    assert_eq!(
+        rows(ok_as(&engine, ROOT, "SELECT a, b FROM t ORDER BY a")),
+        vec![
+            vec![Value::Int(1), Value::Int(7)],
+            vec![Value::Int(2), Value::Int(3)]
+        ]
     );
 }
 

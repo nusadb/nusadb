@@ -42,7 +42,12 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
         .collect();
     super::dcl::require_column_privilege(catalog, &table, &insert_columns, ast::Privilege::Insert)?;
     // RETURNING projects the inserted rows: resolve it against the table's columns.
-    let returning = analyze_returning(&ins.returning, &table, catalog)?;
+    let returning = analyze_returning(
+        &ins.returning,
+        &table,
+        &vec![true; table.columns.len()],
+        catalog,
+    )?;
     // `ON CONFLICT`: `DO NOTHING` skips conflicting rows; `DO UPDATE` upserts the existing
     // row. Resolved against the target table (DO UPDATE also resolves the arbiter + EXCLUDED scope).
     let on_conflict = match ins.on_conflict {
@@ -310,17 +315,21 @@ fn reject_conflict_subquery(expr: &TypedExpr) -> Result<(), Error> {
 
 /// Resolve a `RETURNING` clause against the affected table's columns. The scope is the
 /// affected row (every column of `table`, in table order), so `RETURNING *` and `RETURNING col`
-/// resolve like a single-table projection. Aggregates are not meaningful over a per-row `RETURNING`
-/// and are rejected. An empty clause yields an empty projection (the caller returns a row count).
+/// resolve like a single-table projection; `readable` (parallel to the columns) says which of them
+/// the session may `SELECT`, and a reference to any other is refused. Aggregates are not meaningful
+/// over a per-row `RETURNING` and are rejected. An empty clause yields an empty projection (the
+/// caller returns a row count).
 pub(super) fn analyze_returning(
     returning: &[ast::SelectItem],
     table: &TableSchema,
+    readable: &[bool],
     catalog: &dyn Catalog,
 ) -> Result<Vec<Projection>, Error> {
     if returning.is_empty() {
         return Ok(Vec::new());
     }
-    let scope = scope_of(table);
+    let mut scope = scope_of(table);
+    gate_target_scope(&mut scope, readable);
     let mut aggregates = Vec::new();
     let source_len = scope.len();
     let projection = analyze_projection(
@@ -798,140 +807,35 @@ pub(super) fn analyze_delete_stmt(
     Ok(plan)
 }
 
-/// Collect the column names a raw expression *reads*, appending them to `out`.
-///
-/// Returns `None` (indeterminate) for a subquery, a correlated construct, or any variant not walked
-/// here — the caller must then widen to a table-wide SELECT check. This is deliberately conservative:
-/// `None` can only *widen* the privilege required, never narrow it, so a construct this walk does not
-/// understand can never let a read slip through unchecked.
-fn collect_read_columns(expr: &ast::Expr, out: &mut HashSet<String>) -> Option<()> {
-    use ast::Expr as E;
-    match expr {
-        // Insert the name VERBATIM — it is already in the parser's `fold_ident` form (unquoted names
-        // lowercased, quoted names case-preserved), the exact form the catalog columns and column
-        // grants are keyed on. Re-folding here (e.g. lowercasing) would let a read of a quoted
-        // `"SECRET"` be matched against a grant on `secret`: a privilege bypass.
-        E::Column(name) => {
-            out.insert(name.clone());
-        },
-        E::QualifiedColumn { column, .. } => {
-            out.insert(column.clone());
-        },
-        E::Literal(_) => {},
-        E::Binary { left, right, .. } | E::IsDistinctFrom { left, right, .. } => {
-            collect_read_columns(left, out)?;
-            collect_read_columns(right, out)?;
-        },
-        E::Unary { expr, .. }
-        | E::IsNull { expr, .. }
-        | E::IsBool { expr, .. }
-        | E::Cast { expr, .. } => collect_read_columns(expr, out)?,
-        E::InList { expr, list, .. } => {
-            collect_read_columns(expr, out)?;
-            for e in list {
-                collect_read_columns(e, out)?;
-            }
-        },
-        E::Between {
-            expr, low, high, ..
-        } => {
-            collect_read_columns(expr, out)?;
-            collect_read_columns(low, out)?;
-            collect_read_columns(high, out)?;
-        },
-        E::Like { expr, pattern, .. } => {
-            collect_read_columns(expr, out)?;
-            collect_read_columns(pattern, out)?;
-        },
-        E::Case {
-            operand,
-            branches,
-            default,
-        } => {
-            if let Some(o) = operand {
-                collect_read_columns(o, out)?;
-            }
-            for b in branches {
-                collect_read_columns(&b.when, out)?;
-                collect_read_columns(&b.then, out)?;
-            }
-            if let Some(d) = default {
-                collect_read_columns(d, out)?;
-            }
-        },
-        E::Coalesce(args) | E::ScalarFunction { args, .. } => {
-            for a in args {
-                collect_read_columns(a, out)?;
-            }
-        },
-        // A subquery, quantified comparison, aggregate, composite-field access, or any construct not
-        // explicitly walked above is indeterminate — widen to a table-wide check.
-        _ => return None,
-    }
-    Some(())
-}
-
-/// The set of target-table column names a `WHERE` and `RETURNING` read, or `None` if it cannot be
-/// determined completely and safely (a subquery, a `RETURNING *` wildcard, or an unwalked construct).
-fn where_returning_read_columns(
-    filter: Option<&ast::Expr>,
-    returning: &[ast::SelectItem],
-) -> Option<HashSet<String>> {
-    let mut cols = HashSet::new();
-    if let Some(f) = filter {
-        collect_read_columns(f, &mut cols)?;
-    }
-    for item in returning {
-        match item {
-            ast::SelectItem::Expr { expr, .. } => collect_read_columns(expr, &mut cols)?,
-            // A wildcard reads every column; a partial column grant cannot cover it.
-            ast::SelectItem::Wildcard | ast::SelectItem::QualifiedWildcard(_) => return None,
-        }
-    }
-    Some(cols)
-}
-
-/// Raise the SELECT privilege that an `UPDATE`/`DELETE` `WHERE` or `RETURNING` needs to read the
-/// target's rows.
-///
-/// A column-level SELECT grant suffices when the predicate and RETURNING read only columns the grant
-/// covers, matching the reference engine — so collect exactly the target columns they read and
-/// require SELECT on each (a table-wide grant covers them all). The relaxation applies only when the
-/// read set is determined completely and safely: with a `FROM`/`USING` source in scope (a column may
-/// belong to another table), a subquery, a wildcard, or any unresolved column, it falls back to
-/// requiring table-wide SELECT — never a narrower check than before.
-fn require_where_returning_read(
-    catalog: &dyn Catalog,
+/// Whether the session may read each column of `table`, the target of a write whose privileges are
+/// those of `access` (the target itself, or the parent it is reached through), parallel to
+/// `table.columns`: a column is readable with SELECT on the column of `access` of the same name.
+fn target_readable(
     table: &TableSchema,
-    filter: Option<&ast::Expr>,
-    returning: &[ast::SelectItem],
-    has_aux_source: bool,
-) -> Result<(), Error> {
-    let columns = if has_aux_source {
-        None
-    } else {
-        where_returning_read_columns(filter, returning)
-    };
-    match columns {
-        // Fully determined: require SELECT on exactly the columns read. Every collected name must be
-        // a real target column (with no other table in scope, it can only be one) — if any is not,
-        // fall back to the table-wide check and let the analyzer surface the real column error.
-        Some(names)
-            if names
+    access: &TableSchema,
+    catalog: &dyn Catalog,
+) -> Result<Vec<bool>, Error> {
+    let grants = super::column_select_grants(access, catalog)?;
+    Ok(table
+        .columns
+        .iter()
+        .map(|c| {
+            access
+                .columns
                 .iter()
-                .all(|n| table.columns.iter().any(|c| &c.name == n)) =>
-        {
-            if names.is_empty() {
-                // The predicate/RETURNING reads no column values (e.g. `WHERE true`): nothing to
-                // gate, so no SELECT is required — the same as the reference engine.
-                Ok(())
-            } else {
-                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-                super::dcl::require_column_privilege(catalog, table, &refs, ast::Privilege::Select)
-            }
-        },
-        // Indeterminate, or a collected name that is not a target column: require table-wide SELECT.
-        _ => super::dcl::require_table_privilege(catalog, table, ast::Privilege::Select),
+                .zip(&grants)
+                .any(|(a, &granted)| granted && a.name == c.name)
+        })
+        .collect())
+}
+
+/// Mark each column of a write target's scope readable as far as `readable` (parallel to the
+/// target's columns, which lead the scope) allows, so a reference to a column the session may not
+/// `SELECT` is refused wherever the statement reads it: a `SET` expression, the `WHERE`, `RETURNING`
+/// or a subquery correlated to the target row.
+fn gate_target_scope(scope: &mut [ScopedColumn], readable: &[bool]) {
+    for (col, &granted) in scope.iter_mut().zip(readable) {
+        col.select_granted = granted;
     }
 }
 
@@ -991,23 +895,13 @@ pub(super) fn analyze_update(
         &update_columns,
         ast::Privilege::Update,
     )?;
-    // A `WHERE` or `RETURNING` reads the target's rows to decide what to change or to hand back, so
-    // it needs SELECT too. An unconditional `UPDATE t SET c = 1` reads nothing and needs only
-    // UPDATE — the standard distinction, and the one that keeps a write-only role write-only. A
-    // column-level SELECT grant satisfies the read when the predicate/RETURNING touch only the
-    // granted columns; an indeterminate read (subquery, `FROM` source, wildcard) requires table-wide
-    // SELECT.
-    if upd.filter.is_some() || !upd.returning.is_empty() {
-        require_where_returning_read(
-            catalog,
-            &access,
-            upd.filter.as_ref(),
-            &upd.returning,
-            upd.from.is_some(),
-        )?;
-    }
+    // Every column of the target the statement reads, in a SET expression, the WHERE, RETURNING or a
+    // correlated subquery, needs SELECT on it (table-wide or on the column). An unconditional
+    // `UPDATE t SET c = 1` reads nothing and needs only UPDATE, which keeps a write-only role
+    // write-only.
+    let readable = target_readable(&table, &access, catalog)?;
     // RETURNING projects the updated rows, resolved against the table's (post-update) columns.
-    let returning = analyze_returning(&upd.returning, &table, catalog)?;
+    let returning = analyze_returning(&upd.returning, &table, &readable, catalog)?;
     // UPDATE ... FROM: resolve a single named FROM table and extend the scope with it, so the
     // SET values and WHERE may reference its columns (at ordinals `target_width + j` of the
     // concatenated `target ++ from` row the executor evaluates against).
@@ -1025,6 +919,7 @@ pub(super) fn analyze_update(
         catalog,
         false,
     )?;
+    gate_target_scope(&mut scope, &readable);
     let mut from_table: Option<TableSchema> = None;
     let mut from_plan: Option<Box<SelectPlan>> = None;
     if let Some((qualifier, (schema, plan, readable))) = from {
@@ -1184,19 +1079,10 @@ pub(super) fn analyze_delete(
     // The table whose privileges and row-level security govern the target.
     let access = via.unwrap_or(&table).clone();
     super::dcl::require_table_privilege(catalog, &access, ast::Privilege::Delete)?;
-    // As for UPDATE: a `WHERE` or `RETURNING` reads rows, so it additionally needs SELECT — satisfied
-    // by a column-level grant when only granted columns are read, else table-wide.
-    if del.filter.is_some() || !del.returning.is_empty() {
-        require_where_returning_read(
-            catalog,
-            &access,
-            del.filter.as_ref(),
-            &del.returning,
-            del.using.is_some(),
-        )?;
-    }
+    // As for UPDATE: every column of the target the statement reads needs SELECT on it.
+    let readable = target_readable(&table, &access, catalog)?;
     // RETURNING projects the deleted rows, resolved against the table's columns.
-    let returning = analyze_returning(&del.returning, &table, catalog)?;
+    let returning = analyze_returning(&del.returning, &table, &readable, catalog)?;
     // DELETE ... USING: resolve a single named source table and extend the scope, so the
     // WHERE may reference its columns (at ordinals `target_width + j` of `target ++ using`). Reuses
     // the same single-named-table resolution as UPDATE ... FROM.
@@ -1214,6 +1100,7 @@ pub(super) fn analyze_delete(
         catalog,
         false,
     )?;
+    gate_target_scope(&mut scope, &readable);
     let mut using_table: Option<TableSchema> = None;
     let mut using_plan: Option<Box<SelectPlan>> = None;
     if let Some((qualifier, (schema, plan, readable))) = using {
@@ -1499,7 +1386,12 @@ pub(super) fn analyze_instead_of_insert(
             })
             .collect::<Result<_, _>>()?
     };
-    let returning = analyze_returning(&ins.returning, &schema, catalog)?;
+    let returning = analyze_returning(
+        &ins.returning,
+        &schema,
+        &vec![true; schema.columns.len()],
+        catalog,
+    )?;
     let null_for = |ty| TypedExpr {
         kind: crate::planner::TypedExprKind::Literal(ast::Value::Null),
         ty,
@@ -1602,7 +1494,12 @@ pub(super) fn analyze_instead_of_update(
         let value = super::analyze_expr(expr, &scope, catalog, Some(ty))?;
         assignments.push((pos, value));
     }
-    let returning = analyze_returning(&upd.returning, &schema, catalog)?;
+    let returning = analyze_returning(
+        &upd.returning,
+        &schema,
+        &vec![true; schema.columns.len()],
+        catalog,
+    )?;
     Ok(LogicalPlan::InsteadOfDml(Box::new(
         crate::planner::InsteadOfDmlPlan {
             view: schema,
@@ -1637,7 +1534,12 @@ pub(super) fn analyze_instead_of_delete(
         .as_ref()
         .map(|f| super::analyze_expr(f, &scope, catalog, Some(ColumnType::Bool)))
         .transpose()?;
-    let returning = analyze_returning(&del.returning, &schema, catalog)?;
+    let returning = analyze_returning(
+        &del.returning,
+        &schema,
+        &vec![true; schema.columns.len()],
+        catalog,
+    )?;
     Ok(LogicalPlan::InsteadOfDml(Box::new(
         crate::planner::InsteadOfDmlPlan {
             view: schema,
