@@ -6487,3 +6487,151 @@ async fn a_partitioned_table_is_accessed_through_the_grants_on_it() {
     drop(conn);
     handle.await.unwrap().unwrap();
 }
+
+/// A plan one connection cached is not served after another connection changes what the plan's
+/// checks decided: row-level security turned on or off, a policy created, altered or dropped, a
+/// grant or a column grant given or taken back, a role membership given or taken back. `SET ROLE`
+/// in the same connection does not reuse the plan made for the other role, and a `PREPARE`d
+/// statement follows the same rules.
+#[tokio::test]
+async fn a_cached_plan_follows_security_changes_made_by_another_connection() {
+    async fn connect(
+        engine: &Arc<dyn StorageEngine>,
+        user: &str,
+    ) -> (
+        Connection<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let handle = tokio::spawn(handle_client(server, Arc::clone(engine)));
+        let mut conn = Connection::new(client);
+        conn.write_frame(
+            &FrontendMessage::Startup {
+                major: 1,
+                minor: 0,
+                user: user.to_owned(),
+                database: "d".to_owned(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next(&mut conn).await, BackendMessage::AuthOk);
+        consume_until_ready(&mut conn).await;
+        (conn, handle)
+    }
+
+    /// Drain a simple query to its `ReadyForQuery`: the first column of each row as text, or the
+    /// error's SQLSTATE.
+    async fn run(
+        conn: &mut Connection<tokio::io::DuplexStream>,
+        sql: &str,
+    ) -> Result<String, String> {
+        query(conn, sql).await;
+        let mut rows = Vec::new();
+        let mut error = None;
+        loop {
+            match next(conn).await {
+                BackendMessage::Error { code, .. } => error = Some(code),
+                BackendMessage::DataRow { values } => rows.push(
+                    values[0]
+                        .as_deref()
+                        .map_or_else(|| "NULL".into(), String::from_utf8_lossy)
+                        .into_owned(),
+                ),
+                BackendMessage::ReadyForQuery(_) => break,
+                _ => {},
+            }
+        }
+        error.map_or_else(|| Ok(rows.join(",")), Err)
+    }
+
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let (mut root, root_handle) = connect(&engine, "nusadb-root").await;
+    for sql in [
+        "CREATE TABLE t (id INT, owner TEXT)",
+        "INSERT INTO t VALUES (1, 'alice'), (2, 'bob')",
+        "CREATE ROLE alice LOGIN",
+        "CREATE ROLE readers",
+        "CREATE ROLE limited",
+        "GRANT limited TO alice",
+        "GRANT SELECT ON t TO alice",
+    ] {
+        run(&mut root, sql)
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+    }
+    let (mut alice, alice_handle) = connect(&engine, "alice").await;
+    let q = "SELECT id FROM t ORDER BY id";
+    // Each step runs as root, then alice queries twice: the first run may plan afresh, the second
+    // would be served from her connection's cache.
+    let steps: [(&[&str], Result<&str, &str>); 11] = [
+        (&[], Ok("1,2")),
+        (
+            &[
+                "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+                "CREATE POLICY own ON t USING (owner = current_user)",
+            ],
+            Ok("1"),
+        ),
+        (
+            &["ALTER POLICY own ON t USING (owner <> current_user)"],
+            Ok("2"),
+        ),
+        (&["DROP POLICY own ON t"], Ok("")),
+        (
+            &["CREATE POLICY own ON t USING (owner = current_user)"],
+            Ok("1"),
+        ),
+        (&["ALTER TABLE t DISABLE ROW LEVEL SECURITY"], Ok("1,2")),
+        (&["REVOKE SELECT ON t FROM alice"], Err("42501")),
+        (&["GRANT SELECT (id) ON t TO alice"], Ok("1,2")),
+        (&["REVOKE SELECT (id) ON t FROM alice"], Err("42501")),
+        (
+            &["GRANT SELECT ON t TO readers", "GRANT readers TO alice"],
+            Ok("1,2"),
+        ),
+        (&["REVOKE readers FROM alice"], Err("42501")),
+    ];
+    for (changes, expected) in steps {
+        for sql in changes {
+            run(&mut root, sql)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                run(&mut alice, q).await,
+                expected.map(str::to_owned).map_err(str::to_owned),
+                "after {changes:?}"
+            );
+        }
+    }
+
+    // A role switch in the same connection is checked as the role switched to.
+    run(&mut root, "GRANT readers TO alice").await.unwrap();
+    assert_eq!(run(&mut alice, q).await, Ok("1,2".to_owned()));
+    assert_eq!(run(&mut alice, q).await, Ok("1,2".to_owned()));
+    run(&mut alice, "SET ROLE limited").await.unwrap();
+    assert_eq!(run(&mut alice, q).await, Err("42501".to_owned()));
+    run(&mut alice, "RESET ROLE").await.unwrap();
+    assert_eq!(run(&mut alice, q).await, Ok("1,2".to_owned()));
+
+    // A prepared statement is checked again on every EXECUTE.
+    run(&mut alice, &format!("PREPARE p AS {q}")).await.unwrap();
+    assert_eq!(run(&mut alice, "EXECUTE p").await, Ok("1,2".to_owned()));
+    run(&mut root, "ALTER TABLE t ENABLE ROW LEVEL SECURITY")
+        .await
+        .unwrap();
+    assert_eq!(run(&mut alice, "EXECUTE p").await, Ok("1".to_owned()));
+    assert_eq!(run(&mut alice, q).await, Ok("1".to_owned()));
+
+    for (mut conn, handle) in [(root, root_handle), (alice, alice_handle)] {
+        conn.write_frame(&FrontendMessage::Terminate.encode().unwrap())
+            .await
+            .unwrap();
+        drop(conn);
+        handle.await.unwrap().unwrap();
+    }
+}

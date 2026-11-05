@@ -28,7 +28,9 @@
 //!    lookup) without the expensive part (parse/analyze/plan), and — being read from the same live
 //!    snapshot the re-analysis would use — it has no cross-transaction staleness. Row-level security,
 //!    whose *predicate* is baked into the plan, is not re-checkable this way and stays uncached
-//!    (rule 2).
+//!    (rule 2). Whether row-level security is on at all is re-checked like a privilege: a plan made
+//!    while it was off for a table it read records that, and `ENABLE ROW LEVEL SECURITY` from any
+//!    session discards the plan, which bakes no policy predicate.
 //! 3. **Schema-version fingerprint.** Each entry records the schema version of *every* base table the
 //!    analyzer resolved (captured by a recording catalog, which is complete by construction — the
 //!    analyzer cannot resolve a table without looking it up). The entry is reused only while every one
@@ -61,6 +63,10 @@ type PrivilegeCheck = (ast::ObjectKind, String, ast::Privilege, bool);
 /// on reuse exactly like a [`PrivilegeCheck`].
 type OwnershipCheck = (ast::ObjectKind, String, bool);
 
+/// One row-level-security question the analysis asked: `(schema, table)` and whether it was on.
+/// Re-checked on reuse exactly like a [`PrivilegeCheck`].
+type RlsCheck = (String, String, bool);
+
 /// A planned read statement plus the schema fingerprint it was planned under.
 struct CachedPlan {
     /// `(table, schema version)` for every base table the plan references, sorted. The plan is reused
@@ -72,6 +78,9 @@ struct CachedPlan {
     privilege_checks: Vec<PrivilegeCheck>,
     /// Every ownership decision the analysis consulted, re-verified the same way.
     ownership_checks: Vec<OwnershipCheck>,
+    /// Every row-level-security state the analysis consulted, re-verified the same way: the plan
+    /// bakes in no policy predicate for a table whose security was off.
+    rls_checks: Vec<RlsCheck>,
     /// The inheritance/partition metadata fingerprint at plan time, `Some` when the analysis
     /// consulted that metadata (a parent expansion, a partition prune, or merely probing a database
     /// that has edges). Re-checked on reuse: any new edge, attach/detach, or bound change moves the
@@ -169,6 +178,8 @@ struct RecordingCatalog<'a> {
     privilege_checks: RefCell<Vec<PrivilegeCheck>>,
     /// Every ownership decision the analysis asked for, captured the same way.
     ownership_checks: RefCell<Vec<OwnershipCheck>>,
+    /// Every row-level-security state the analysis asked for, captured the same way.
+    rls_checks: RefCell<Vec<RlsCheck>>,
     /// The listings of tables whose only indexes are partial, re-checked on reuse.
     index_listings: RefCell<Vec<IndexListing>>,
 }
@@ -184,6 +195,7 @@ impl<'a> RecordingCatalog<'a> {
             saw_inheritance: Cell::new(false),
             privilege_checks: RefCell::new(Vec::new()),
             ownership_checks: RefCell::new(Vec::new()),
+            rls_checks: RefCell::new(Vec::new()),
             index_listings: RefCell::new(Vec::new()),
         }
     }
@@ -317,10 +329,15 @@ impl Catalog for RecordingCatalog<'_> {
     fn rls_enabled(&self, schema: &str, name: &str) -> Result<bool, Error> {
         let enabled = self.inner.rls_enabled(schema, name)?;
         // An RLS-enabled table bakes a policy predicate into the plan; policy changes are unversioned,
-        // so the plan cannot be safely reused — do not cache it.
+        // so the plan cannot be safely reused: do not cache it. A table whose security is off bakes
+        // no predicate, and turning it on moves no schema version: record the answer so a hit
+        // re-checks it (module rule 4).
         if enabled {
             self.saw_unversioned_dep.set(true);
         }
+        self.rls_checks
+            .borrow_mut()
+            .push((schema.to_owned(), name.to_owned(), enabled));
         Ok(enabled)
     }
 
@@ -493,6 +510,11 @@ fn access_checks_still_hold(catalog: &dyn Catalog, entry: &CachedPlan) -> Result
             return Ok(false);
         }
     }
+    for (schema, name, expected) in &entry.rls_checks {
+        if catalog.rls_enabled(schema, name)? != *expected {
+            return Ok(false);
+        }
+    }
     Ok(true)
 }
 
@@ -636,6 +658,7 @@ pub fn plan_cached(
                 fingerprint,
                 privilege_checks: recorder.privilege_checks.into_inner(),
                 ownership_checks: recorder.ownership_checks.into_inner(),
+                rls_checks: recorder.rls_checks.into_inner(),
                 inheritance_fingerprint,
                 index_listings: recorder.index_listings.into_inner(),
                 plan: physical.clone(),
