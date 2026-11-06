@@ -43,10 +43,15 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
         .filter_map(|&i| table.columns.get(i).map(|c| c.name.as_str()))
         .collect();
     super::dcl::require_column_privilege(catalog, &table, &insert_columns, ast::Privilege::Insert)?;
-    // A column the statement reads back, through RETURNING or an `ON CONFLICT` clause, needs
-    // SELECT on it: RETURNING hands back stored values (a default, a trigger's change, or the
-    // existing row an upsert updated), and an arbiter reads the existing rows.
-    let reads_target = !ins.returning.is_empty() || ins.on_conflict.is_some();
+    // A column the statement reads back needs SELECT on it: RETURNING hands back stored values (a
+    // default, a trigger's change, or the existing row an upsert updated), and `DO UPDATE` reads the
+    // existing row. An arbiter reads the existing rows too, but it asks for the columns it compares
+    // itself (see `resolve_conflict_target`), which is all a `DO NOTHING` reads.
+    let reads_target = !ins.returning.is_empty()
+        || ins
+            .on_conflict
+            .as_ref()
+            .is_some_and(|c| matches!(c.action, ast::ConflictAction::DoUpdate { .. }));
     let target_cols = target_columns(&table, None, reads_target, catalog)?;
     // RETURNING projects the inserted rows: resolve it against the table's columns.
     let returning = analyze_returning(&ins.returning, &table, &table.name, &target_cols, catalog)?;
@@ -265,7 +270,8 @@ fn analyze_on_conflict(
 ///
 /// The arbiter reads the existing rows to find a conflict, so it needs SELECT on the columns it
 /// compares: the target's columns and the columns its `WHERE` reads, or the key of the named
-/// constraint (every column of the table when the name is not a key the catalog lists).
+/// constraint (every column of the table when the name is not a key the catalog lists). This is the
+/// whole of what a `DO NOTHING` reads of the table.
 fn resolve_conflict_target(
     target: Option<ast::ConflictTarget>,
     table: &TableSchema,
