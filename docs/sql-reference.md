@@ -1646,8 +1646,9 @@ length, and takes none of the other options; its stream layout is in the wire pr
 specification, section 12.4. Export takes a table (optionally with a column list) or a `(query)`;
 the query form is `TO STDOUT` only and runs like any `SELECT` of the session: with the caller's
 privileges and row policies, under its `SET` variables and time zone, and resolving unqualified
-names through its `search_path`. Load takes a table only. A load larger than `--copy-max-bytes` is refused rather than buffered without
-bound. Columns a load leaves out take their defaults. Loading into a partitioned table sends each row
+names through its `search_path`. Load takes a table only. A load larger than `--copy-max-bytes` is
+refused rather than buffered without bound. Columns a load leaves out take their defaults. Loading
+into a partitioned table sends each row
 to its partition, and a row no partition accepts refuses the whole load; loading into a partition
 refuses a row outside its bound.
 
