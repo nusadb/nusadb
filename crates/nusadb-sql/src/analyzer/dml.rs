@@ -812,8 +812,12 @@ pub(super) fn analyze_update_stmt(
     let mut plan = analyze_update(parent, catalog, None)?;
     // Each descendant is reached through the parent: its target takes the parent's privileges and
     // row-level security, so all of them share one lookup of the parent's grants.
-    let parent_table = plan.table.clone();
-    let via = Via::new(&parent_table, update_reads_target(&upd), catalog)?;
+    let UpdatePlan {
+        table: parent_table,
+        propagate,
+        ..
+    } = &mut plan;
+    let via = Via::new(parent_table, update_reads_target(&upd), catalog)?;
     for descendant in descendants {
         // The descendant is a schema-qualified edge key, bare for `public`; split it and name the
         // schema explicitly so the sub-plan targets exactly the recorded table. A bare name would
@@ -827,7 +831,7 @@ pub(super) fn analyze_update_stmt(
         let mut sub_plan = analyze_update(sub, catalog, Some(&via))?;
         // Reached through the parent: a bound-leaving new image moves to its sibling partition.
         sub_plan.partition_via_parent = true;
-        plan.propagate.push(sub_plan);
+        propagate.push(sub_plan);
     }
     Ok(plan)
 }
@@ -846,8 +850,12 @@ pub(super) fn analyze_delete_stmt(
     parent.only = true;
     let mut plan = analyze_delete(parent, catalog, None)?;
     // As in `analyze_update_stmt`: each descendant's target is reached through the parent.
-    let parent_table = plan.table.clone();
-    let via = Via::new(&parent_table, delete_reads_target(&del), catalog)?;
+    let DeletePlan {
+        table: parent_table,
+        propagate,
+        ..
+    } = &mut plan;
+    let via = Via::new(parent_table, delete_reads_target(&del), catalog)?;
     for descendant in descendants {
         // As in `analyze_update_stmt`: split the qualified edge key into the sub-plan's target.
         let (sub_schema, sub_name) = super::split_qualified(&descendant);
@@ -855,8 +863,7 @@ pub(super) fn analyze_delete_stmt(
         sub.only = true;
         sub.schema = Some(sub_schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA).to_owned());
         sub_name.clone_into(&mut sub.table);
-        plan.propagate
-            .push(analyze_delete(sub, catalog, Some(&via))?);
+        propagate.push(analyze_delete(sub, catalog, Some(&via))?);
     }
     Ok(plan)
 }
@@ -1032,15 +1039,10 @@ pub(super) fn analyze_update(
         catalog,
     )?;
     // The table whose privileges and row-level security govern the target.
-    let access = via.map_or(&table, |v| v.parent).clone();
+    let access = via.map_or(&table, |v| v.parent);
     // UPDATE needs the privilege on the table, or a column-scoped UPDATE grant on each SET column.
     let update_columns: Vec<&str> = upd.assignments.iter().map(|a| a.column.as_str()).collect();
-    super::dcl::require_column_privilege(
-        catalog,
-        &access,
-        &update_columns,
-        ast::Privilege::Update,
-    )?;
+    super::dcl::require_column_privilege(catalog, access, &update_columns, ast::Privilege::Update)?;
     // Every column of the target the statement reads, in a SET expression, the WHERE, RETURNING or a
     // correlated subquery, needs SELECT on it (table-wide or on the column). An unconditional
     // `UPDATE t SET c = 1` reads nothing and needs only UPDATE, which keeps a write-only role
@@ -1222,8 +1224,8 @@ pub(super) fn analyze_delete(
         catalog,
     )?;
     // The table whose privileges and row-level security govern the target.
-    let access = via.map_or(&table, |v| v.parent).clone();
-    super::dcl::require_table_privilege(catalog, &access, ast::Privilege::Delete)?;
+    let access = via.map_or(&table, |v| v.parent);
+    super::dcl::require_table_privilege(catalog, access, ast::Privilege::Delete)?;
     // As for UPDATE: every column of the target the statement reads needs SELECT on it.
     let target_cols = target_columns(&table, via, delete_reads_target(&del), catalog)?;
     // As for UPDATE: the target goes by its alias, else by the table the statement names.
