@@ -617,8 +617,16 @@ impl ColumnAccess {
     }
 }
 
-/// The column decisions a session has read, per transaction, table and privilege.
-type ColumnAccessReads = HashMap<(TxnId, String, Privilege), ColumnAccess>;
+/// What a session has read of the access catalogs, per transaction.
+#[derive(Debug, Default)]
+struct AccessReads {
+    /// The column decisions, per table and privilege.
+    columns: HashMap<(TxnId, String, Privilege), ColumnAccess>,
+    /// The table of grants.
+    grants: HashMap<TxnId, Arc<[GrantRecord]>>,
+    /// The owners of the objects asked about.
+    owners: HashMap<(TxnId, ObjectKind, String), String>,
+}
 
 /// A session resolved to the roles it effectively holds and whether it is a superuser — the two
 /// facts every privilege question turns on, computed once from the role and membership catalogs.
@@ -639,11 +647,12 @@ pub struct ResolvedSession {
     assumable: BTreeSet<String>,
     /// Whether any of the effective roles carries the superuser attribute.
     superuser: bool,
-    /// The column decisions read so far, shared with this session's clones. A statement that
-    /// checks every column of a table, or the same columns again under each partition of a parent,
-    /// then reads the catalogs once rather than once per check. As with the roles above, a holder
-    /// keeps a session for one statement, so a grant or revoke reaches the next statement.
-    column_access: Arc<Mutex<ColumnAccessReads>>,
+    /// What has been read of the access catalogs so far, shared with this session's clones. A
+    /// statement that checks every column of a table, the same columns again under each partition
+    /// of a parent, or several privileges on one table then reads the catalogs once rather than
+    /// once per check. As with the roles above, a holder keeps a session for one statement, so a
+    /// grant or revoke reaches the next statement.
+    reads: Arc<Mutex<AccessReads>>,
 }
 
 impl ResolvedSession {
@@ -659,7 +668,7 @@ impl ResolvedSession {
                 assumable: effective.clone(),
                 effective,
                 superuser: true,
-                column_access: Arc::default(),
+                reads: Arc::default(),
             });
         }
         let memberships = all_memberships(engine, txn)?;
@@ -673,7 +682,7 @@ impl ResolvedSession {
             effective,
             assumable,
             superuser,
-            column_access: Arc::default(),
+            reads: Arc::default(),
         })
     }
 
@@ -737,8 +746,8 @@ impl ResolvedSession {
         if self.superuser {
             return Ok(true);
         }
-        let owner = object_owner(engine, txn, kind, object)?;
-        let grants = all_grants(engine, txn)?;
+        let owner = self.owner_of(engine, txn, kind, object)?;
+        let grants = self.grants(engine, txn)?;
         if self.decide(&owner, &grants, kind, object, privilege, false) {
             return Ok(true);
         }
@@ -757,8 +766,8 @@ impl ResolvedSession {
         object: &str,
         privilege: Privilege,
     ) -> Result<ColumnAccess, Error> {
-        let owner = object_owner(engine, txn, ObjectKind::Table, object)?;
-        let table_grants = all_grants(engine, txn)?;
+        let owner = self.owner_of(engine, txn, ObjectKind::Table, object)?;
+        let table_grants = self.grants(engine, txn)?;
         let column_grants = all_column_grants(engine, txn)?;
         // A table-wide grant (or ownership, via `decide`) covers every column.
         let table_wide = self.decide(
@@ -804,21 +813,46 @@ impl ResolvedSession {
             return Ok(true);
         }
         let key = (txn, object.to_owned(), privilege);
-        let known = self.column_reads().get(&key).map(|a| a.covers(column));
+        let known = self.reads().columns.get(&key).map(|a| a.covers(column));
         if let Some(covered) = known {
             return Ok(covered);
         }
         let access = self.read_column_access(engine, txn, object, privilege)?;
         let covered = access.covers(column);
-        self.column_reads().insert(key, access);
+        self.reads().columns.insert(key, access);
         Ok(covered)
     }
 
-    /// The column decisions read so far.
-    fn column_reads(&self) -> MutexGuard<'_, ColumnAccessReads> {
-        self.column_access
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    /// What has been read of the access catalogs so far.
+    fn reads(&self) -> MutexGuard<'_, AccessReads> {
+        self.reads.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The owner of `object`, as this session last read it in `txn`.
+    fn owner_of(
+        &self,
+        engine: &dyn StorageEngine,
+        txn: TxnId,
+        kind: ObjectKind,
+        object: &str,
+    ) -> Result<String, Error> {
+        let key = (txn, kind, object.to_owned());
+        if let Some(owner) = self.reads().owners.get(&key) {
+            return Ok(owner.clone());
+        }
+        let owner = object_owner(engine, txn, kind, object)?;
+        self.reads().owners.insert(key, owner.clone());
+        Ok(owner)
+    }
+
+    /// The table of grants, as this session last read it in `txn`.
+    fn grants(&self, engine: &dyn StorageEngine, txn: TxnId) -> Result<Arc<[GrantRecord]>, Error> {
+        if let Some(grants) = self.reads().grants.get(&txn) {
+            return Ok(Arc::clone(grants));
+        }
+        let grants: Arc<[GrantRecord]> = all_grants(engine, txn)?.into();
+        self.reads().grants.insert(txn, Arc::clone(&grants));
+        Ok(grants)
     }
 
     /// Whether the session may access *at least one* column of table `object` with `privilege` — the
@@ -837,8 +871,8 @@ impl ResolvedSession {
         if self.superuser {
             return Ok(true);
         }
-        let owner = object_owner(engine, txn, ObjectKind::Table, object)?;
-        let table_grants = all_grants(engine, txn)?;
+        let owner = self.owner_of(engine, txn, ObjectKind::Table, object)?;
+        let table_grants = self.grants(engine, txn)?;
         if self.decide(
             &owner,
             &table_grants,
@@ -875,8 +909,8 @@ impl ResolvedSession {
         if self.superuser {
             return Ok(true);
         }
-        let owner = object_owner(engine, txn, kind, object)?;
-        let grants = all_grants(engine, txn)?;
+        let owner = self.owner_of(engine, txn, kind, object)?;
+        let grants = self.grants(engine, txn)?;
         Ok(self.decide(&owner, &grants, kind, object, privilege, true))
     }
 
@@ -891,7 +925,7 @@ impl ResolvedSession {
         kind: ObjectKind,
         object: &str,
     ) -> Result<bool, Error> {
-        Ok(self.owns(&object_owner(engine, txn, kind, object)?))
+        Ok(self.owns(&self.owner_of(engine, txn, kind, object)?))
     }
 
     /// Whether the session may assume `role` — a superuser, or a role it effectively holds.

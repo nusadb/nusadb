@@ -204,6 +204,47 @@ async fn a_revoke_reaches_the_next_statement_of_its_own_transaction() {
     denied(&mut root, read).await;
 }
 
+/// What a statement read of the table grants lasts as long as the statement, like its column grants.
+#[tokio::test]
+async fn a_table_wide_revoke_reaches_the_next_statement_of_an_open_transaction() {
+    let (engine, mut root) = fixture().await;
+    let mut clerk = open(&engine, "clerk").await;
+    for sql in [
+        "CREATE TABLE u (id INT PRIMARY KEY, v INT)",
+        "GRANT SELECT, INSERT ON u TO clerk",
+    ] {
+        ok(&mut root, sql).await;
+    }
+    let upsert = "INSERT INTO u VALUES (1, 1) ON CONFLICT (id) DO NOTHING RETURNING *";
+
+    ok(&mut clerk, "BEGIN").await;
+    ok(&mut clerk, upsert).await;
+    ok(&mut clerk, upsert).await;
+    ok(&mut root, "REVOKE SELECT ON u FROM clerk").await;
+    denied(&mut clerk, upsert).await;
+    ok(&mut clerk, "ROLLBACK").await;
+
+    ok(&mut root, "GRANT SELECT ON u TO clerk").await;
+    ok(&mut clerk, upsert).await;
+}
+
+/// The same within one transaction, where the next statement sees the writes of the last one.
+#[tokio::test]
+async fn a_table_wide_grant_reaches_the_next_statement_of_its_own_transaction() {
+    let (_engine, mut root) = fixture().await;
+    let read = "SELECT * FROM u";
+    ok(&mut root, "CREATE TABLE u (id INT, v INT)").await;
+    ok(&mut root, "BEGIN").await;
+    ok(&mut root, "GRANT SELECT ON u TO clerk").await;
+    ok(&mut root, "SET ROLE clerk").await;
+    ok(&mut root, read).await;
+    ok(&mut root, read).await;
+    ok(&mut root, "RESET ROLE").await;
+    ok(&mut root, "REVOKE SELECT ON u FROM clerk").await;
+    ok(&mut root, "SET ROLE clerk").await;
+    denied(&mut root, read).await;
+}
+
 /// A nested body's statement is a statement too: its check does not outlive it.
 #[tokio::test]
 async fn a_revoke_reaches_the_next_nested_body_of_an_open_transaction() {

@@ -4763,7 +4763,13 @@ fn reindex_repairs_partial_index_membership() {
 /// The scans of the column-grant catalog while `sql` is analyzed as `user`, under one catalog as a
 /// connection builds one per statement.
 fn column_grant_reads(engine: &MockEngine, user: &str, sql: &str) -> u32 {
-    let before = engine.scans_of(crate::rbac::COLUMN_PRIVILEGE_CATALOG);
+    catalog_reads(engine, crate::rbac::COLUMN_PRIVILEGE_CATALOG, user, sql)
+}
+
+/// The scans of `catalog_table` while `sql` is analyzed as `user`, under one catalog as a
+/// connection builds one per statement.
+fn catalog_reads(engine: &MockEngine, catalog_table: &str, user: &str, sql: &str) -> u32 {
+    let before = engine.scans_of(catalog_table);
     let catalog = super::SessionCatalog::new(
         engine,
         TxnId(1),
@@ -4772,7 +4778,7 @@ fn column_grant_reads(engine: &MockEngine, user: &str, sql: &str) -> u32 {
         None,
     );
     analyze(parse(sql).unwrap(), &catalog).unwrap();
-    engine.scans_of(crate::rbac::COLUMN_PRIVILEGE_CATALOG) - before
+    engine.scans_of(catalog_table) - before
 }
 
 /// A table of 50 columns, a parent of 20 partitions and two roles over them: `writer` holds table
@@ -4817,6 +4823,34 @@ fn a_statement_reads_the_column_grants_once_per_table_and_privilege() {
     ]
     .map(|sql| column_grant_reads(&engine, "restricted", sql));
     assert_eq!(reads, [1, 2, 1, 2]);
+}
+
+/// A statement asks about several privileges on its target, and about SELECT more than once when an
+/// arbiter and the rest of an upsert read the target. The answers all come from one read of the
+/// owners and the table grants, which a table-wide role would otherwise pay for per question.
+#[test]
+fn a_statement_reads_the_owners_and_the_table_grants_once() {
+    use crate::rbac::{OWNER_CATALOG, PRIVILEGE_CATALOG};
+
+    let engine = grants_fixture();
+    run("GRANT SELECT ON wide TO writer", &engine).unwrap();
+    for sql in [
+        "INSERT INTO wide (id) VALUES (1) ON CONFLICT (id) DO NOTHING",
+        "INSERT INTO wide (id) VALUES (1) ON CONFLICT (id) DO NOTHING RETURNING *",
+        "INSERT INTO wide (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET c1 = excluded.c1",
+        "UPDATE wide SET c1 = c2 WHERE id = 1 RETURNING *",
+    ] {
+        assert_eq!(
+            catalog_reads(&engine, PRIVILEGE_CATALOG, "writer", sql),
+            1,
+            "{sql}"
+        );
+        assert_eq!(
+            catalog_reads(&engine, OWNER_CATALOG, "writer", sql),
+            1,
+            "{sql}"
+        );
+    }
 }
 
 /// A statement that reads no column of its target asks nothing about SELECT, so it costs what it
