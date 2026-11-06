@@ -1,6 +1,8 @@
 //! Column grants over a connection. The wire path answers column checks from one read of the grants
 //! per statement, so these tests pin that the read lasts no longer than the statement: a grant or a
-//! revoke reaches the next statement of the same transaction, and from another connection too.
+//! revoke reaches the next statement of the same transaction, and from another connection too. They
+//! also pin that a read of a whole row needs SELECT on every column it expands, wherever a statement
+//! makes it, over the simple and the extended protocol alike.
 
 #![allow(
     clippy::unwrap_used,
@@ -61,6 +63,54 @@ async fn run(conn: &mut Conn, sql: &str) -> Outcome {
         },
     )
     .await;
+    outcome(conn).await
+}
+
+/// Prepare `sql` as the statement `name` (the unnamed one when empty), without running it.
+async fn parse(conn: &mut Conn, name: &str, sql: &str) {
+    send(
+        conn,
+        FrontendMessage::Parse {
+            name: name.to_owned(),
+            sql: sql.to_owned(),
+            param_types: Vec::new(),
+        },
+    )
+    .await;
+}
+
+/// Bind the prepared statement `name` and run it to the end of the pipeline.
+async fn execute(conn: &mut Conn, name: &str) -> Outcome {
+    send(
+        conn,
+        FrontendMessage::Bind {
+            portal: String::new(),
+            statement: name.to_owned(),
+            params: Vec::new(),
+            result_formats: Vec::new(),
+        },
+    )
+    .await;
+    send(
+        conn,
+        FrontendMessage::Execute {
+            portal: String::new(),
+            max_rows: 0,
+        },
+    )
+    .await;
+    send(conn, FrontendMessage::Sync).await;
+    outcome(conn).await
+}
+
+/// Run `sql` over the extended protocol: Parse, Bind, Execute, Sync.
+async fn run_extended(conn: &mut Conn, sql: &str) -> Outcome {
+    parse(conn, "", sql).await;
+    execute(conn, "").await
+}
+
+/// The rows and the refusal a statement answered with, up to `ReadyForQuery`.
+async fn outcome(conn: &mut Conn) -> Outcome {
     let mut rows = Vec::new();
     let mut refused = None;
     loop {
@@ -93,6 +143,17 @@ async fn denied(conn: &mut Conn, sql: &str) {
         run(conn, sql).await,
         Outcome::Refused("42501".to_owned()),
         "{sql}"
+    );
+}
+
+/// Expect a permission denial over both protocols. Outside a transaction block only: the first
+/// refusal would abort it.
+async fn denied_both(conn: &mut Conn, sql: &str) {
+    denied(conn, sql).await;
+    assert_eq!(
+        run_extended(conn, sql).await,
+        Outcome::Refused("42501".to_owned()),
+        "{sql} over the extended protocol"
     );
 }
 
@@ -165,4 +226,214 @@ async fn a_wildcard_returning_through_a_parent_is_the_parents_columns_over_the_w
         ok(&mut clerk, "DELETE FROM ip WHERE id = 2 RETURNING *").await,
         vec![vec![field("2"), field("21")]]
     );
+}
+
+/// An engine with `t (id, a, secret)`, one row, a table `s` to read from, a full view of `t`, and a
+/// role with no privilege yet.
+async fn whole_row_fixture() -> (Arc<dyn StorageEngine>, Conn) {
+    let engine: Arc<dyn StorageEngine> = Arc::new(BtreeEngine::new());
+    let mut root = open(&engine, "nusadb-root").await;
+    for sql in [
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, secret TEXT)",
+        "INSERT INTO t VALUES (1, 2, 'hunter2')",
+        "CREATE TABLE s (id INT, x INT, hid TEXT)",
+        "INSERT INTO s VALUES (1, 7, 'hid')",
+        "CREATE VIEW v AS SELECT * FROM t",
+        "CREATE ROLE clerk LOGIN",
+    ] {
+        ok(&mut root, sql).await;
+    }
+    (engine, root)
+}
+
+/// What the superuser sees of `t`, to show a refused statement changed nothing.
+async fn table_t(root: &mut Conn) -> Vec<Vec<Option<String>>> {
+    ok(root, "SELECT id, a, secret FROM t").await
+}
+
+#[tokio::test]
+async fn a_write_reads_no_whole_row_without_select_on_every_column() {
+    let (engine, mut root) = whole_row_fixture().await;
+    ok(&mut root, "GRANT UPDATE (a), DELETE ON t TO clerk").await;
+    let before = table_t(&mut root).await;
+    let mut clerk = open(&engine, "clerk").await;
+    for sql in [
+        "UPDATE t SET a = 1 RETURNING row_to_json(t)",
+        "UPDATE t AS x SET a = 1 RETURNING row_to_json(x)",
+        "WITH u AS (UPDATE t SET a = 5 RETURNING row_to_json(t) j) SELECT j FROM u",
+        "DELETE FROM t RETURNING row_to_json(t)",
+        "DELETE FROM t AS x RETURNING row_to_json(x)",
+        "UPDATE t SET a = 1 WHERE row_to_json(t)::text LIKE '%hunter2%'",
+        "UPDATE t SET a = length(row_to_json(t)::text)",
+        "DELETE FROM t WHERE row_to_json(t)::text LIKE '%hunter2%'",
+        "UPDATE v SET a = 5 RETURNING row_to_json(t)",
+        "UPDATE v SET a = 5 WHERE row_to_json(t)::text LIKE '%hunter2%'",
+        "DELETE FROM v RETURNING row_to_json(t)",
+    ] {
+        denied_both(&mut clerk, sql).await;
+    }
+    assert_eq!(table_t(&mut root).await, before);
+}
+
+#[tokio::test]
+async fn a_write_reads_a_whole_row_with_select_on_every_column() {
+    let (engine, mut root) = whole_row_fixture().await;
+    ok(&mut root, "GRANT UPDATE (a) ON t TO clerk").await;
+    ok(&mut root, "GRANT SELECT (id, a) ON t TO clerk").await;
+    let mut clerk = open(&engine, "clerk").await;
+    let sql = "UPDATE t SET a = 3 RETURNING row_to_json(t)";
+    denied(&mut clerk, sql).await;
+
+    // Each column granted is as good as the table.
+    ok(&mut root, "GRANT SELECT (secret) ON t TO clerk").await;
+    let row = r#"{"id": 1, "a": 3, "secret": "hunter2"}"#.to_owned();
+    assert_eq!(ok(&mut clerk, sql).await, vec![vec![Some(row.clone())]]);
+    assert_eq!(
+        run_extended(&mut clerk, sql).await,
+        Outcome::Rows(vec![vec![Some(row.clone())]])
+    );
+    ok(&mut root, "REVOKE SELECT (id, a, secret) ON t FROM clerk").await;
+    ok(&mut root, "GRANT SELECT ON t TO clerk").await;
+    assert_eq!(ok(&mut clerk, sql).await, vec![vec![Some(row)]]);
+}
+
+#[tokio::test]
+async fn a_row_of_named_columns_needs_select_on_those_columns_only() {
+    let (engine, mut root) = whole_row_fixture().await;
+    ok(&mut root, "GRANT SELECT (id, a) ON t TO clerk").await;
+    let mut clerk = open(&engine, "clerk").await;
+    assert_eq!(
+        ok(&mut clerk, "SELECT row_to_json(ROW(id, a)) FROM t").await,
+        vec![vec![Some(r#"{"f1": 1, "f2": 2}"#.to_owned())]]
+    );
+    assert_eq!(
+        ok(
+            &mut clerk,
+            "SELECT row_to_json(d) FROM (SELECT id, a FROM t) d"
+        )
+        .await,
+        vec![vec![Some(r#"{"id": 1, "a": 2}"#.to_owned())]]
+    );
+    denied_both(&mut clerk, "SELECT row_to_json(ROW(id, secret)) FROM t").await;
+}
+
+#[tokio::test]
+async fn a_select_reads_no_whole_row_without_select_on_every_column() {
+    let (engine, mut root) = whole_row_fixture().await;
+    for sql in [
+        "GRANT SELECT (id) ON t TO clerk",
+        "GRANT SELECT (id, x) ON s TO clerk",
+        "CREATE TABLE kept (j TEXT)",
+        "GRANT INSERT ON kept TO clerk",
+    ] {
+        ok(&mut root, sql).await;
+    }
+    let mut clerk = open(&engine, "clerk").await;
+    for sql in [
+        "SELECT row_to_json(t) FROM t",
+        "SELECT row_to_json(x) FROM t x",
+        "SELECT id FROM t WHERE row_to_json(t)::text LIKE '%hunter2%'",
+        "SELECT id FROM t ORDER BY row_to_json(t)::text",
+        "SELECT row_to_json(t)::text, count(*) FROM t GROUP BY 1",
+        "SELECT count(*) FILTER (WHERE row_to_json(t)::text LIKE '%h%') FROM t",
+        "SELECT json_agg(row_to_json(t)) FROM t",
+        "SELECT row_number() OVER (ORDER BY row_to_json(t)::text) FROM t",
+        "SELECT j FROM (SELECT row_to_json(t) j FROM t) d",
+        "WITH d AS (SELECT row_to_json(t) j FROM t) SELECT j FROM d",
+        "SELECT (SELECT row_to_json(x) FROM t x) FROM s",
+        "SELECT s.id FROM s JOIN t ON row_to_json(t)::text LIKE '%h%'",
+        "SELECT t.id FROM t JOIN s ON row_to_json(s)::text LIKE '%hid%'",
+        "SELECT * FROM generate_series(1, (SELECT length(row_to_json(t)::text) FROM t))",
+        "SELECT jsonb_each(row_to_json(t)) FROM t",
+        "INSERT INTO kept SELECT row_to_json(t)::text FROM t",
+        "CREATE TABLE stolen AS SELECT row_to_json(t) j FROM t",
+        "CREATE MATERIALIZED VIEW stolen AS SELECT row_to_json(t) j FROM t",
+        "DO $$ INSERT INTO kept SELECT row_to_json(t)::text FROM t $$",
+    ] {
+        denied_both(&mut clerk, sql).await;
+    }
+    denied(&mut clerk, "COPY (SELECT row_to_json(t) FROM t) TO STDOUT").await;
+    denied(&mut clerk, "EXPLAIN SELECT row_to_json(t) FROM t").await;
+    ok(&mut clerk, "PREPARE whole AS SELECT row_to_json(t) FROM t").await;
+    denied(&mut clerk, "EXECUTE whole").await;
+}
+
+#[tokio::test]
+async fn a_cached_whole_row_read_is_refused_after_a_revoke() {
+    let (engine, mut root) = whole_row_fixture().await;
+    ok(&mut root, "GRANT SELECT (id, a, secret) ON t TO clerk").await;
+    let mut clerk = open(&engine, "clerk").await;
+    let sql = "SELECT row_to_json(t) FROM t";
+    let row = r#"{"id": 1, "a": 2, "secret": "hunter2"}"#.to_owned();
+    for _ in 0..2 {
+        assert_eq!(ok(&mut clerk, sql).await, vec![vec![Some(row.clone())]]);
+    }
+    ok(&mut root, "REVOKE SELECT (secret) ON t FROM clerk").await;
+    denied(&mut clerk, sql).await;
+}
+
+#[tokio::test]
+async fn a_write_reads_no_whole_row_of_a_source_without_select_on_every_column() {
+    let (engine, mut root) = whole_row_fixture().await;
+    for sql in [
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON t TO clerk",
+        "GRANT SELECT (id, x) ON s TO clerk",
+    ] {
+        ok(&mut root, sql).await;
+    }
+    let mut clerk = open(&engine, "clerk").await;
+    for sql in [
+        "UPDATE t SET a = length(row_to_json(s)::text) FROM s",
+        "UPDATE t SET a = 1 FROM s WHERE row_to_json(s)::text LIKE '%hid%'",
+        "UPDATE t SET a = 1 FROM s AS q WHERE row_to_json(q)::text LIKE '%hid%'",
+        "DELETE FROM t USING s WHERE row_to_json(s)::text LIKE '%hid%'",
+        "MERGE INTO t USING s ON row_to_json(s)::text LIKE '%hid%' \
+         WHEN MATCHED THEN UPDATE SET a = 1",
+        "MERGE INTO t USING s ON t.id = s.id \
+         WHEN MATCHED AND row_to_json(s)::text LIKE '%hid%' THEN DELETE",
+        "MERGE INTO t USING s ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET a = length(row_to_json(s)::text)",
+        "MERGE INTO t USING s ON t.id = 9 \
+         WHEN NOT MATCHED THEN INSERT (id, a) VALUES (s.id, length(row_to_json(s)::text))",
+    ] {
+        denied_both(&mut clerk, sql).await;
+    }
+    ok(&mut root, "GRANT SELECT (hid) ON s TO clerk").await;
+    ok(
+        &mut clerk,
+        "UPDATE t SET a = length(row_to_json(s)::text) FROM s",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_insert_reads_no_whole_row_without_select_on_every_column() {
+    let (engine, mut root) = whole_row_fixture().await;
+    for sql in [
+        "CREATE UNIQUE INDEX t_part ON t (a) WHERE id > 100",
+        "GRANT INSERT, UPDATE (a), SELECT (id, a) ON t TO clerk",
+    ] {
+        ok(&mut root, sql).await;
+    }
+    let before = table_t(&mut root).await;
+    let mut clerk = open(&engine, "clerk").await;
+    for sql in [
+        "INSERT INTO t VALUES (2, 3, 'x') RETURNING row_to_json(t)",
+        "INSERT INTO t VALUES (1, 3, 'x') ON CONFLICT (id) DO NOTHING RETURNING row_to_json(t)",
+        "INSERT INTO t VALUES (1, 3, 'x') ON CONFLICT (id) DO UPDATE SET a = 1 \
+         RETURNING row_to_json(t)",
+        "INSERT INTO t VALUES (1, 3, 'x') ON CONFLICT (id) DO UPDATE SET a = 1 \
+         WHERE row_to_json(t)::text LIKE '%hunter2%'",
+        "INSERT INTO t VALUES (1, 3, 'x') ON CONFLICT (id) DO UPDATE \
+         SET a = length(row_to_json(t)::text)",
+        "INSERT INTO t VALUES (200, 3, 'x') ON CONFLICT (a) \
+         WHERE row_to_json(t)::text LIKE '%hunter2%' DO NOTHING",
+        "INSERT INTO t VALUES (200, 3, 'x') ON CONFLICT (a) \
+         WHERE secret = 'hunter2' DO NOTHING",
+        "INSERT INTO t VALUES (200, 3, 'x') ON CONFLICT (a) \
+         WHERE EXISTS (SELECT 1 WHERE secret = 'hunter2') DO NOTHING",
+    ] {
+        denied_both(&mut clerk, sql).await;
+    }
+    assert_eq!(table_t(&mut root).await, before);
 }

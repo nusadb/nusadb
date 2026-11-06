@@ -395,6 +395,7 @@ fn create_table_scope(ct: &ast::CreateTable) -> Vec<ScopedColumn> {
             enum_type: None,
             // Not a user `SELECT` read of a base table, so column-scoped SELECT never gates it.
             select_granted: true,
+            whole_row_rank: super::IN_SCOPE_ORDER,
         })
         .collect()
 }
@@ -618,6 +619,7 @@ fn resolve_column_defaults(
             enum_type: None,
             // Not a user `SELECT` read of a base table, so column-scoped SELECT never gates it.
             select_granted: true,
+            whole_row_rank: super::IN_SCOPE_ORDER,
         })
         .collect();
     let mut defaults = Vec::new();

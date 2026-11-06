@@ -1055,6 +1055,7 @@ UPDATE cities SET pop = pop + 1;              -- reaches capitals too
 UPDATE ONLY cities SET pop = 0;               -- just the parent's own rows
 DELETE FROM cities WHERE pop = 0;             -- likewise propagates; ONLY restricts
 UPDATE cities SET pop = 1 RETURNING *;        -- name, pop for every row, capitals included
+UPDATE cities SET pop = 2 RETURNING row_to_json(cities);  -- the same two columns on every row
 TRUNCATE cities;                              -- empties capitals too
 TRUNCATE ONLY cities;                         -- just the parent's own rows
 ```
@@ -2930,7 +2931,8 @@ read from the source of an `UPDATE ... FROM`, `DELETE ... USING` or `MERGE ... U
 needs `SELECT` on the columns its `RETURNING` hands back, on the columns of its `ON CONFLICT`
 arbiter, and on those its `DO UPDATE` reads (`excluded.col` included), and `DO UPDATE` needs
 `UPDATE` on the columns it sets. A write that reads no column of its target (`UPDATE t SET c = 1`,
-`INSERT` without `RETURNING`) needs no `SELECT` at all. The columns a
+`INSERT` without `RETURNING`) needs no `SELECT` at all. A whole row, as in `row_to_json(t)`, reads
+every column of `t`, and needs `SELECT` on each of them wherever a statement reads it. The columns a
 row-level security policy reads need no `SELECT`. The bootstrap superuser `nusadb-root` bypasses
 every check.
 

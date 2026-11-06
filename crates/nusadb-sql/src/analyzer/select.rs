@@ -1198,6 +1198,7 @@ pub(super) fn single_table_scope(table: &TableSchema) -> Vec<ScopedColumn> {
             // A policy predicate / derived (VALUES, window) column, not a user read of a base
             // table — column-scoped SELECT never gates it.
             select_granted: true,
+            whole_row_rank: super::IN_SCOPE_ORDER,
         })
         .collect()
 }
@@ -1591,6 +1592,7 @@ pub(super) fn analyze_set_operation(
             // A policy predicate / derived (VALUES, window) column, not a user read of a base
             // table — column-scoped SELECT never gates it.
             select_granted: true,
+            whole_row_rank: super::IN_SCOPE_ORDER,
         })
         .collect();
     let mut order_by = Vec::with_capacity(so.order_by.len());
@@ -1961,6 +1963,7 @@ fn analyze_select_scoped(
             // A policy predicate / derived (VALUES, window) column, not a user read of a base
             // table — column-scoped SELECT never gates it.
             select_granted: true,
+            whole_row_rank: super::IN_SCOPE_ORDER,
         }))
         .collect();
 
@@ -3738,19 +3741,9 @@ pub(super) fn analyze_projection(
                 }
                 // `*` expands to every column of every table in scope, in order, except a column
                 // hidden by a `USING`/`NATURAL` merge (the right side's coalesced copy) — it appears
-                // once, via the visible left column.
-                for (index, col) in visible.iter().enumerate() {
-                    if col.qualified_only {
-                        continue;
-                    }
-                    // `*` reads every column, so a column-restricted session must hold SELECT on all
-                    // of them (matching the reference engine, which refuses `SELECT *` otherwise).
-                    if !col.select_granted {
-                        return Err(Error::PermissionDenied(format!(
-                            "SELECT on column `{}` of table `{}`",
-                            col.def.name, col.qualifier
-                        )));
-                    }
+                // once, via the visible left column. It reads every column, so a column-restricted
+                // session must hold SELECT on all of them.
+                for (index, col) in super::whole_row_columns(visible, |c| !c.qualified_only)? {
                     projection.push(Projection {
                         expr: TypedExpr {
                             kind: TypedExprKind::Column(index),
@@ -3764,18 +3757,13 @@ pub(super) fn analyze_projection(
             },
             ast::SelectItem::QualifiedWildcard(table) => {
                 // `table.*` expands to every column owned by that table/alias, in order.
-                let mut matched = false;
-                for (index, col) in visible.iter().enumerate() {
-                    if col.qualifier != table {
-                        continue;
-                    }
-                    if !col.select_granted {
-                        return Err(Error::PermissionDenied(format!(
-                            "SELECT on column `{}` of table `{}`",
-                            col.def.name, col.qualifier
-                        )));
-                    }
-                    matched = true;
+                let columns = super::whole_row_columns(visible, |c| c.qualifier == table)?;
+                if columns.is_empty() {
+                    return Err(Error::InvalidStatement(format!(
+                        "`{table}.*` refers to a table not in the FROM clause"
+                    )));
+                }
+                for (index, col) in columns {
                     projection.push(Projection {
                         expr: TypedExpr {
                             kind: TypedExprKind::Column(index),
@@ -3785,11 +3773,6 @@ pub(super) fn analyze_projection(
                         },
                         name: col.def.name.clone(),
                     });
-                }
-                if !matched {
-                    return Err(Error::InvalidStatement(format!(
-                        "`{table}.*` refers to a table not in the FROM clause"
-                    )));
                 }
             },
             // A set-returning function is valid only at the top of a SELECT-list item, so it

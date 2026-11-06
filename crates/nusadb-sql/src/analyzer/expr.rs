@@ -2108,11 +2108,9 @@ fn analyze_row_to_json(
                 .iter()
                 .any(|c| &c.qualifier == name && !c.qualified_only) =>
         {
-            let mut typed = Vec::new();
-            for (index, col) in scope.iter().enumerate() {
-                if &col.qualifier != name || col.qualified_only {
-                    continue;
-                }
+            let columns = whole_row_columns(scope, |c| &c.qualifier == name && !c.qualified_only)?;
+            let mut typed = Vec::with_capacity(columns.len() * 2);
+            for (index, col) in columns {
                 typed.push(text_key(col.def.name.clone()));
                 typed.push(TypedExpr {
                     kind: TypedExprKind::Column(index),

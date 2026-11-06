@@ -3,7 +3,7 @@
 //! Split verbatim out of `analyzer/mod.rs` (ADR 007). Siblings resolve via `use super::*`.
 #![allow(clippy::wildcard_imports)]
 
-use std::borrow::Cow;
+use std::collections::HashMap;
 
 use super::*;
 
@@ -47,14 +47,19 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
     // SELECT on it: RETURNING hands back stored values (a default, a trigger's change, or the
     // existing row an upsert updated), and an arbiter reads the existing rows.
     let reads_target = !ins.returning.is_empty() || ins.on_conflict.is_some();
-    let readable = target_grants(&table, reads_target, catalog)?;
+    let target_cols = target_columns(&table, None, reads_target, catalog)?;
     // RETURNING projects the inserted rows: resolve it against the table's columns.
-    let returning = analyze_returning(&ins.returning, &table, &table.name, &readable, catalog)?;
+    let returning = analyze_returning(&ins.returning, &table, &table.name, &target_cols, catalog)?;
     // `ON CONFLICT`: `DO NOTHING` skips conflicting rows; `DO UPDATE` upserts the existing
     // row. Resolved against the target table (DO UPDATE also resolves the arbiter + EXCLUDED scope).
     let on_conflict = match ins.on_conflict {
         None => None,
-        Some(conflict) => Some(analyze_on_conflict(conflict, &table, &readable, catalog)?),
+        Some(conflict) => Some(analyze_on_conflict(
+            conflict,
+            &table,
+            &target_cols,
+            catalog,
+        )?),
     };
     let target_columns: Vec<ColumnDef> = targets
         .iter()
@@ -180,7 +185,7 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
 fn analyze_on_conflict(
     conflict: ast::OnConflict,
     table: &TableSchema,
-    readable: &[bool],
+    target_cols: &[TargetColumn],
     catalog: &dyn Catalog,
 ) -> Result<OnConflictPlan, Error> {
     let ast::ConflictAction::DoUpdate {
@@ -210,7 +215,7 @@ fn analyze_on_conflict(
     // column in the SET/WHERE refers to the existing (target) row. Both copies of a column are
     // readable only with SELECT on it.
     let mut scope = upsert_scope(table);
-    let both: Vec<bool> = readable.iter().chain(readable).copied().collect();
+    let both: Vec<TargetColumn> = target_cols.iter().chain(target_cols).copied().collect();
     gate_target_scope(&mut scope, &both);
     let mut typed = Vec::with_capacity(assignments.len());
     let mut seen = HashSet::new();
@@ -292,8 +297,13 @@ fn resolve_conflict_target(
             }
             // One complete expression, nothing after it.
             crate::parser::predicate_conjuncts(&predicate)?;
-            // The inference predicate reads only the target row: a boolean over its columns.
-            let typed = super::analyze_check_predicate(&predicate, table, &IndexExprCatalog)?;
+            require_read(&ordinals)?;
+            // The inference predicate reads only the target row: a boolean over its columns, each
+            // needing SELECT wherever the predicate refers to it.
+            let expr = crate::parser::parse_expression(&predicate)?;
+            let mut scope = single_table_scope(table);
+            gate_target_scope(&mut scope, &target_columns(table, None, true, catalog)?);
+            let typed = analyze_expr(&expr, &scope, &IndexExprCatalog, Some(ColumnType::Bool))?;
             if typed.ty != ColumnType::Bool {
                 return Err(Error::TypeMismatch {
                     context: "ON CONFLICT (columns) WHERE".to_owned(),
@@ -301,9 +311,6 @@ fn resolve_conflict_target(
                     found: typed.ty,
                 });
             }
-            let mut read = ordinals.clone();
-            crate::planner::collect_columns(&typed, &mut read);
-            require_read(&read)?;
             Ok(Some(ConflictArbiter::ColumnsWhere(ordinals, predicate)))
         },
         Some(ast::ConflictTarget::Constraint(name)) => {
@@ -339,6 +346,7 @@ fn upsert_scope(table: &TableSchema) -> Vec<ScopedColumn> {
         enum_type: None,
         // The `EXCLUDED` pseudo-relation of `ON CONFLICT` is the proposed row, not a base-table read.
         select_granted: true,
+        whole_row_rank: IN_SCOPE_ORDER,
     }));
     scope
 }
@@ -356,22 +364,22 @@ fn reject_conflict_subquery(expr: &TypedExpr) -> Result<(), Error> {
 
 /// Resolve a `RETURNING` clause against the affected table's columns. The scope is the
 /// affected row (every column of `table`, in table order), so `RETURNING *` and `RETURNING col`
-/// resolve like a single-table projection; `readable` (parallel to the columns) says which of them
-/// the session may `SELECT`, and a reference to any other is refused. Aggregates are not meaningful
+/// resolve like a single-table projection; `target_cols` (parallel to the columns) says which of
+/// them the session may `SELECT`, and a reference to any other is refused. Aggregates are not meaningful
 /// over a per-row `RETURNING` and are rejected. An empty clause yields an empty projection (the
 /// caller returns a row count).
 pub(super) fn analyze_returning(
     returning: &[ast::SelectItem],
     table: &TableSchema,
     qualifier: &str,
-    readable: &[bool],
+    target_cols: &[TargetColumn],
     catalog: &dyn Catalog,
 ) -> Result<Vec<Projection>, Error> {
     if returning.is_empty() {
         return Ok(Vec::new());
     }
     let mut scope = scope_of_aliased(table, qualifier);
-    gate_target_scope(&mut scope, readable);
+    gate_target_scope(&mut scope, target_cols);
     let mut aggregates = Vec::new();
     let source_len = scope.len();
     let projection = analyze_projection(
@@ -805,11 +813,7 @@ pub(super) fn analyze_update_stmt(
     // Each descendant is reached through the parent: its target takes the parent's privileges and
     // row-level security, so all of them share one lookup of the parent's grants.
     let parent_table = plan.table.clone();
-    let select_grants = target_grants(&parent_table, update_reads_target(&upd), catalog)?;
-    let via = Via {
-        parent: &parent_table,
-        select_grants: &select_grants,
-    };
+    let via = Via::new(&parent_table, update_reads_target(&upd), catalog)?;
     for descendant in descendants {
         // The descendant is a schema-qualified edge key, bare for `public`; split it and name the
         // schema explicitly so the sub-plan targets exactly the recorded table. A bare name would
@@ -843,11 +847,7 @@ pub(super) fn analyze_delete_stmt(
     let mut plan = analyze_delete(parent, catalog, None)?;
     // As in `analyze_update_stmt`: each descendant's target is reached through the parent.
     let parent_table = plan.table.clone();
-    let select_grants = target_grants(&parent_table, delete_reads_target(&del), catalog)?;
-    let via = Via {
-        parent: &parent_table,
-        select_grants: &select_grants,
-    };
+    let via = Via::new(&parent_table, delete_reads_target(&del), catalog)?;
     for descendant in descendants {
         // As in `analyze_update_stmt`: split the qualified edge key into the sub-plan's target.
         let (sub_schema, sub_name) = super::split_qualified(&descendant);
@@ -866,7 +866,47 @@ pub(super) struct Via<'a> {
     /// The table the statement names.
     parent: &'a TableSchema,
     /// The session's SELECT on the parent's columns, parallel to them.
-    select_grants: &'a [bool],
+    select_grants: Vec<bool>,
+    /// Each column of the parent by name, as its position there. A target holds the parent's
+    /// columns under the same names, wherever it holds them.
+    positions: HashMap<&'a str, usize>,
+}
+
+impl<'a> Via<'a> {
+    /// One lookup of the session's grants on `parent`, for all the targets reached through it.
+    fn new(
+        parent: &'a TableSchema,
+        reads_target: bool,
+        catalog: &dyn Catalog,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            parent,
+            select_grants: target_grants(parent, reads_target, catalog)?,
+            positions: parent
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(position, c)| (c.name.as_str(), position))
+                .collect(),
+        })
+    }
+}
+
+/// What a statement on a write target may do with one of the target's columns.
+#[derive(Clone, Copy)]
+pub(super) struct TargetColumn {
+    /// Whether the session may read it.
+    readable: bool,
+    /// Its [`ScopedColumn::whole_row_rank`].
+    whole_row_rank: Option<usize>,
+}
+
+impl TargetColumn {
+    /// A column the session may read, for a target whose reads were authorized elsewhere.
+    const READABLE: Self = Self {
+        readable: true,
+        whole_row_rank: IN_SCOPE_ORDER,
+    };
 }
 
 /// Whether a statement can read a column of its target: only a `WHERE`, a `RETURNING` or a `SET`
@@ -900,74 +940,48 @@ fn target_grants(
     }
 }
 
-/// Whether the session may read each column of `table`, the target of a write, parallel to
-/// `table.columns`. Without `via` these are the grants on `table`; a target reached through a parent
-/// takes the parent's, a column being readable with SELECT on the parent's column of the same name.
-fn target_readable(
+/// What the statement may do with each column of `table`, the target of a write, parallel to
+/// `table.columns`. Without `via` the columns are read on the grants on `table`. A target reached
+/// through a parent stands for the row of the table the statement names: a column is readable with
+/// SELECT on the parent's column of the same name, a whole row takes the parent's columns in the
+/// parent's order, and a column the parent does not have is neither.
+fn target_columns(
     table: &TableSchema,
     via: Option<&Via<'_>>,
     reads_target: bool,
     catalog: &dyn Catalog,
-) -> Result<Vec<bool>, Error> {
+) -> Result<Vec<TargetColumn>, Error> {
     let Some(via) = via else {
-        return target_grants(table, reads_target, catalog);
+        let grants = target_grants(table, reads_target, catalog)?;
+        return Ok(grants
+            .into_iter()
+            .map(|readable| TargetColumn {
+                readable,
+                whole_row_rank: IN_SCOPE_ORDER,
+            })
+            .collect());
     };
     Ok(table
         .columns
         .iter()
         .map(|c| {
-            via.parent
-                .columns
-                .iter()
-                .zip(via.select_grants)
-                .any(|(a, &granted)| granted && a.name == c.name)
+            let position = via.positions.get(c.name.as_str()).copied();
+            TargetColumn {
+                readable: position.is_some_and(|p| via.select_grants.get(p) == Some(&true)),
+                whole_row_rank: position,
+            }
         })
         .collect())
 }
 
-/// The `RETURNING` items of a write on a target named `qualifier`. Through a parent, the statement
-/// returns the columns of the table it names: a wildcard stands for the parent's columns, by name
-/// and in the parent's order, whatever columns the target holding the row adds or where it holds
-/// them. Each is then a reference to its column, checked and resolved like one written out.
-fn returning_of_target<'a>(
-    returning: &'a [ast::SelectItem],
-    via: Option<&Via<'_>>,
-    qualifier: &str,
-) -> Cow<'a, [ast::SelectItem]> {
-    let Some(via) = via else {
-        return Cow::Borrowed(returning);
-    };
-    let column_item = |expr| ast::SelectItem::Expr { expr, alias: None };
-    let columns = via.parent.columns.iter();
-    let mut items = Vec::with_capacity(returning.len());
-    for item in returning {
-        match item {
-            ast::SelectItem::Wildcard => items.extend(
-                columns
-                    .clone()
-                    .map(|c| column_item(ast::Expr::Column(c.name.clone()))),
-            ),
-            ast::SelectItem::QualifiedWildcard(table) if table == qualifier => {
-                items.extend(columns.clone().map(|c| {
-                    column_item(ast::Expr::QualifiedColumn {
-                        table: table.clone(),
-                        column: c.name.clone(),
-                    })
-                }));
-            },
-            other => items.push(other.clone()),
-        }
-    }
-    Cow::Owned(items)
-}
-
-/// Mark each column of a write target's scope readable as far as `readable` (parallel to the
-/// target's columns, which lead the scope) allows, so a reference to a column the session may not
-/// `SELECT` is refused wherever the statement reads it: a `SET` expression, the `WHERE`, `RETURNING`
-/// or a subquery correlated to the target row.
-fn gate_target_scope(scope: &mut [ScopedColumn], readable: &[bool]) {
-    for (col, &granted) in scope.iter_mut().zip(readable) {
-        col.select_granted = granted;
+/// Mark each column of a write target's scope as `target_cols` (parallel to the target's columns,
+/// which lead the scope) says, so a reference to a column the session may not `SELECT` is refused
+/// wherever the statement reads it: a `SET` expression, the `WHERE`, `RETURNING` or a subquery
+/// correlated to the target row, alone or as part of a whole row.
+fn gate_target_scope(scope: &mut [ScopedColumn], target_cols: &[TargetColumn]) {
+    for (col, target) in scope.iter_mut().zip(target_cols) {
+        col.select_granted = target.readable;
+        col.whole_row_rank = target.whole_row_rank;
     }
 }
 
@@ -1031,13 +1045,12 @@ pub(super) fn analyze_update(
     // correlated subquery, needs SELECT on it (table-wide or on the column). An unconditional
     // `UPDATE t SET c = 1` reads nothing and needs only UPDATE, which keeps a write-only role
     // write-only.
-    let readable = target_readable(&table, via, update_reads_target(&upd), catalog)?;
+    let target_cols = target_columns(&table, via, update_reads_target(&upd), catalog)?;
     // The statement names the target by its alias, else by the table it names: the parent, for a
     // sub-plan reached through it.
     let target_qual = upd.alias.clone().unwrap_or_else(|| access.name.clone());
     // RETURNING projects the updated rows, resolved against the table's (post-update) columns.
-    let returning_items = returning_of_target(&upd.returning, via, &target_qual);
-    let returning = analyze_returning(&returning_items, &table, &target_qual, &readable, catalog)?;
+    let returning = analyze_returning(&upd.returning, &table, &target_qual, &target_cols, catalog)?;
     // UPDATE ... FROM: resolve a single named FROM table and extend the scope with it, so the
     // SET values and WHERE may reference its columns (at ordinals `target_width + j` of the
     // concatenated `target ++ from` row the executor evaluates against).
@@ -1050,7 +1063,7 @@ pub(super) fn analyze_update(
     // `base_scope` (ungated) so composite/enum columns carry their type names — `(col).field` in the
     // WHERE / SET expressions resolves exactly as it does in a SELECT.
     let mut scope = base_scope(&table, &target_qual, catalog, false)?;
-    gate_target_scope(&mut scope, &readable);
+    gate_target_scope(&mut scope, &target_cols);
     let mut from_table: Option<TableSchema> = None;
     let mut from_plan: Option<Box<SelectPlan>> = None;
     if let Some((qualifier, (schema, plan, readable))) = from {
@@ -1174,6 +1187,7 @@ fn aux_scope(table: &TableSchema, qualifier: &str, readable: &[bool]) -> Vec<Sco
             // Composite field access on a secondary UPDATE/DELETE source is out of first-cut scope.
             composite_type: None,
             select_granted,
+            whole_row_rank: IN_SCOPE_ORDER,
             enum_type: None,
         })
         .collect()
@@ -1211,12 +1225,11 @@ pub(super) fn analyze_delete(
     let access = via.map_or(&table, |v| v.parent).clone();
     super::dcl::require_table_privilege(catalog, &access, ast::Privilege::Delete)?;
     // As for UPDATE: every column of the target the statement reads needs SELECT on it.
-    let readable = target_readable(&table, via, delete_reads_target(&del), catalog)?;
+    let target_cols = target_columns(&table, via, delete_reads_target(&del), catalog)?;
     // As for UPDATE: the target goes by its alias, else by the table the statement names.
     let target_qual = del.alias.clone().unwrap_or_else(|| access.name.clone());
     // RETURNING projects the deleted rows, resolved against the table's columns.
-    let returning_items = returning_of_target(&del.returning, via, &target_qual);
-    let returning = analyze_returning(&returning_items, &table, &target_qual, &readable, catalog)?;
+    let returning = analyze_returning(&del.returning, &table, &target_qual, &target_cols, catalog)?;
     // DELETE ... USING: resolve a single named source table and extend the scope, so the
     // WHERE may reference its columns (at ordinals `target_width + j` of `target ++ using`). Reuses
     // the same single-named-table resolution as UPDATE ... FROM.
@@ -1229,7 +1242,7 @@ pub(super) fn analyze_delete(
     // exactly as `UPDATE t AS x` does. Built via `base_scope` (ungated) so composite/enum columns
     // carry their type names — `(col).field` in the WHERE resolves exactly as in a SELECT.
     let mut scope = base_scope(&table, &target_qual, catalog, false)?;
-    gate_target_scope(&mut scope, &readable);
+    gate_target_scope(&mut scope, &target_cols);
     let mut using_table: Option<TableSchema> = None;
     let mut using_plan: Option<Box<SelectPlan>> = None;
     if let Some((qualifier, (schema, plan, readable))) = using {
@@ -1519,7 +1532,7 @@ pub(super) fn analyze_instead_of_insert(
         &ins.returning,
         &schema,
         &schema.name,
-        &vec![true; schema.columns.len()],
+        &vec![TargetColumn::READABLE; schema.columns.len()],
         catalog,
     )?;
     let null_for = |ty| TypedExpr {
@@ -1628,7 +1641,7 @@ pub(super) fn analyze_instead_of_update(
         &upd.returning,
         &schema,
         &schema.name,
-        &vec![true; schema.columns.len()],
+        &vec![TargetColumn::READABLE; schema.columns.len()],
         catalog,
     )?;
     Ok(LogicalPlan::InsteadOfDml(Box::new(
@@ -1669,7 +1682,7 @@ pub(super) fn analyze_instead_of_delete(
         &del.returning,
         &schema,
         &schema.name,
-        &vec![true; schema.columns.len()],
+        &vec![TargetColumn::READABLE; schema.columns.len()],
         catalog,
     )?;
     Ok(LogicalPlan::InsteadOfDml(Box::new(

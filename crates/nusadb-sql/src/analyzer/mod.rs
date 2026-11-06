@@ -2292,6 +2292,45 @@ pub(crate) struct ScopedColumn {
     /// a `false` column (or expanding it via `*`) is a permission error. `true` for every derived
     /// column (CTE, projection, `VALUES`) and whenever the session holds table-wide SELECT.
     select_granted: bool,
+    /// This column's place in a reference to its whole relation (`*`, `t.*`, `row_to_json(t)`), see
+    /// [`whole_row_columns`]: the reference takes the columns by this rank, ties in scope order, and
+    /// leaves out a column ranked `None`. Every column ranks [`IN_SCOPE_ORDER`] except those of a
+    /// write's target reached through a parent, whose whole row is the parent's.
+    whole_row_rank: Option<usize>,
+}
+
+/// The [`ScopedColumn::whole_row_rank`] of a column a whole-row reference takes in scope order.
+const IN_SCOPE_ORDER: Option<usize> = Some(0);
+
+/// The columns a reference to a whole relation reads, as `(ordinal, column)`: those `of_relation`
+/// picks out, in the order the relation gives them. Such a reference names no column for
+/// [`resolve_scoped`] to check, so every form of it comes through here, where each column it would
+/// expand needs SELECT.
+fn whole_row_columns(
+    scope: &[ScopedColumn],
+    of_relation: impl Fn(&ScopedColumn) -> bool,
+) -> Result<Vec<(usize, &ScopedColumn)>, Error> {
+    let mut columns = Vec::with_capacity(scope.len());
+    for (ordinal, col) in scope.iter().enumerate() {
+        if !of_relation(col) {
+            continue;
+        }
+        let Some(rank) = col.whole_row_rank else {
+            continue;
+        };
+        if !col.select_granted {
+            return Err(Error::PermissionDenied(format!(
+                "SELECT on column `{}` of table `{}`",
+                col.def.name, col.qualifier
+            )));
+        }
+        columns.push((rank, ordinal, col));
+    }
+    columns.sort_by_key(|&(rank, ..)| rank);
+    Ok(columns
+        .into_iter()
+        .map(|(_, ordinal, col)| (ordinal, col))
+        .collect())
 }
 
 /// Build a base-table `SELECT` scope, enriching each column with its user-defined composite type
@@ -2333,6 +2372,7 @@ pub(crate) fn base_scope(
             composite_type,
             enum_type,
             select_granted,
+            whole_row_rank: IN_SCOPE_ORDER,
         });
     }
     Ok(out)
@@ -2374,9 +2414,10 @@ pub(crate) fn scope_of_aliased(table: &TableSchema, qualifier: &str) -> Vec<Scop
             // DML-target builder has no catalog, so composite field access there is not resolved.
             composite_type: None,
             enum_type: None,
-            // The UPDATE/DELETE target's own reads are gated table-wide (see `analyze_update`), not
-            // per column, so the target scope is always selectable here.
+            // The caller decides what the session may read of a write's target: it gates this scope
+            // (see `gate_target_scope`) unless the statement needs SELECT on the whole table.
             select_granted: true,
+            whole_row_rank: IN_SCOPE_ORDER,
         })
         .collect()
 }

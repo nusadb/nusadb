@@ -1047,3 +1047,94 @@ fn a_wildcard_returning_keeps_the_columns_of_the_table_named() {
         )
     );
 }
+
+/// `row_to_json` of a parent a write goes through stands for the parent's columns, in the parent's
+/// order, however the table holding the row lays them out, as `SELECT row_to_json(ip) FROM ip` does.
+#[test]
+fn a_whole_row_through_a_parent_is_the_parents_columns() {
+    let engine = returning_fixture();
+    root(&engine, "CREATE TABLE ig (more TEXT) INHERITS (ic)");
+    root(&engine, "INSERT INTO ig VALUES (3, 30, 'hidden', 'also')");
+    root(&engine, "ALTER TABLE ip ADD COLUMN z INT DEFAULT 7");
+    root(&engine, "GRANT SELECT (z) ON ip TO narrow");
+    let json = |rows: Vec<&str>| {
+        rows.into_iter()
+            .map(|r| vec![Value::Text(r.to_owned())])
+            .collect::<Vec<_>>()
+    };
+    let expected = json(vec![
+        r#"{"id": 1, "v": 0, "z": 7}"#,
+        r#"{"id": 2, "v": 0, "z": 7}"#,
+        r#"{"id": 3, "v": 0, "z": 7}"#,
+    ]);
+    for role in ["whole", "narrow"] {
+        for sql in [
+            "UPDATE ip SET v = 0 RETURNING row_to_json(ip)::text",
+            "UPDATE ip AS x SET v = 0 RETURNING row_to_json(x)::text",
+        ] {
+            assert_eq!(rows(ok_as(&engine, role, sql)), expected, "{role}: {sql}");
+        }
+        assert_eq!(
+            rows(ok_as(
+                &engine,
+                role,
+                "SELECT row_to_json(ip)::text FROM ip ORDER BY id"
+            )),
+            expected,
+            "{role}"
+        );
+    }
+    // A column only a child adds decides nothing: it is not part of the row read.
+    let hidden = "UPDATE ip SET v = 1 WHERE row_to_json(ip)::text LIKE '%hidden%'";
+    assert!(matches!(
+        ok_as(&engine, "narrow", hidden),
+        ExecutionResult::Updated(0)
+    ));
+    let hidden = "DELETE FROM ip WHERE row_to_json(ip)::text LIKE '%secret%'";
+    assert!(matches!(
+        ok_as(&engine, "narrow", hidden),
+        ExecutionResult::Deleted(0)
+    ));
+    assert_eq!(
+        rows(ok_as(
+            &engine,
+            "narrow",
+            "DELETE FROM ip WHERE id = 3 RETURNING row_to_json(ip)::text"
+        )),
+        json(vec![r#"{"id": 3, "v": 0, "z": 7}"#])
+    );
+    // Named directly, a table's whole row is its own.
+    assert_eq!(
+        rows(ok_as(
+            &engine,
+            ROOT,
+            "UPDATE ONLY ic SET v = 5 RETURNING row_to_json(ic)::text"
+        )),
+        json(vec![r#"{"id": 2, "v": 5, "extra": "secret", "z": 7}"#])
+    );
+}
+
+/// A whole row through a parent still needs SELECT on each of the parent's columns.
+#[test]
+fn a_whole_row_through_a_parent_needs_select_on_its_columns() {
+    let engine = returning_fixture();
+    root(&engine, "CREATE ROLE blind LOGIN");
+    root(
+        &engine,
+        "GRANT SELECT (id), UPDATE (v), DELETE ON ip TO blind",
+    );
+    root(
+        &engine,
+        "GRANT SELECT (id), UPDATE (v), DELETE ON pp TO blind",
+    );
+    for sql in [
+        "UPDATE ip SET v = 1 RETURNING row_to_json(ip)",
+        "UPDATE pp SET v = 1 RETURNING row_to_json(pp)",
+        "UPDATE ip SET v = 1 WHERE row_to_json(ip)::text LIKE '%1%'",
+        "DELETE FROM ip RETURNING row_to_json(ip)",
+        "DELETE FROM pp WHERE row_to_json(pp)::text LIKE '%1%'",
+        "SELECT row_to_json(ip) FROM ip",
+    ] {
+        denied_as(&engine, "blind", sql, "SELECT on column `v`");
+    }
+}
