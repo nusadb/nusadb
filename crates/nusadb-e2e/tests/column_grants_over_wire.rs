@@ -204,6 +204,20 @@ async fn a_revoke_reaches_the_next_statement_of_its_own_transaction() {
     denied(&mut root, read).await;
 }
 
+/// A nested body's statement is a statement too: its check does not outlive it.
+#[tokio::test]
+async fn a_revoke_reaches_the_next_nested_body_of_an_open_transaction() {
+    let (engine, mut root) = fixture().await;
+    let mut clerk = open(&engine, "clerk").await;
+    let body = "DO $$ UPDATE t SET v = s $$";
+    ok(&mut clerk, "BEGIN").await;
+    ok(&mut clerk, body).await;
+    ok(&mut clerk, body).await;
+    ok(&mut root, "REVOKE SELECT (s) ON t FROM clerk").await;
+    denied(&mut clerk, body).await;
+    ok(&mut clerk, "ROLLBACK").await;
+}
+
 #[tokio::test]
 async fn a_wildcard_returning_through_a_parent_is_the_parents_columns_over_the_wire() {
     let (engine, mut root) = fixture().await;

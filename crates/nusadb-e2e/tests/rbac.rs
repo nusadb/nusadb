@@ -1149,6 +1149,55 @@ fn only_a_write_that_reads_nothing_of_its_target_goes_without_select() {
     );
 }
 
+/// A nested body is analyzed through its own catalog, which keeps the role's column decisions for
+/// one statement only: a revoke reaches the next body the role runs, in the same transaction too.
+#[test]
+fn a_nested_body_sees_a_revoke_made_after_the_last_one_ran() {
+    let engine = column_fixture();
+    root(
+        &engine,
+        "GRANT SELECT (a, secret), UPDATE (b) ON t TO clerk",
+    );
+    root(
+        &engine,
+        "CREATE PROCEDURE copy_secret() AS $$ UPDATE t SET b = secret $$",
+    );
+    let bodies = ["DO $$ UPDATE t SET b = secret $$", "CALL copy_secret()"];
+
+    for body in bodies {
+        ok_as(&engine, "clerk", body);
+        ok_as(&engine, "clerk", body);
+    }
+    root(&engine, "REVOKE SELECT (secret) ON t FROM clerk");
+    for body in bodies {
+        denied_as(&engine, "clerk", body);
+    }
+    root(&engine, "GRANT SELECT (secret) ON t TO clerk");
+
+    let in_block = |sql: &str, session: &mut Session<'_>| {
+        let stmt = parse(sql).unwrap();
+        let catalog = RbacCatalog {
+            engine: &engine,
+            user: "clerk",
+        };
+        session
+            .execute(plan(analyze(stmt, &catalog).unwrap()))
+            .map_err(|e| e.to_string())
+    };
+    for body in bodies {
+        let mut session = Session::new(&engine);
+        session.set_current_user("clerk");
+        in_block("BEGIN", &mut session).unwrap();
+        in_block(body, &mut session).unwrap();
+        in_block(body, &mut session).unwrap();
+        root(&engine, "REVOKE SELECT (secret) ON t FROM clerk");
+        let refused = in_block(body, &mut session).unwrap_err();
+        assert!(refused.contains("permission denied"), "{body}: {refused}");
+        in_block("ROLLBACK", &mut session).unwrap();
+        root(&engine, "GRANT SELECT (secret) ON t TO clerk");
+    }
+}
+
 /// An `INSERT` that reads rows back, through `RETURNING` or an `ON CONFLICT` clause, needs SELECT
 /// on each column it reads, and an `ON CONFLICT DO UPDATE` needs UPDATE on each column it sets.
 #[test]
