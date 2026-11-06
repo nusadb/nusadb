@@ -221,6 +221,11 @@ impl<'a> RecordingCatalog<'a> {
 }
 
 impl Catalog for RecordingCatalog<'_> {
+    fn catalog_for_stored_sql(&self) -> &dyn Catalog {
+        // Itself, not the wrapped catalog: what a stored definition reads is recorded like the rest.
+        self
+    }
+
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
         let schema = self.inner.lookup_table(name)?;
         if let Some(s) = &schema {
@@ -242,6 +247,10 @@ impl Catalog for RecordingCatalog<'_> {
         // session path during cached-plan analysis, not the default `public`, or the wire's read
         // path would bind bare names to the wrong schema.
         self.inner.search_path()
+    }
+
+    fn current_schema(&self) -> String {
+        self.inner.current_schema()
     }
 
     fn temp_schema(&self) -> Option<String> {

@@ -23,6 +23,7 @@ use nusadb_sql::{Catalog, ExecutionResult, IndexInfo, Session, analyze, execute,
 struct EngineCatalog<'a>(&'a dyn StorageEngine);
 
 impl Catalog for EngineCatalog<'_> {
+    nusadb_test_utils::catalog_answers_as_superuser!(nusadb_sql);
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, nusadb_sql::Error> {
         self.0.lookup_table(name).map_err(Into::into)
     }
@@ -178,6 +179,62 @@ impl Catalog for RlsCatalog<'_> {
         let policies = nusadb_sql::lookup_policies_for(self.engine, txn, schema, name);
         let _ = self.engine.rollback(txn);
         policies
+    }
+    fn catalog_for_stored_sql(&self) -> &dyn nusadb_sql::Catalog {
+        self
+    }
+    fn has_privilege(
+        &self,
+        _kind: nusadb_sql::ast::ObjectKind,
+        _object: &str,
+        _privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn has_column_privilege(
+        &self,
+        _object: &str,
+        _column: &str,
+        _privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn has_any_column_privilege(
+        &self,
+        _object: &str,
+        _privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_grant_object(
+        &self,
+        _kind: nusadb_sql::ast::ObjectKind,
+        _object: &str,
+        _privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_create_role(&self) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_create_database(&self) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_administer_role(&self, _role: &str) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_assume_role(&self, _role: &str) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn role_exists(&self, _name: &str) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn owns_object(
+        &self,
+        _kind: nusadb_sql::ast::ObjectKind,
+        _object: &str,
+    ) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
     }
 }
 
@@ -11202,6 +11259,7 @@ struct TempCatalog<'a> {
 }
 
 impl Catalog for TempCatalog<'_> {
+    nusadb_test_utils::catalog_answers_as_superuser!(nusadb_sql);
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, nusadb_sql::Error> {
         self.engine.lookup_table(name).map_err(Into::into)
     }

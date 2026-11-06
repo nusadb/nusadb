@@ -1404,6 +1404,7 @@ mod tests {
         use crate::{Catalog, IndexInfo, Session, analyze, parse, plan};
         struct Cat<'a>(&'a dyn StorageEngine, Option<TxnId>);
         impl Catalog for Cat<'_> {
+            nusadb_test_utils::catalog_answers_as_superuser!(crate);
             fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
                 self.1
                     .map_or_else(
@@ -1451,6 +1452,7 @@ mod tests {
         use crate::{Catalog, IndexInfo, Session, analyze, parse, plan};
         struct Cat<'a>(&'a dyn StorageEngine, Option<TxnId>);
         impl Catalog for Cat<'_> {
+            nusadb_test_utils::catalog_answers_as_superuser!(crate);
             fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
                 self.1
                     .map_or_else(

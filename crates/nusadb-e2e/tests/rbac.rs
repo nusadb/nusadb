@@ -2,9 +2,8 @@
 //! manage them.
 //!
 //! These drive the real enforcement path. The catalog below answers privilege questions from the
-//! actual role and privilege catalogs, exactly as the wire server's adapter does — a permissive
-//! stand-in would make every assertion here vacuous, since the `Catalog` trait's defaults grant
-//! everything so that embeddings without a role catalog behave as they did before.
+//! actual role and privilege catalogs, exactly as the wire server's adapter does: a permissive
+//! stand-in would make every assertion here vacuous.
 
 #![allow(
     clippy::unwrap_used,
@@ -174,6 +173,9 @@ impl Catalog for RbacCatalog<'_> {
         name: &str,
     ) -> Result<Vec<nusadb_sql::PolicyDef>, nusadb_sql::Error> {
         self.with_txn(|txn| nusadb_sql::lookup_policies_for(self.engine, txn, schema, name))
+    }
+    fn catalog_for_stored_sql(&self) -> &dyn nusadb_sql::Catalog {
+        self
     }
 }
 
@@ -455,10 +457,9 @@ fn a_view_is_not_a_way_around_the_check_on_its_base_table() {
 #[test]
 fn a_nested_body_does_not_run_as_superuser() {
     let engine = fixture();
-    // The catalog used to analyze a `DO` / `CALL` / trigger body took the trait's permissive
-    // defaults, so `is_superuser()` was true inside it and the body could write the role catalog —
-    // handing any authenticated role a superuser row. The body must be analyzed as the same role
-    // that reached it.
+    // A catalog that answered a `DO` / `CALL` / trigger body as a superuser would let the body
+    // write the role catalog, handing any authenticated role a superuser row. The body must be
+    // analyzed as the same role that reached it.
     let err = as_role(
         &engine,
         "app",
@@ -1667,4 +1668,20 @@ fn create_schema_is_not_opened_by_a_schema_grant() {
     let engine = fixture();
     root(&engine, "GRANT CREATE ON SCHEMA public TO app");
     denied_as(&engine, "app", "CREATE SCHEMA evil_schema");
+}
+
+/// The recursive term of a CTE is analyzed under an overlay of the catalog, which changes what the
+/// CTE's name means and nothing else.
+#[test]
+fn a_recursive_term_is_checked_like_any_other_read() {
+    let engine = fixture();
+    root(&engine, "CREATE TABLE guarded (id INT, secret TEXT)");
+    root(&engine, "INSERT INTO guarded VALUES (1, 'kept')");
+    let read = "WITH RECURSIVE r(n, s) AS (SELECT 1, ''::text UNION ALL \
+                SELECT n + 1, x.secret FROM r, guarded x WHERE n < 2) SELECT * FROM r";
+    denied_as(&engine, "app", read);
+    root(&engine, "GRANT SELECT (id) ON guarded TO app");
+    denied_as(&engine, "app", read);
+    root(&engine, "GRANT SELECT ON guarded TO app");
+    assert_eq!(rows(ok_as(&engine, "app", read)).len(), 2);
 }

@@ -19,6 +19,7 @@ use nusadb_sql::{Catalog, Error, ExecutionResult, IndexInfo, Session, analyze, p
 
 struct Cat<'a>(&'a dyn StorageEngine);
 impl Catalog for Cat<'_> {
+    nusadb_test_utils::catalog_answers_as_superuser!(nusadb_sql);
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
         self.0.lookup_table(name).map_err(Into::into)
     }

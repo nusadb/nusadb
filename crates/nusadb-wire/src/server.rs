@@ -5848,6 +5848,10 @@ impl<'a> EngineCatalog<'a> {
 }
 
 impl Catalog for EngineCatalog<'_> {
+    fn catalog_for_stored_sql(&self) -> &dyn Catalog {
+        self
+    }
+
     fn search_path(&self) -> Vec<String> {
         self.search_path.clone()
     }
@@ -6065,8 +6069,6 @@ impl Catalog for EngineCatalog<'_> {
     }
 
     fn may_create_database(&self) -> Result<bool, nusadb_sql::Error> {
-        // Without this the trait's permissive default answered, and any login role could create
-        // a schema or database over the wire.
         nusadb_sql::rbac::may_create_database(self.engine, self.txn, self.user)
     }
 

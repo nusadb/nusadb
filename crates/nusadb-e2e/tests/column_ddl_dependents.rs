@@ -37,6 +37,7 @@ impl TxnCatalog<'_> {
 }
 
 impl Catalog for TxnCatalog<'_> {
+    nusadb_test_utils::catalog_answers_as_superuser!(nusadb_sql);
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, nusadb_sql::Error> {
         self.lookup_table_in(nusadb_core::PUBLIC_SCHEMA, name)
     }

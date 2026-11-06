@@ -458,6 +458,7 @@ impl StorageEngine for Interleave {
 struct EngineCatalog<'a>(&'a dyn StorageEngine);
 
 impl Catalog for EngineCatalog<'_> {
+    nusadb_test_utils::catalog_answers_as_superuser!(nusadb_sql);
     fn lookup_table(
         &self,
         name: &str,

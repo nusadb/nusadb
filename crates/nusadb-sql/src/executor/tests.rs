@@ -389,6 +389,7 @@ impl StorageEngine for MockEngine {
 }
 
 impl Catalog for MockEngine {
+    nusadb_test_utils::catalog_answers_as_superuser!(crate);
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
         StorageEngine::lookup_table(self, name).map_err(Error::from)
     }
@@ -4226,8 +4227,8 @@ fn an_unrecorded_marker_refuses_a_toggle_but_not_a_drop() {
     use super::row;
 
     /// Answers `lookup_table` and `lookup_table_in` so both a bare and a qualified target can be
-    /// named. Everything else is the trait default: `is_superuser` and `owns_object` are `true`,
-    /// so nothing here says anything about authorization.
+    /// named. Access questions are answered as a superuser, so nothing here says anything about
+    /// authorization, and everything else is the trait default.
     ///
     /// One default is live rather than merely unused: `temp_schema` reads the executor
     /// thread-local shared by every test in this binary, and `lookup_table_ref` probes it before
@@ -4236,6 +4237,7 @@ fn an_unrecorded_marker_refuses_a_toggle_but_not_a_drop() {
     /// next person to extend this fixture is the one who would trip it.
     struct OverEngine<'a>(&'a BtreeEngine);
     impl Catalog for OverEngine<'_> {
+        nusadb_test_utils::catalog_answers_as_superuser!(crate);
         fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
             StorageEngine::lookup_table(self.0, name).map_err(Error::from)
         }
@@ -4356,6 +4358,7 @@ fn create_and_drop_policy_agree_on_the_namespace() {
     struct Elsewhere<'a>(&'a MockEngine);
 
     impl Catalog for Elsewhere<'_> {
+        nusadb_test_utils::catalog_answers_as_superuser!(crate);
         fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
             Ok(Catalog::lookup_table(self.0, name)?.map(|mut t| {
                 t.schema = "app".to_owned();
@@ -4611,6 +4614,7 @@ fn dml_point_lookup_uses_an_implied_partial_unique_index() {
 
     struct Cat<'a>(&'a BtreeEngine);
     impl Catalog for Cat<'_> {
+        nusadb_test_utils::catalog_answers_as_superuser!(crate);
         fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
             self.0.lookup_table(name).map_err(Into::into)
         }
@@ -4671,6 +4675,7 @@ fn reindex_repairs_partial_index_membership() {
 
     struct Cat<'a>(&'a BtreeEngine);
     impl Catalog for Cat<'_> {
+        nusadb_test_utils::catalog_answers_as_superuser!(crate);
         fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
             self.0.lookup_table(name).map_err(Into::into)
         }

@@ -157,6 +157,32 @@ impl Catalog for RoleCatalog<'_> {
             nusadb_sql::rbac::owns_object(self.engine, txn, self.user, kind, object)
         })
     }
+    fn catalog_for_stored_sql(&self) -> &dyn nusadb_sql::Catalog {
+        self
+    }
+    fn may_grant_object(
+        &self,
+        _kind: nusadb_sql::ast::ObjectKind,
+        _object: &str,
+        _privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_create_role(&self) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_create_database(&self) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_administer_role(&self, _role: &str) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_assume_role(&self, _role: &str) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn role_exists(&self, _name: &str) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
 }
 
 /// The bootstrap superuser, used for every setup statement.

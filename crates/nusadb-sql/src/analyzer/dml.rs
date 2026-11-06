@@ -309,7 +309,7 @@ fn resolve_conflict_target(
             let expr = crate::parser::parse_expression(&predicate)?;
             let mut scope = single_table_scope(table);
             gate_target_scope(&mut scope, &target_columns(table, None, true, catalog)?);
-            let typed = analyze_expr(&expr, &scope, &IndexExprCatalog, Some(ColumnType::Bool))?;
+            let typed = analyze_expr(&expr, &scope, &EmptyCatalog, Some(ColumnType::Bool))?;
             if typed.ty != ColumnType::Bool {
                 return Err(Error::TypeMismatch {
                     context: "ON CONFLICT (columns) WHERE".to_owned(),
@@ -450,7 +450,7 @@ pub(super) fn analyze_create_index(
     // whose lookup the write path lacks) is rejected LOUDLY now rather than silently producing an
     // index that maintenance can never populate. Built-in functions
     // and Rust UDFs resolve without a catalog, so they still pass.
-    let index_catalog = IndexExprCatalog;
+    let index_catalog = EmptyCatalog;
     for expr_sql in &ci.key_exprs {
         validate_index_key_expr(expr_sql, &table, &index_catalog)?;
     }
@@ -524,20 +524,6 @@ pub(super) fn analyze_create_index(
         vector,
         if_not_exists: ci.if_not_exists,
     })
-}
-
-/// The minimal catalog an index key/predicate is validated against at `CREATE INDEX` — it exposes
-/// no tables and no functions, exactly matching what the executor's write-path re-analysis sees
-/// (a row-only scope with no catalog). A SQL `CREATE FUNCTION` UDF in a key/predicate therefore
-/// fails to resolve here and is rejected loudly, rather than being accepted and then silently
-/// unmaintainable. Built-in scalar functions and Rust UDFs resolve
-/// from static registries without a catalog, so they still validate.
-struct IndexExprCatalog;
-
-impl Catalog for IndexExprCatalog {
-    fn lookup_table(&self, _name: &str) -> Result<Option<TableSchema>, Error> {
-        Ok(None)
-    }
 }
 
 /// Validate a functional/expression index key: it must parse, type-check against `table`'s columns,

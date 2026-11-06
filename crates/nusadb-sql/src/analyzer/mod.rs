@@ -306,32 +306,6 @@ pub trait Catalog {
         Ok(None)
     }
 
-    /// Whether the session running this statement is a superuser, which bypasses row-level security.
-    /// Default `true` so a minimal catalog (and the analyzer's own unit tests) behaves as a
-    /// superuser — RLS never restricts it, keeping existing behavior unchanged. The production
-    /// adapter reports this from the session user.
-    fn is_superuser(&self) -> bool {
-        true
-    }
-
-    /// Whether row-level security is enabled on base table `schema.name`. Default `false` so a
-    /// minimal catalog never restricts; the production adapter reads the RLS catalog. Consulted only
-    /// for a non-superuser (the caller short-circuits on [`Catalog::is_superuser`] first), so a
-    /// superuser session never pays for this lookup.
-    ///
-    /// The namespace is part of the question. Asking by bare name alone once meant a marker on
-    /// `public.t` answered for every `t` in the engine.
-    fn rls_enabled(&self, schema: &str, name: &str) -> Result<bool, Error> {
-        let _ = (schema, name);
-        Ok(false)
-    }
-
-    /// The session user, used to match a policy's `TO role` list. Default is the bootstrap
-    /// superuser name; consulted only when building a non-superuser's policy predicate.
-    fn current_user(&self) -> String {
-        "nusadb-root".to_owned()
-    }
-
     /// The prepared transactions of the database, for the `nusadb_prepared_xacts` view (see
     /// [`crate::two_phase`]). The default, for a catalog with no engine behind it, is none; the
     /// production adapters ask the engine.
@@ -339,22 +313,41 @@ pub trait Catalog {
         Ok(Vec::new())
     }
 
-    /// The row-level-security policies defined on base table `name`. Default empty so a
-    /// minimal catalog has none; the production adapter reads the policy catalog. Consulted only for
-    /// a non-superuser whose query targets a single RLS-enabled base table.
-    fn lookup_policies(&self, schema: &str, name: &str) -> Result<Vec<PolicyDef>, Error> {
-        let _ = (schema, name);
-        Ok(Vec::new())
-    }
+    /// The catalog to analyze a stored definition under: the text of a view, a policy or another
+    /// object the catalog holds, as opposed to the text of the statement being analyzed.
+    ///
+    /// A stored definition names catalog objects, so an overlay that adds names of its own for the
+    /// statement must not lend them to it: an overlay answers with its wrapped catalog's answer.
+    /// Every other catalog answers with itself.
+    fn catalog_for_stored_sql(&self) -> &dyn Catalog;
 
     // --- Access control -------------------------------------------------
     //
-    // Each of these defaults to "permitted", matching [`Catalog::is_superuser`]'s default and for
-    // the same reason: a minimal catalog (the analyzer's own unit tests, and any embedding that
-    // has no role catalog) behaves exactly as it did before access control existed. Enforcement
-    // comes from the production adapter in the executor, which answers these from the role and
-    // privilege catalogs. A permissive default is only safe *because* it is unreachable from the
-    // wire: every connection is served by that adapter.
+    // Nothing from here to the end of the trait has a default. These answers decide what a session
+    // may do, so a catalog has to give each one, and an overlay that wraps another catalog has to
+    // pass each one on: a default here would be a silent answer to a security question, and would
+    // be taken for the real one by whoever forgets. A test double with no roles writes
+    // `nusadb_test_utils::catalog_answers_as_superuser!`, which only a dev-dependency can reach.
+
+    /// Whether the session running this statement is a superuser, which bypasses privilege checks
+    /// and row-level security.
+    fn is_superuser(&self) -> bool;
+
+    /// The session user, used to match a policy's `TO role` list. Consulted only when building a
+    /// non-superuser's policy predicate.
+    fn current_user(&self) -> String;
+
+    /// Whether row-level security is enabled on base table `schema.name`. Consulted only for a
+    /// non-superuser (the caller short-circuits on [`Catalog::is_superuser`] first), so a superuser
+    /// session never pays for this lookup.
+    ///
+    /// The namespace is part of the question. Asking by bare name alone once meant a marker on
+    /// `public.t` answered for every `t` in the engine.
+    fn rls_enabled(&self, schema: &str, name: &str) -> Result<bool, Error>;
+
+    /// The row-level-security policies defined on base table `schema.name`. Consulted only for a
+    /// non-superuser whose query targets a single RLS-enabled base table.
+    fn lookup_policies(&self, schema: &str, name: &str) -> Result<Vec<PolicyDef>, Error>;
 
     /// Whether the session may exercise `privilege` on an object.
     fn has_privilege(
@@ -362,87 +355,134 @@ pub trait Catalog {
         kind: crate::ast::ObjectKind,
         object: &str,
         privilege: crate::ast::Privilege,
-    ) -> Result<bool, Error> {
-        let _ = (kind, object, privilege);
-        Ok(true)
-    }
+    ) -> Result<bool, Error>;
 
-    /// Whether the session may access `column` of table `object` with `privilege` — a table-wide
-    /// grant, ownership, superuser, or a column-scoped grant on exactly this column. The default is
-    /// **fail-closed** (`false`): a catalog that enforces nothing keeps the permissive
-    /// [`Self::has_privilege`] default (`true`), which short-circuits before this method is ever
-    /// reached, so only a catalog that *does* enforce table privileges gets here — and for such a
-    /// catalog "no explicit column grant ⇒ deny" is the security-correct answer. Returning `true`
-    /// here would let an enforcing catalog that forgot to override this method fail open.
+    /// Whether the session may access `column` of table `object` with `privilege`: a table-wide
+    /// grant, ownership, superuser, or a column-scoped grant on exactly this column.
     fn has_column_privilege(
         &self,
         object: &str,
         column: &str,
         privilege: crate::ast::Privilege,
-    ) -> Result<bool, Error> {
-        let _ = (object, column, privilege);
-        Ok(false)
-    }
+    ) -> Result<bool, Error>;
 
-    /// Whether the session may access *at least one* column of table `object` with `privilege` — the
-    /// gate that brings a table into scope when the session lacks the table-wide privilege but holds
-    /// some column-scoped one. **Fail-closed** default (`false`) for the same reason as
-    /// [`Self::has_column_privilege`]: a permissive catalog never reaches it (the table-wide check
-    /// admits first), so returning `true` here would only ever fail an enforcing catalog open.
+    /// Whether the session may access *at least one* column of table `object` with `privilege`: the
+    /// gate that brings a table into scope when the session lacks the table-wide privilege but
+    /// holds some column-scoped one.
     fn has_any_column_privilege(
         &self,
         object: &str,
         privilege: crate::ast::Privilege,
-    ) -> Result<bool, Error> {
-        let _ = (object, privilege);
-        Ok(false)
-    }
+    ) -> Result<bool, Error>;
 
-    /// Whether the session may pass `privilege` on to another role — ownership, superuser, or a
+    /// Whether the session may pass `privilege` on to another role: ownership, superuser, or a
     /// grant carrying the grant option.
     fn may_grant_object(
         &self,
         kind: crate::ast::ObjectKind,
         object: &str,
         privilege: crate::ast::Privilege,
-    ) -> Result<bool, Error> {
-        let _ = (kind, object, privilege);
-        Ok(true)
-    }
+    ) -> Result<bool, Error>;
 
     /// Whether the session may create roles.
-    fn may_create_role(&self) -> Result<bool, Error> {
-        Ok(true)
-    }
+    fn may_create_role(&self) -> Result<bool, Error>;
 
-    /// Whether the session may create a database or a schema — holds `CREATEDB`, or is a superuser.
-    fn may_create_database(&self) -> Result<bool, Error> {
-        Ok(true)
-    }
+    /// Whether the session may create a database or a schema: holds `CREATEDB`, or is a superuser.
+    fn may_create_database(&self) -> Result<bool, Error>;
 
     /// Whether the session may grant membership in, alter, or drop `role`.
-    fn may_administer_role(&self, role: &str) -> Result<bool, Error> {
-        let _ = role;
-        Ok(true)
-    }
+    fn may_administer_role(&self, role: &str) -> Result<bool, Error>;
 
-    /// Whether the session may `SET ROLE` to `role` — that is, is a member of it.
-    fn may_assume_role(&self, role: &str) -> Result<bool, Error> {
-        let _ = role;
-        Ok(true)
-    }
+    /// Whether the session may `SET ROLE` to `role`, that is, is a member of it.
+    fn may_assume_role(&self, role: &str) -> Result<bool, Error>;
 
     /// Whether a role of this name exists.
-    fn role_exists(&self, name: &str) -> Result<bool, Error> {
-        let _ = name;
+    fn role_exists(&self, name: &str) -> Result<bool, Error>;
+
+    /// Whether the session owns an object: the check `DROP` / `ALTER` needs, which no `GRANT` can
+    /// satisfy.
+    fn owns_object(&self, kind: crate::ast::ObjectKind, object: &str) -> Result<bool, Error>;
+}
+
+/// A [`Catalog`] that resolves nothing and allows nothing, for an expression that reads only the
+/// row it is given.
+///
+/// A stored `CHECK` predicate, column default, or index key and predicate is re-analyzed under it:
+/// each was validated to be subquery-free when it was created, so it never needs to resolve a name.
+/// `CREATE INDEX` validates a key or predicate under it too, so a SQL `CREATE FUNCTION` UDF there
+/// fails to resolve and is rejected loudly, rather than being accepted and then silently
+/// unmaintainable; built-in scalar functions and Rust UDFs resolve from static registries without a
+/// catalog, so they still validate. No expression of that kind asks an access question, so every
+/// answer here is a refusal.
+pub(crate) struct EmptyCatalog;
+
+impl Catalog for EmptyCatalog {
+    fn lookup_table(&self, _name: &str) -> Result<Option<TableSchema>, Error> {
+        Ok(None)
+    }
+    fn catalog_for_stored_sql(&self) -> &dyn Catalog {
+        self
+    }
+    fn is_superuser(&self) -> bool {
+        false
+    }
+    fn current_user(&self) -> String {
+        String::new()
+    }
+    fn rls_enabled(&self, _schema: &str, _name: &str) -> Result<bool, Error> {
         Ok(true)
     }
-
-    /// Whether the session owns an object — the check `DROP` / `ALTER` needs, which no `GRANT` can
-    /// satisfy.
-    fn owns_object(&self, kind: crate::ast::ObjectKind, object: &str) -> Result<bool, Error> {
-        let _ = (kind, object);
-        Ok(true)
+    fn lookup_policies(&self, _schema: &str, _name: &str) -> Result<Vec<PolicyDef>, Error> {
+        Ok(Vec::new())
+    }
+    fn has_privilege(
+        &self,
+        _kind: ast::ObjectKind,
+        _object: &str,
+        _privilege: ast::Privilege,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn has_column_privilege(
+        &self,
+        _object: &str,
+        _column: &str,
+        _privilege: ast::Privilege,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn has_any_column_privilege(
+        &self,
+        _object: &str,
+        _privilege: ast::Privilege,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn may_grant_object(
+        &self,
+        _kind: ast::ObjectKind,
+        _object: &str,
+        _privilege: ast::Privilege,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn may_create_role(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn may_create_database(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn may_administer_role(&self, _role: &str) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn may_assume_role(&self, _role: &str) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn role_exists(&self, _name: &str) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn owns_object(&self, _kind: ast::ObjectKind, _object: &str) -> Result<bool, Error> {
+        Ok(false)
     }
 }
 
@@ -2131,8 +2171,9 @@ fn resolve_table(
 /// Until policy-based access lands, an RLS-enabled table is superuser-only: refusing is the
 /// safe choice — never silently return every row to a user the policy would restrict. The check
 /// short-circuits on [`Catalog::is_superuser`] first, so a superuser session never pays for the RLS
-/// lookup, and so a minimal catalog (default superuser) is unaffected. Applied at every base-table
-/// resolution site (DML targets via [`resolve_table`], and the `SELECT` `FROM` base).
+/// lookup, and so a catalog with no roles, which answers as a superuser, is unaffected. Applied at
+/// every base-table resolution site (DML targets via [`resolve_table`], and the `SELECT` `FROM`
+/// base).
 pub(super) fn enforce_table_rls(
     schema: &str,
     name: &str,

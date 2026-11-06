@@ -22,6 +22,7 @@ use nusadb_sql::{
 /// Minimal analyzer catalog over the engine's schema.
 struct Cat<'a>(&'a dyn StorageEngine);
 impl Catalog for Cat<'_> {
+    nusadb_test_utils::catalog_answers_as_superuser!(nusadb_sql);
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
         self.0.lookup_table(name).map_err(Into::into)
     }
@@ -35,6 +36,7 @@ impl Catalog for Cat<'_> {
 /// ordered-index-scan path under a lock, which a masked-index catalog would hide.
 struct IndexedCat<'a>(&'a dyn StorageEngine, TxnId);
 impl Catalog for IndexedCat<'_> {
+    nusadb_test_utils::catalog_answers_as_superuser!(nusadb_sql);
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
         self.0.lookup_table(name).map_err(Into::into)
     }
@@ -47,6 +49,7 @@ impl Catalog for IndexedCat<'_> {
 /// a query on a parent expands to it and its descendants.
 struct InheritCat<'a>(&'a dyn StorageEngine, TxnId);
 impl Catalog for InheritCat<'_> {
+    nusadb_test_utils::catalog_answers_as_superuser!(nusadb_sql);
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
         self.0.lookup_table(name).map_err(Into::into)
     }

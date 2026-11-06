@@ -17,6 +17,7 @@ use nusadb_sql::{Catalog, Error, ExecutionResult, Session, analyze, parse, plan}
 struct EngineCatalog<'a>(&'a dyn StorageEngine);
 
 impl Catalog for EngineCatalog<'_> {
+    nusadb_test_utils::catalog_answers_as_superuser!(nusadb_sql);
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
         self.0.lookup_table(name).map_err(Into::into)
     }

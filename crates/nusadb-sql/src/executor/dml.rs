@@ -4166,17 +4166,7 @@ pub(super) fn fk_declared_name(
     )
 }
 
-/// A [`Catalog`](crate::analyzer::Catalog) that resolves nothing — used to re-analyze a stored
-/// single-table CHECK predicate, which references only the target table's own columns (supplied via
-/// the column scope), never another table, view, or index. Validated to be subquery-free at
-/// CREATE/ALTER time, so it never needs to resolve a name.
-pub(super) struct EmptyCatalog;
-
-impl crate::analyzer::Catalog for EmptyCatalog {
-    fn lookup_table(&self, _name: &str) -> Result<Option<TableSchema>, Error> {
-        Ok(None)
-    }
-}
+pub(super) use crate::analyzer::EmptyCatalog;
 
 /// Enforce every `CHECK` constraint declared on `table` against the `rows` about to be written.
 /// Each constraint persists its predicate as canonical SQL; we re-parse and type-check it

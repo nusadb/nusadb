@@ -37,6 +37,7 @@ impl Cat<'_> {
 }
 
 impl Catalog for Cat<'_> {
+    nusadb_test_utils::catalog_answers_as_superuser!(nusadb_sql);
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
         self.engine.lookup_table(name).map_err(Into::into)
     }

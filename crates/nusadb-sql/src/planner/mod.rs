@@ -106,6 +106,7 @@ mod tests {
     struct MockCatalog(Vec<TableSchema>);
 
     impl Catalog for MockCatalog {
+        nusadb_test_utils::catalog_answers_as_superuser!(crate);
         fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
             Ok(self.0.iter().find(|t| t.name == name).cloned())
         }
@@ -450,6 +451,7 @@ mod tests {
     struct IndexedCatalog(MockCatalog, bool);
 
     impl Catalog for IndexedCatalog {
+        nusadb_test_utils::catalog_answers_as_superuser!(crate);
         fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
             self.0.lookup_table(name)
         }

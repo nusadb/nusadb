@@ -52,6 +52,72 @@ impl Catalog for EngineCatalog<'_> {
     fn prepared_transactions(&self) -> Result<Vec<PreparedTransaction>, nusadb_sql::Error> {
         self.engine.list_prepared().map_err(Into::into)
     }
+    fn catalog_for_stored_sql(&self) -> &dyn nusadb_sql::Catalog {
+        self
+    }
+    fn rls_enabled(&self, _schema: &str, _name: &str) -> Result<bool, nusadb_sql::Error> {
+        Ok(false)
+    }
+    fn lookup_policies(
+        &self,
+        _schema: &str,
+        _name: &str,
+    ) -> Result<Vec<nusadb_sql::PolicyDef>, nusadb_sql::Error> {
+        Ok(Vec::new())
+    }
+    fn has_privilege(
+        &self,
+        _kind: nusadb_sql::ast::ObjectKind,
+        _object: &str,
+        _privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn has_column_privilege(
+        &self,
+        _object: &str,
+        _column: &str,
+        _privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn has_any_column_privilege(
+        &self,
+        _object: &str,
+        _privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_grant_object(
+        &self,
+        _kind: nusadb_sql::ast::ObjectKind,
+        _object: &str,
+        _privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_create_role(&self) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_create_database(&self) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_administer_role(&self, _role: &str) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_assume_role(&self, _role: &str) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn role_exists(&self, _name: &str) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn owns_object(
+        &self,
+        _kind: nusadb_sql::ast::ObjectKind,
+        _object: &str,
+    ) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
 }
 
 fn run(

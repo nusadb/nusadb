@@ -113,6 +113,7 @@ impl SltCatalog<'_> {
 }
 
 impl Catalog for SltCatalog<'_> {
+    nusadb_test_utils::catalog_answers_as_superuser!(nusadb_sql);
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, nusadb_sql::Error> {
         self.resolve(name)
     }

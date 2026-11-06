@@ -37,6 +37,75 @@ impl Catalog for MockCatalog {
     fn is_superuser(&self) -> bool {
         self.superuser
     }
+    fn catalog_for_stored_sql(&self) -> &dyn crate::Catalog {
+        self
+    }
+    fn current_user(&self) -> String {
+        "nusadb-root".to_owned()
+    }
+    fn rls_enabled(&self, _schema: &str, _name: &str) -> Result<bool, crate::Error> {
+        Ok(false)
+    }
+    fn lookup_policies(
+        &self,
+        _schema: &str,
+        _name: &str,
+    ) -> Result<Vec<crate::PolicyDef>, crate::Error> {
+        Ok(Vec::new())
+    }
+    fn has_privilege(
+        &self,
+        _kind: crate::ast::ObjectKind,
+        _object: &str,
+        _privilege: crate::ast::Privilege,
+    ) -> Result<bool, crate::Error> {
+        Ok(true)
+    }
+    fn has_column_privilege(
+        &self,
+        _object: &str,
+        _column: &str,
+        _privilege: crate::ast::Privilege,
+    ) -> Result<bool, crate::Error> {
+        Ok(true)
+    }
+    fn has_any_column_privilege(
+        &self,
+        _object: &str,
+        _privilege: crate::ast::Privilege,
+    ) -> Result<bool, crate::Error> {
+        Ok(true)
+    }
+    fn may_grant_object(
+        &self,
+        _kind: crate::ast::ObjectKind,
+        _object: &str,
+        _privilege: crate::ast::Privilege,
+    ) -> Result<bool, crate::Error> {
+        Ok(true)
+    }
+    fn may_create_role(&self) -> Result<bool, crate::Error> {
+        Ok(true)
+    }
+    fn may_create_database(&self) -> Result<bool, crate::Error> {
+        Ok(true)
+    }
+    fn may_administer_role(&self, _role: &str) -> Result<bool, crate::Error> {
+        Ok(true)
+    }
+    fn may_assume_role(&self, _role: &str) -> Result<bool, crate::Error> {
+        Ok(true)
+    }
+    fn role_exists(&self, _name: &str) -> Result<bool, crate::Error> {
+        Ok(true)
+    }
+    fn owns_object(
+        &self,
+        _kind: crate::ast::ObjectKind,
+        _object: &str,
+    ) -> Result<bool, crate::Error> {
+        Ok(true)
+    }
 }
 
 fn col(name: &str, ty: ColumnType, nullable: bool) -> ColumnDef {
@@ -2788,5 +2857,48 @@ fn row_value_is_rejected_for_aggregates_other_than_count() {
             matches!(plan(sql, &catalog()), Err(Error::Unsupported(_))),
             "expected `{sql}` to be rejected",
         );
+    }
+}
+
+/// The names of the methods an `impl Catalog for <wrapper>` block in `source` defines.
+fn catalog_methods(source: &str, opening: &str) -> Vec<String> {
+    let start = source.find(opening).expect("the impl block") + opening.len();
+    let body = source[start..].split("\n}\n").next().expect("its end");
+    body.lines()
+        .filter_map(|line| line.strip_prefix("    fn "))
+        .map(|rest| rest.split(['(', '<']).next().expect("a name").to_owned())
+        .collect()
+}
+
+/// An overlay stands in for the catalog it wraps, and a method it leaves out is answered by the
+/// trait's default instead of by that catalog: for the access questions the compiler would catch
+/// that, and for the rest (which keep a default for test doubles) it would lose a parent's
+/// partitions or a view without a word. So each overlay answers each question.
+#[test]
+fn an_overlay_answers_every_question_of_the_catalog() {
+    let trait_source = include_str!("mod.rs");
+    let opening = "pub trait Catalog {\n";
+    let questions = catalog_methods(trait_source, opening);
+    assert!(questions.len() > 30, "{questions:?}");
+    for (name, source, opening) in [
+        (
+            "CteCatalog",
+            include_str!("select.rs"),
+            "impl Catalog for CteCatalog<'_> {\n",
+        ),
+        (
+            "ViaParent",
+            include_str!("via_parent.rs"),
+            "impl Catalog for ViaParent<'_> {\n",
+        ),
+        (
+            "RecordingCatalog",
+            include_str!("../plan_cache.rs"),
+            "impl Catalog for RecordingCatalog<'_> {\n",
+        ),
+    ] {
+        let answered = catalog_methods(source, opening);
+        let missing: Vec<_> = questions.iter().filter(|q| !answered.contains(q)).collect();
+        assert!(missing.is_empty(), "{name} does not answer {missing:?}");
     }
 }

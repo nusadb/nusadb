@@ -245,6 +245,9 @@ fn expand_inheritance(
     branch_filter: Option<&ast::Expr>,
     catalog: &dyn Catalog,
 ) -> Result<SelectPlan, Error> {
+    // A branch names a catalog table, and the term of a recursive CTE of the same name must not take
+    // it for its working table.
+    let catalog = catalog.catalog_for_stored_sql();
     let cols: Vec<String> = parent.columns.iter().map(|c| c.name.clone()).collect();
     let branch = |table: &str| {
         let mut select = inheritance_branch(&cols, table);
@@ -1303,6 +1306,10 @@ fn combine_rls_policies(
     catalog: &dyn Catalog,
     pick: impl Fn(&PolicyDef) -> Option<String>,
 ) -> Result<TypedExpr, Error> {
+    // A policy names catalog objects. The query it filters can name its own relations whatever it
+    // likes, and none of them is in the policy's scope.
+    let _no_query_names = push_visible_ctes(&[]);
+    let catalog = catalog.catalog_for_stored_sql();
     let user = catalog.current_user();
     // A policy reads the row on the table's terms, not the session's: the session needs no SELECT
     // on the columns a policy predicate reads (it may hold a column grant that leaves them out).
@@ -1785,13 +1792,17 @@ pub(super) fn resolve_view(name: &str, catalog: &dyn Catalog) -> Result<SelectPl
         )));
     }
     VIEW_DEPTH.with(|d| d.set(d.get() + 1));
+    // The body means what it meant at `CREATE VIEW`: a relation the querying statement declares is
+    // not in its scope.
+    let no_query_names = push_visible_ctes(&[]);
     let result = match crate::parse(&sql) {
-        Ok(ast::Statement::Select(sel)) => analyze_select(sel, catalog),
+        Ok(ast::Statement::Select(sel)) => analyze_select(sel, catalog.catalog_for_stored_sql()),
         Ok(_) => Err(Error::Internal(format!(
             "view `{name}` definition is not a SELECT"
         ))),
         Err(e) => Err(e),
     };
+    drop(no_query_names);
     VIEW_DEPTH.with(|d| d.set(d.get() - 1));
     result
 }
@@ -2964,7 +2975,10 @@ const fn synthetic_recursive_table_id(index: usize) -> nusadb_core::TableId {
 }
 
 /// A [`Catalog`] that overlays one recursive CTE's synthetic table over an inner catalog, so the
-/// CTE's recursive term resolves its self-reference. All other lookups delegate to `inner`.
+/// CTE's recursive term resolves its self-reference. Every answer about anything else is the inner
+/// catalog's, the access questions above all: the term is ordinary SQL run by the session, and
+/// reads what the session may read. Each method of the trait is answered here, and a test holds
+/// this overlay to that (see the analyzer tests).
 struct CteCatalog<'a> {
     inner: &'a dyn Catalog,
     name: &'a str,
@@ -2980,9 +2994,31 @@ impl CteCatalog<'_> {
             && (schema == nusadb_core::PUBLIC_SCHEMA
                 || self.inner.temp_schema().as_deref() == Some(schema))
     }
+
+    /// Whether `key`, in the form the metadata catalogs key a table by (`schema.name`, bare for
+    /// `public`), is the synthetic table's.
+    fn shadows_key(&self, key: &str) -> bool {
+        let (schema, name) = super::split_qualified(key);
+        self.shadows(schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA), name)
+    }
+
+    /// Whether `object`, in the form the privilege catalog keys a table by, is the synthetic table.
+    /// Its schema is always `public` however the reference reached it, so this is one exact key:
+    /// the table a term reads as `SELECT` of its own making, and nothing of the same name.
+    fn is_working_table(&self, object: &str) -> bool {
+        object
+            .strip_prefix(self.schema.schema.as_str())
+            .and_then(|rest| rest.strip_prefix('.'))
+            == Some(self.schema.name.as_str())
+    }
 }
 
 impl Catalog for CteCatalog<'_> {
+    fn catalog_for_stored_sql(&self) -> &dyn Catalog {
+        // The CTE's name means something only in the text of the query that declares it.
+        self.inner.catalog_for_stored_sql()
+    }
+
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
         if name == self.name {
             return Ok(Some(self.schema.clone()));
@@ -3008,6 +3044,10 @@ impl Catalog for CteCatalog<'_> {
         self.inner.search_path()
     }
 
+    fn current_schema(&self) -> String {
+        self.inner.current_schema()
+    }
+
     fn temp_schema(&self) -> Option<String> {
         // Forward the session temp schema from the inner (real) catalog. Without this the default
         // reads the executor thread-local, which during wire analysis holds the PREVIOUS statement's
@@ -3016,12 +3056,30 @@ impl Catalog for CteCatalog<'_> {
         self.inner.temp_schema()
     }
 
+    fn session_timezone(&self) -> Option<String> {
+        self.inner.session_timezone()
+    }
+
     fn list_indexes(&self, table: &str) -> Result<Vec<IndexInfo>, Error> {
         // The synthetic CTE table carries no indexes; everything else delegates.
         if table == self.name {
             return Ok(Vec::new());
         }
         self.inner.list_indexes(table)
+    }
+
+    fn table_stats(&self, table: &str) -> Result<Option<nusadb_core::TableStats>, Error> {
+        if table == self.name {
+            return Ok(None);
+        }
+        self.inner.table_stats(table)
+    }
+
+    fn approx_row_count(&self, table: &str) -> Result<u64, Error> {
+        if table == self.name {
+            return Ok(0);
+        }
+        self.inner.approx_row_count(table)
     }
 
     fn list_indexes_in(&self, schema: &str, name: &str) -> Result<Vec<IndexInfo>, Error> {
@@ -3051,6 +3109,60 @@ impl Catalog for CteCatalog<'_> {
         self.inner.approx_row_count_in(schema, name)
     }
 
+    fn has_instead_of_trigger(&self, name: &str, event: ast::TriggerEvent) -> Result<bool, Error> {
+        self.inner.has_instead_of_trigger(name, event)
+    }
+
+    fn lookup_view(&self, name: &str) -> Result<Option<String>, Error> {
+        self.inner.lookup_view(name)
+    }
+
+    fn lookup_view_columns(&self, name: &str) -> Result<Vec<String>, Error> {
+        self.inner.lookup_view_columns(name)
+    }
+
+    fn lookup_view_check_option(&self, name: &str) -> Result<bool, Error> {
+        self.inner.lookup_view_check_option(name)
+    }
+
+    fn lookup_function(&self, name: &str) -> Result<Option<super::FunctionDef>, Error> {
+        self.inner.lookup_function(name)
+    }
+
+    fn any_inheritance(&self) -> Result<bool, Error> {
+        self.inner.any_inheritance()
+    }
+
+    fn inheritance_descendants(&self, table: &str) -> Result<Vec<String>, Error> {
+        // The synthetic table is nobody's parent, whatever a real table of its name is.
+        if self.shadows_key(table) {
+            return Ok(Vec::new());
+        }
+        self.inner.inheritance_descendants(table)
+    }
+
+    fn partition_key_columns(&self, table: &str) -> Result<Option<Vec<String>>, Error> {
+        if self.shadows_key(table) {
+            return Ok(None);
+        }
+        self.inner.partition_key_columns(table)
+    }
+
+    fn inheritance_fingerprint(&self) -> Result<u64, Error> {
+        self.inner.inheritance_fingerprint()
+    }
+
+    fn partitions_to_prune(
+        &self,
+        parent: &str,
+        constraints: &[super::PruneConstraint],
+    ) -> Result<Vec<String>, Error> {
+        if self.shadows_key(parent) {
+            return Ok(Vec::new());
+        }
+        self.inner.partitions_to_prune(parent, constraints)
+    }
+
     fn lookup_composite(
         &self,
         name: &str,
@@ -3066,7 +3178,7 @@ impl Catalog for CteCatalog<'_> {
         column: &str,
     ) -> Result<Option<String>, Error> {
         // The synthetic CTE table has no composite columns; a real base table's delegate.
-        if table == self.name {
+        if self.shadows(schema, table) {
             return Ok(None);
         }
         self.inner.lookup_composite_column(schema, table, column)
@@ -3079,7 +3191,7 @@ impl Catalog for CteCatalog<'_> {
         column: &str,
     ) -> Result<Option<String>, Error> {
         // The synthetic CTE table has no enum columns; a real base table's delegate.
-        if table == self.name {
+        if self.shadows(schema, table) {
             return Ok(None);
         }
         self.inner.lookup_enum_column(schema, table, column)
@@ -3090,28 +3202,108 @@ impl Catalog for CteCatalog<'_> {
         self.inner.enum_labels(name)
     }
 
-    // The security context must delegate to the inner catalog: otherwise a recursive CTE's term,
-    // analyzed through this overlay, would fall back to the trait defaults (superuser, no RLS) and
-    // a non-superuser could read an RLS-enabled base table by wrapping it in a CTE.
+    fn prepared_transactions(&self) -> Result<Vec<nusadb_core::PreparedTransaction>, Error> {
+        self.inner.prepared_transactions()
+    }
+
+    // The security context is the inner catalog's, with one exception: the synthetic table is the
+    // term's own working set, which the statement computed itself. Reading it takes no grant, and
+    // only reading it, only under its exact key.
     fn is_superuser(&self) -> bool {
         self.inner.is_superuser()
     }
 
+    fn current_user(&self) -> String {
+        self.inner.current_user()
+    }
+
     fn rls_enabled(&self, schema: &str, name: &str) -> Result<bool, Error> {
         // The synthetic CTE table is derived, never a base table, so it carries no RLS flag — but
-        // only where it actually shadows, which is the same two probes `lookup_table_in` above
-        // names: the `public` arm of the search path, and the session temp schema.
-        //
-        // Matching the bare name alone made this a bypass rather than a guard. A qualified
-        // reference resolves to the real protected table, and a CTE named after it then answered
-        // "no row-level security" for it — with the CTE name chosen by whoever writes the query.
-        if name == self.name
-            && (schema == nusadb_core::PUBLIC_SCHEMA
-                || self.inner.temp_schema().as_deref() == Some(schema))
-        {
+        // only where it actually shadows. Matching the bare name alone made this a bypass rather
+        // than a guard: a qualified reference resolves to the real protected table, and a CTE named
+        // after it then answered "no row-level security" for it.
+        if self.shadows(schema, name) {
             return Ok(false);
         }
         self.inner.rls_enabled(schema, name)
+    }
+
+    fn lookup_policies(&self, schema: &str, name: &str) -> Result<Vec<super::PolicyDef>, Error> {
+        if self.shadows(schema, name) {
+            return Ok(Vec::new());
+        }
+        self.inner.lookup_policies(schema, name)
+    }
+
+    fn has_privilege(
+        &self,
+        kind: ast::ObjectKind,
+        object: &str,
+        privilege: ast::Privilege,
+    ) -> Result<bool, Error> {
+        if kind == ast::ObjectKind::Table
+            && privilege == ast::Privilege::Select
+            && self.is_working_table(object)
+        {
+            return Ok(true);
+        }
+        self.inner.has_privilege(kind, object, privilege)
+    }
+
+    fn has_column_privilege(
+        &self,
+        object: &str,
+        column: &str,
+        privilege: ast::Privilege,
+    ) -> Result<bool, Error> {
+        if privilege == ast::Privilege::Select && self.is_working_table(object) {
+            return Ok(true);
+        }
+        self.inner.has_column_privilege(object, column, privilege)
+    }
+
+    fn has_any_column_privilege(
+        &self,
+        object: &str,
+        privilege: ast::Privilege,
+    ) -> Result<bool, Error> {
+        if privilege == ast::Privilege::Select && self.is_working_table(object) {
+            return Ok(true);
+        }
+        self.inner.has_any_column_privilege(object, privilege)
+    }
+
+    fn may_grant_object(
+        &self,
+        kind: ast::ObjectKind,
+        object: &str,
+        privilege: ast::Privilege,
+    ) -> Result<bool, Error> {
+        self.inner.may_grant_object(kind, object, privilege)
+    }
+
+    fn may_create_role(&self) -> Result<bool, Error> {
+        self.inner.may_create_role()
+    }
+
+    fn may_create_database(&self) -> Result<bool, Error> {
+        self.inner.may_create_database()
+    }
+
+    fn may_administer_role(&self, role: &str) -> Result<bool, Error> {
+        self.inner.may_administer_role(role)
+    }
+
+    fn may_assume_role(&self, role: &str) -> Result<bool, Error> {
+        self.inner.may_assume_role(role)
+    }
+
+    fn role_exists(&self, name: &str) -> Result<bool, Error> {
+        self.inner.role_exists(name)
+    }
+
+    fn owns_object(&self, kind: ast::ObjectKind, object: &str) -> Result<bool, Error> {
+        self.inner.owns_object(kind, object)
     }
 }
 

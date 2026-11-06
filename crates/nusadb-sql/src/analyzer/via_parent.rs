@@ -66,6 +66,9 @@ impl<'a> ViaParent<'a> {
 }
 
 impl Catalog for ViaParent<'_> {
+    fn catalog_for_stored_sql(&self) -> &dyn Catalog {
+        self.inner.catalog_for_stored_sql()
+    }
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
         self.inner.lookup_table(name)
     }

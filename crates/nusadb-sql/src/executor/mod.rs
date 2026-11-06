@@ -5576,10 +5576,8 @@ struct ExecCatalog<'a> {
     ///
     /// A nested body — a trigger action, a `CALL`/`DO` block, a view being refreshed — is analyzed
     /// through this catalog, and it must be analyzed as the *same* role as the statement that
-    /// reached it. Without this field the trait's permissive defaults applied
-    /// (`is_superuser() == true`, every privilege granted), which turned any nested body into a
-    /// superuser context: `DO $$ INSERT INTO nusadb_roles ... $$` would have let any role write
-    /// itself a superuser row.
+    /// reached it. Answering without it would make any nested body a superuser context:
+    /// `DO $$ INSERT INTO nusadb_roles ... $$` would let any role write itself a superuser row.
     user: String,
     /// The role resolved for this statement's column checks.
     session: OnceCell<crate::rbac::ResolvedSession>,
@@ -5614,6 +5612,10 @@ fn statement_session<'c>(
 }
 
 impl crate::Catalog for ExecCatalog<'_> {
+    fn catalog_for_stored_sql(&self) -> &dyn crate::Catalog {
+        self
+    }
+
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
         self.engine
             .lookup_table_as_of(self.txn, name)
@@ -5731,8 +5733,7 @@ impl crate::Catalog for ExecCatalog<'_> {
         lookup_enum(self.engine, self.txn, name)
     }
 
-    // Access control. These must delegate rather than take the trait's permissive defaults — see
-    // the note on the `user` field.
+    // Access control, answered for the role in the `user` field: see the note on it.
 
     fn is_superuser(&self) -> bool {
         crate::rbac::principal(self.engine, self.txn, &self.user)
@@ -5870,6 +5871,10 @@ impl<'a> SessionCatalog<'a> {
 }
 
 impl crate::Catalog for SessionCatalog<'_> {
+    fn catalog_for_stored_sql(&self) -> &dyn crate::Catalog {
+        self
+    }
+
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, Error> {
         self.engine
             .lookup_table_as_of(self.txn, name)

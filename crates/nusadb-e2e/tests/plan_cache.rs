@@ -18,6 +18,7 @@ use nusadb_sql::{Catalog, ExecutionResult, IndexInfo, PlanCache, execute, parse,
 struct EngineCatalog<'a>(&'a dyn StorageEngine);
 
 impl Catalog for EngineCatalog<'_> {
+    nusadb_test_utils::catalog_answers_as_superuser!(nusadb_sql);
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, nusadb_sql::Error> {
         self.0.lookup_table(name).map_err(Into::into)
     }
@@ -294,6 +295,7 @@ struct PathCatalog<'a> {
 }
 
 impl Catalog for PathCatalog<'_> {
+    nusadb_test_utils::catalog_answers_as_superuser!(nusadb_sql);
     fn lookup_table(&self, name: &str) -> Result<Option<TableSchema>, nusadb_sql::Error> {
         self.engine.lookup_table(name).map_err(Into::into)
     }
@@ -414,6 +416,57 @@ impl Catalog for ToggleCatalog<'_> {
         _object: &str,
     ) -> Result<bool, nusadb_sql::Error> {
         Ok(false)
+    }
+    fn catalog_for_stored_sql(&self) -> &dyn nusadb_sql::Catalog {
+        self
+    }
+    fn rls_enabled(&self, _schema: &str, _name: &str) -> Result<bool, nusadb_sql::Error> {
+        Ok(false)
+    }
+    fn lookup_policies(
+        &self,
+        _schema: &str,
+        _name: &str,
+    ) -> Result<Vec<nusadb_sql::PolicyDef>, nusadb_sql::Error> {
+        Ok(Vec::new())
+    }
+    fn has_column_privilege(
+        &self,
+        _object: &str,
+        _column: &str,
+        _privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        Ok(false)
+    }
+    fn has_any_column_privilege(
+        &self,
+        _object: &str,
+        _privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        Ok(false)
+    }
+    fn may_grant_object(
+        &self,
+        _kind: nusadb_sql::ast::ObjectKind,
+        _object: &str,
+        _privilege: nusadb_sql::ast::Privilege,
+    ) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_create_role(&self) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_create_database(&self) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_administer_role(&self, _role: &str) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn may_assume_role(&self, _role: &str) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
+    }
+    fn role_exists(&self, _name: &str) -> Result<bool, nusadb_sql::Error> {
+        Ok(true)
     }
 }
 
