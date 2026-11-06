@@ -112,6 +112,30 @@ async fn copy_query_renders_values_in_the_session_zone() {
     assert_eq!(ok(&mut conn, "COPY ts_t TO STDOUT").await, selected);
 }
 
+/// The table form runs no query of its own, so the only thing that gives it the session's zone is
+/// the pin of the COPY itself. No statement before it reads the zone, and the two connections show
+/// that one session's rendering does not stand in for another's.
+#[tokio::test]
+async fn copy_table_renders_values_in_the_session_zone() {
+    let (engine, mut conn) = zone_fixture().await;
+    let mut other = open(&engine, "nusadb-root").await;
+    ok(&mut other, "SET TIME ZONE '-03'").await;
+    for _ in 0..2 {
+        assert_eq!(
+            ok(&mut conn, "COPY ts_t TO STDOUT").await,
+            "2026-01-01 07:00:00+07\n"
+        );
+        assert_eq!(
+            ok(&mut other, "COPY ts_t TO STDOUT").await,
+            "2025-12-31 21:00:00-03\n"
+        );
+    }
+    assert_eq!(
+        ok(&mut conn, "COPY ts_t (at) TO STDOUT WITH (FORMAT csv)").await,
+        "2026-01-01 07:00:00+07\n"
+    );
+}
+
 #[tokio::test]
 async fn copy_query_evaluates_in_the_session_zone() {
     let (_engine, mut conn) = zone_fixture().await;
