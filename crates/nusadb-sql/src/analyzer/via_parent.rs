@@ -6,7 +6,8 @@
 //! to every row, wherever the row is stored. The read is expanded into one generated
 //! `SELECT <columns> FROM ONLY <table>` branch per table, and [`ViaParent`] is the catalog those
 //! branches are analyzed under: it answers the privilege questions about the branch tables as
-//! granted (the parent's check already decided them) and reports no row-level security for them,
+//! granted (the enclosing query checks its column reads against the parent, and a generated read of
+//! every column is not one of them) and reports no row-level security for them,
 //! because the caller adds the parent's policies to every branch itself, built under the plain
 //! catalog. Everything else is the wrapped catalog's answer.
 //!
@@ -38,15 +39,8 @@ pub(super) struct ViaParent<'a> {
 
 impl<'a> ViaParent<'a> {
     /// The catalog for the branches over `parent` and the tables `reached` through it
-    /// (schema-qualified edge keys, bare in `public`). With `cover_parent`, the parent's own
-    /// privileges count as checked too: the caller generated a read of the parent's every column for
-    /// an expansion whose real column reads the enclosing query checks against the parent.
-    pub(super) fn new(
-        inner: &'a dyn Catalog,
-        parent: &TableSchema,
-        reached: &[String],
-        cover_parent: bool,
-    ) -> Self {
+    /// (schema-qualified edge keys, bare in `public`).
+    pub(super) fn new(inner: &'a dyn Catalog, parent: &TableSchema, reached: &[String]) -> Self {
         let mut branches: HashSet<(String, String)> = reached
             .iter()
             .map(|key| {
@@ -61,9 +55,7 @@ impl<'a> ViaParent<'a> {
             .iter()
             .map(|(schema, name)| format!("{schema}.{name}"))
             .collect();
-        if cover_parent {
-            covered.insert(format!("{}.{}", parent.schema, parent.name));
-        }
+        covered.insert(format!("{}.{}", parent.schema, parent.name));
         branches.insert((parent.schema.clone(), parent.name.clone()));
         Self {
             inner,

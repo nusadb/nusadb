@@ -236,17 +236,13 @@ fn analyze_set_op_table(so: ast::SetOperation, catalog: &dyn Catalog) -> Result<
 /// columns by name (so a descendant's extra columns drop and the order is the parent's). Each branch
 /// scans `ONLY` its table, so none is expanded again. The branches are reached through the parent:
 /// their privileges are the parent's, which the caller checks, and the parent's row-level security
-/// filters every branch. The result is inlined like a derived table.
-///
-/// `cover_parent` says the caller checks the query's column reads against the parent itself, so the
-/// generated read of every column of the parent's own branch is not checked again. A caller that
-/// does not check the parent's columns passes `false`, and the parent's branch then needs SELECT on
-/// every column of the parent.
+/// filters every branch. The result is inlined like a derived table, and the caller checks the
+/// query's column reads against the parent, so the generated read of every column of the parent's
+/// own branch is not checked again.
 fn expand_inheritance(
     parent: &TableSchema,
     descendants: &[String],
     branch_filter: Option<&ast::Expr>,
-    cover_parent: bool,
     catalog: &dyn Catalog,
 ) -> Result<SelectPlan, Error> {
     let cols: Vec<String> = parent.columns.iter().map(|c| c.name.clone()).collect();
@@ -269,7 +265,7 @@ fn expand_inheritance(
     // The branches are reached through the parent, whose privileges the enclosing query checks
     // (per column, against the columns it really reads). The generated branches name their own
     // table and nothing else, so the name-keyed answers of `ViaParent` reach no other reference.
-    let via_parent = super::via_parent::ViaParent::new(catalog, parent, descendants, cover_parent);
+    let via_parent = super::via_parent::ViaParent::new(catalog, parent, descendants);
     let mut plan = analyze_set_op_table(
         ast::SetOperation {
             with: Vec::new(),
@@ -784,7 +780,7 @@ fn resolve_join_input(
         let descendants = catalog
             .inheritance_descendants(&super::qualified_display(&schema.schema, &schema.name))?;
         if !descendants.is_empty() {
-            let plan = expand_inheritance(&schema, &descendants, None, true, catalog)?;
+            let plan = expand_inheritance(&schema, &descendants, None, catalog)?;
             return Ok((schema, Some(Box::new(plan))));
         }
     }
@@ -876,7 +872,7 @@ pub(super) fn resolve_aux_relation(
             if !descendants.is_empty() {
                 // The source's columns are checked against the parent where the statement reads
                 // them, through `readable`.
-                let plan = expand_inheritance(&schema, &descendants, None, true, catalog)?;
+                let plan = expand_inheritance(&schema, &descendants, None, catalog)?;
                 return Ok((schema, Some(plan), readable));
             }
         }
@@ -1011,7 +1007,6 @@ pub(super) fn resolve_from(
                         &schema,
                         &kept,
                         pushed.as_ref(),
-                        true,
                         catalog,
                     )?)
                 }
