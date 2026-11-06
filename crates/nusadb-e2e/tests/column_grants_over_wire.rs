@@ -219,6 +219,81 @@ async fn a_revoke_reaches_the_next_nested_body_of_an_open_transaction() {
 }
 
 #[tokio::test]
+async fn a_revoke_reaches_the_next_execution_of_a_prepared_statement() {
+    let (engine, mut root) = fixture().await;
+    let mut clerk = open(&engine, "clerk").await;
+    for (name, sql) in [
+        ("write", "UPDATE t SET v = s"),
+        ("read", "SELECT s FROM t"),
+        ("whole", "UPDATE t SET v = 1 WHERE s = 3 RETURNING id, s"),
+    ] {
+        parse(&mut clerk, name, sql).await;
+    }
+    send(&mut clerk, FrontendMessage::Sync).await;
+    assert_eq!(outcome(&mut clerk).await, Outcome::Rows(Vec::new()));
+    for name in ["write", "read", "whole"] {
+        assert!(matches!(execute(&mut clerk, name).await, Outcome::Rows(_)));
+    }
+    ok(&mut root, "REVOKE SELECT (s) ON t FROM clerk").await;
+    for name in ["write", "read", "whole"] {
+        assert_eq!(
+            execute(&mut clerk, name).await,
+            Outcome::Refused("42501".to_owned()),
+            "{name}"
+        );
+    }
+    ok(&mut root, "GRANT SELECT (s) ON t TO clerk").await;
+    for name in ["write", "read", "whole"] {
+        assert!(matches!(execute(&mut clerk, name).await, Outcome::Rows(_)));
+    }
+}
+
+#[tokio::test]
+async fn a_revoke_reaches_the_next_extended_statement_of_an_open_transaction() {
+    let (engine, mut root) = fixture().await;
+    let mut clerk = open(&engine, "clerk").await;
+    let read = "UPDATE t SET v = s";
+
+    ok(&mut clerk, "BEGIN").await;
+    assert_eq!(
+        run_extended(&mut clerk, read).await,
+        Outcome::Rows(Vec::new())
+    );
+    ok(&mut root, "REVOKE SELECT (s) ON t FROM clerk").await;
+    assert_eq!(
+        run_extended(&mut clerk, read).await,
+        Outcome::Refused("42501".to_owned())
+    );
+    ok(&mut clerk, "ROLLBACK").await;
+
+    ok(&mut root, "GRANT SELECT (s) ON t TO clerk").await;
+    assert_eq!(
+        run_extended(&mut clerk, read).await,
+        Outcome::Rows(Vec::new())
+    );
+}
+
+#[tokio::test]
+async fn column_reads_are_checked_where_a_write_makes_them_over_the_extended_protocol() {
+    let (engine, mut root) = fixture().await;
+    ok(&mut root, "REVOKE SELECT (s) ON t FROM clerk").await;
+    let mut clerk = open(&engine, "clerk").await;
+    for sql in [
+        "UPDATE t SET v = s",
+        "UPDATE t SET v = 1 WHERE s = 3",
+        "UPDATE t SET v = 1 RETURNING s",
+        "UPDATE t SET v = 1 RETURNING *",
+        "SELECT * FROM t",
+    ] {
+        denied_both(&mut clerk, sql).await;
+    }
+    assert_eq!(
+        run_extended(&mut clerk, "UPDATE t SET v = 9 RETURNING id").await,
+        Outcome::Rows(vec![vec![Some("1".to_owned())]])
+    );
+}
+
+#[tokio::test]
 async fn a_wildcard_returning_through_a_parent_is_the_parents_columns_over_the_wire() {
     let (engine, mut root) = fixture().await;
     for sql in [
@@ -237,8 +312,21 @@ async fn a_wildcard_returning_through_a_parent_is_the_parents_columns_over_the_w
         vec![vec![field("1"), field("11")], vec![field("2"), field("21")]]
     );
     assert_eq!(
+        run_extended(&mut clerk, "UPDATE ip SET v = v + 1 RETURNING *").await,
+        Outcome::Rows(vec![
+            vec![field("1"), field("12")],
+            vec![field("2"), field("22")]
+        ])
+    );
+    let rows = vec![
+        vec![field(r#"{"id": 1, "v": 13}"#)],
+        vec![field(r#"{"id": 2, "v": 23}"#)],
+    ];
+    let whole = "UPDATE ip SET v = v + 1 RETURNING row_to_json(ip)";
+    assert_eq!(run_extended(&mut clerk, whole).await, Outcome::Rows(rows));
+    assert_eq!(
         ok(&mut clerk, "DELETE FROM ip WHERE id = 2 RETURNING *").await,
-        vec![vec![field("2"), field("21")]]
+        vec![vec![field("2"), field("23")]]
     );
 }
 
