@@ -1031,13 +1031,15 @@ where
                                 .await?
                             },
                             nusadb_sql::ast::CopyDirection::To => {
+                                let mut snapshot = settings_snapshot(&settings, &database);
+                                stamp_transaction_state(&mut snapshot, *txn_state);
                                 handle_copy_out(
                                     &mut conn,
                                     &engine,
                                     copy,
                                     &copy_actor,
-                                    settings_snapshot(&settings, &database).get("timezone").cloned(),
-                                    txn_state.open_block(),
+                                    snapshot,
+                                    txn_state.open_txn(),
                                     &stores.in_flight,
                                 )
                                 .await?
@@ -1997,25 +1999,19 @@ async fn handle_copy_out<S>(
     engine: &Arc<dyn StorageEngine>,
     copy: nusadb_sql::ast::Copy,
     actor: &str,
-    timezone: Option<String>,
-    open_block: Option<(TxnId, i64)>,
+    settings: HashMap<String, String>,
+    open_txn: Option<TxnId>,
     in_flight: &InFlight,
 ) -> io::Result<Result<usize, Failure>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let open_txn = open_block.map(|(txn, _)| txn);
     let format = copy_wire_format(&copy);
     let engine = Arc::clone(engine);
     let actor = actor.to_owned();
     let in_flight = in_flight.clone();
     let rendered = tokio::task::spawn_blocking(move || {
         let _busy = in_flight.enter();
-        // COPY runs outside the ordinary statement pipeline, so pin the session zone here —
-        // `timestamptz` fields render on the session-local wall clock like every other output.
-        nusadb_sql::pin_statement_timezone(timezone.as_deref());
-        // ... and the block's start time, which `now()` in a `COPY (query)` reports.
-        nusadb_sql::pin_transaction_start(open_block);
         // Check and render in one transaction, so the rows streamed out are exactly the ones the
         // access check was evaluated against. Inside a transaction block that is the block's
         // transaction, so the rows include what the block wrote and it stays open.
@@ -2039,8 +2035,16 @@ where
             }
             return Err((msg, "42501".into())); // access-control refusal
         }
-        let out = nusadb_sql::copy_to_bytes_with_columns_in(engine.as_ref(), &copy, &actor, txn)
-            .map_err(|e| (e.to_string(), e.code()));
+        // The render pins the session itself: `timestamptz` fields come out on the session-local
+        // wall clock like every other output, and a query runs under the connection's settings.
+        let out = nusadb_sql::copy_to_bytes_with_settings_in(
+            engine.as_ref(),
+            &copy,
+            &actor,
+            &settings,
+            txn,
+        )
+        .map_err(|e| (e.to_string(), e.code()));
         if owned {
             let _ = deferred::rollback(&*engine, txn); // read-only: nothing to commit
         }

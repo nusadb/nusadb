@@ -584,7 +584,7 @@ pub fn copy_to_in(
     txn: nusadb_core::TxnId,
 ) -> Result<(usize, String), Error> {
     text_copy_output(copy)?;
-    let (count, _, bytes) = run_copy_to(copy, user, engine, txn)?;
+    let (count, _, bytes) = run_copy_to(copy, user, &pinned_zone_settings(), engine, txn)?;
     Ok((count, copy_output_text(bytes)?))
 }
 
@@ -599,7 +599,8 @@ pub fn copy_to_bytes_in(
     user: &str,
     txn: nusadb_core::TxnId,
 ) -> Result<(usize, Vec<u8>), Error> {
-    run_copy_to(copy, user, engine, txn).map(|(count, _, bytes)| (count, bytes))
+    run_copy_to(copy, user, &pinned_zone_settings(), engine, txn)
+        .map(|(count, _, bytes)| (count, bytes))
 }
 
 /// [`copy_to_bytes_in`] that also reports how many columns each copied row carries, which the
@@ -613,7 +614,29 @@ pub fn copy_to_bytes_with_columns_in(
     user: &str,
     txn: nusadb_core::TxnId,
 ) -> Result<(usize, usize, Vec<u8>), Error> {
-    run_copy_to(copy, user, engine, txn)
+    run_copy_to(copy, user, &pinned_zone_settings(), engine, txn)
+}
+
+/// [`copy_to_bytes_with_columns_in`] under a connection's `SET` variables.
+///
+/// The query of a `COPY (<query>) TO STDOUT` then runs like any other statement of the connection,
+/// under its zone, `search_path`, block start and `current_setting` values. The rows render in that
+/// zone.
+///
+/// # Errors
+/// As [`copy_to_bytes_in`]. The caller owns rollback on error.
+#[allow(
+    clippy::implicit_hasher,
+    reason = "the wire server's per-connection GUC store is a default-hasher HashMap"
+)]
+pub fn copy_to_bytes_with_settings_in(
+    engine: &dyn StorageEngine,
+    copy: &ast::Copy,
+    user: &str,
+    settings: &HashMap<String, String>,
+    txn: nusadb_core::TxnId,
+) -> Result<(usize, usize, Vec<u8>), Error> {
+    run_copy_to(copy, user, settings, engine, txn)
 }
 
 /// The number of columns a table-form `COPY ... FROM STDIN` loads: the listed columns, or every
@@ -688,7 +711,7 @@ pub fn copy_to(
 ) -> Result<(usize, String), Error> {
     text_copy_output(copy)?;
     let txn = engine.begin(IsolationLevel::default())?;
-    match run_copy_to(copy, user, engine, txn)
+    match run_copy_to(copy, user, &pinned_zone_settings(), engine, txn)
         .and_then(|(count, _, bytes)| copy_output_text(bytes).map(|text| (count, text)))
     {
         // A failed commit must roll back rather than leak the transaction,

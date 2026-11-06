@@ -2935,17 +2935,23 @@ fn render_copy_output<'v>(
 /// returning the row count, the number of columns copied, and the rendered payload
 /// (newline-terminated lines for text and CSV, a complete stream for binary). A leading header line
 /// of column names is emitted when `WITH (HEADER)` is set.
+///
+/// COPY runs outside the ordinary statement pipeline, on a thread that may last have run another
+/// connection's statement, so the session it runs under is pinned here from `settings`, the session's
+/// `SET` variables.
 pub(super) fn run_copy_to(
     copy: &ast::Copy,
     user: &str,
+    settings: &HashMap<String, String>,
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(usize, usize, Vec<u8>), Error> {
+    super::session_ctx::set_session_user_with_settings(user, settings);
     let _clock = super::clock::enter_statement(txn);
     // `COPY (<query>) TO STDOUT`: analyze + plan + run the query as the COPY user (so it is checked
     // for privileges and row-level security exactly like a direct SELECT), then render its result.
     if let Some(query) = &copy.query {
-        return run_copy_query_to(query, user, &copy.format, engine, txn);
+        return run_copy_query_to(query, user, settings, &copy.format, engine, txn);
     }
 
     let table = lookup_copy_table(copy, engine, txn)?;
@@ -3001,12 +3007,25 @@ pub(super) fn copy_table_column_count(
     Ok(resolve_copy_columns(copy, &table)?.len())
 }
 
-/// `COPY (<query>) TO STDOUT`: analyze + plan + execute `query` as `user` under `txn`, then render its
-/// rows (all projected columns, in order) in `format`, with a header line of column names when the
-/// format asks for one. Returns the row count, the column count, and the payload.
+/// The settings of a COPY whose caller carries none: the zone the caller pinned for its output.
+pub(super) fn pinned_zone_settings() -> HashMap<String, String> {
+    match super::statement_tz_offset_secs() {
+        0 => HashMap::new(),
+        secs => HashMap::from([(
+            "timezone".to_owned(),
+            crate::temporal::zone_setting_for_offset(secs),
+        )]),
+    }
+}
+
+/// `COPY (<query>) TO STDOUT`: analyze + plan + execute `query` as `user` under `txn` and the session
+/// `settings`, then render its rows (all projected columns, in order) in `format`, with a header
+/// line of column names when the format asks for one. Returns the row count, the column count, and
+/// the payload.
 fn run_copy_query_to(
     query: &ast::Select,
     user: &str,
+    settings: &HashMap<String, String>,
     format: &ast::CopyFormat,
     engine: &dyn StorageEngine,
     txn: TxnId,
@@ -3015,23 +3034,16 @@ fn run_copy_query_to(
         engine,
         txn,
         user,
-        // Unqualified names resolve in the default namespace; a query needing another schema must
-        // qualify it (the COPY entry points carry no session search path).
-        crate::search_path_schemas(None),
-        // COPY runs outside the statement pipeline: the wire pinned the connection's zone just
-        // before this call, so hand that pin back to the analyzer (which re-pins from the
-        // catalog) instead of resetting it to UTC.
-        match super::statement_tz_offset_secs() {
-            0 => None,
-            secs => Some(crate::temporal::zone_setting_for_offset(secs)),
-        },
+        crate::search_path_schemas(settings.get("search_path").map(String::as_str)),
+        settings.get("timezone").cloned(),
     );
     let logical = crate::analyze(ast::Statement::Select(query.clone()), &catalog)?;
     let physical = crate::plan(logical);
-    // Run it as `user` too: the thread may last have run another connection's statement, and
-    // `CURRENT_USER` (and every row-level security predicate that reads it) must see the COPY user.
+    // Run it under the session it was planned under: `CURRENT_USER` and every row-level security
+    // predicate that reads it must see the COPY user, and the zone must stay the one the plan
+    // assumed, through to the rendering below.
     let ExecutionResult::Rows { columns, rows, .. } =
-        super::execute_in_txn_as(physical, engine, txn, user)?
+        super::execute_in_txn_as_with_settings(physical, engine, txn, user, settings)?
     else {
         return Err(Error::Internal(
             "COPY (query) TO STDOUT: the query did not produce a row set".to_owned(),
