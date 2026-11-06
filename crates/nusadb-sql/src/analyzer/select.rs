@@ -3003,8 +3003,8 @@ impl CteCatalog<'_> {
     }
 
     /// Whether `object`, in the form the privilege catalog keys a table by, is the synthetic table.
-    /// Its schema is always `public` however the reference reached it, so this is one exact key:
-    /// the table a term reads as `SELECT` of its own making, and nothing of the same name.
+    /// Its schema is always `public` however the reference reached it, so this is one exact key,
+    /// and a table of the same name in another schema is not it.
     fn is_working_table(&self, object: &str) -> bool {
         object
             .strip_prefix(self.schema.schema.as_str())

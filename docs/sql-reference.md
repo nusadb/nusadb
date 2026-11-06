@@ -1806,6 +1806,12 @@ it: `mark` (true on the row that revisits a value) and `path` (the array of visi
 recursion stops descending past a marked row. One cycle column only, and the boolean marker form
 only.
 
+A recursive term is checked like any other read: it needs `SELECT` on what it reads, gets the rows
+the session's row-level security policies allow, and reads a view, a function or a partitioned table
+as any query does. Its reference to the CTE itself needs no grant. A name declared in `WITH` belongs
+to the text of its statement: it does not replace a table named in a view or in a policy that the
+statement reads through.
+
 ### Grouping sets and aggregates with filters
 
 ```sql
