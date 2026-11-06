@@ -11,6 +11,7 @@
 //! each other and the dispatch/format helpers in this file through a glob re-export.
 #![allow(clippy::wildcard_imports)]
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1080,15 +1081,13 @@ pub fn execute_in_txn_as_streaming_with_prepared(
             // this connection's transaction and search path (the session user drives row-level
             // security, so `EXECUTE` cannot bypass it) and stream it like a directly submitted one.
             let bound = crate::params::substitute_values(statement, &args)?;
-            let catalog = SessionCatalog {
+            let catalog = SessionCatalog::new(
                 engine,
                 txn,
                 user,
-                search_path: crate::search_path_schemas(
-                    settings.get("search_path").map(String::as_str),
-                ),
-                timezone: settings.get("timezone").cloned(),
-            };
+                crate::search_path_schemas(settings.get("search_path").map(String::as_str)),
+                settings.get("timezone").cloned(),
+            );
             let logical = crate::analyze(bound, &catalog)?;
             let physical = crate::plan(logical);
             execute_in_txn_as_streaming_with_settings(physical, engine, txn, user, settings, sink)
@@ -2253,13 +2252,13 @@ impl<'engine> Session<'engine> {
         txn: TxnId,
         read_only: bool,
     ) -> Result<ExecutionResult, Error> {
-        let catalog = SessionCatalog {
-            engine: self.engine,
+        let catalog = SessionCatalog::new(
+            self.engine,
             txn,
-            user: &self.current_user,
-            search_path: self.search_path(),
-            timezone: self.variables.get("timezone").cloned(),
-        };
+            &self.current_user,
+            self.search_path(),
+            self.variables.get("timezone").cloned(),
+        );
         let logical = crate::analyze(stmt, &catalog)?;
         let physical = crate::plan(logical);
         if read_only && plan_modifies_data(&physical) {
@@ -5559,6 +5558,8 @@ struct ExecCatalog<'a> {
     /// superuser context: `DO $$ INSERT INTO nusadb_roles ... $$` would have let any role write
     /// itself a superuser row.
     user: String,
+    /// The role resolved for this statement's column checks.
+    session: OnceCell<crate::rbac::ResolvedSession>,
 }
 
 impl<'a> ExecCatalog<'a> {
@@ -5568,8 +5569,25 @@ impl<'a> ExecCatalog<'a> {
             engine,
             txn,
             user: session_ctx::current_user(),
+            session: OnceCell::new(),
         }
     }
+}
+
+/// The session `cell` holds for one statement, resolving it on first use. A catalog keeps it so that
+/// a statement's column checks share one read of the grants (see
+/// [`ResolvedSession`](crate::rbac::ResolvedSession)).
+fn statement_session<'c>(
+    cell: &'c OnceCell<crate::rbac::ResolvedSession>,
+    engine: &dyn StorageEngine,
+    txn: TxnId,
+    user: &str,
+) -> Result<&'c crate::rbac::ResolvedSession, Error> {
+    if let Some(session) = cell.get() {
+        return Ok(session);
+    }
+    let session = crate::rbac::ResolvedSession::resolve(engine, txn, user)?;
+    Ok(cell.get_or_init(|| session))
 }
 
 impl crate::Catalog for ExecCatalog<'_> {
@@ -5733,10 +5751,9 @@ impl crate::Catalog for ExecCatalog<'_> {
         column: &str,
         privilege: crate::ast::Privilege,
     ) -> Result<bool, Error> {
-        crate::rbac::has_column_privilege(
+        statement_session(&self.session, self.engine, self.txn, &self.user)?.has_column_privilege(
             self.engine,
             self.txn,
-            &self.user,
             object,
             column,
             privilege,
@@ -5805,6 +5822,28 @@ struct SessionCatalog<'a> {
     /// default would lag one statement behind a `SET TIME ZONE` (it is re-pinned only when the
     /// NEXT statement executes, after this analysis).
     timezone: Option<String>,
+    /// The role resolved for this statement's column checks.
+    session: OnceCell<crate::rbac::ResolvedSession>,
+}
+
+impl<'a> SessionCatalog<'a> {
+    /// A catalog for one statement of `user`, analyzed under `txn`.
+    const fn new(
+        engine: &'a dyn StorageEngine,
+        txn: TxnId,
+        user: &'a str,
+        search_path: Vec<String>,
+        timezone: Option<String>,
+    ) -> Self {
+        Self {
+            engine,
+            txn,
+            user,
+            search_path,
+            timezone,
+            session: OnceCell::new(),
+        }
+    }
 }
 
 impl crate::Catalog for SessionCatalog<'_> {
@@ -5964,10 +6003,9 @@ impl crate::Catalog for SessionCatalog<'_> {
         column: &str,
         privilege: crate::ast::Privilege,
     ) -> Result<bool, Error> {
-        crate::rbac::has_column_privilege(
+        statement_session(&self.session, self.engine, self.txn, self.user)?.has_column_privilege(
             self.engine,
             self.txn,
-            self.user,
             object,
             column,
             privilege,

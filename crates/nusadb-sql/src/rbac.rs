@@ -42,6 +42,7 @@
 //! deliberate, and preferable to leaving the data open.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use nusadb_core::TxnId;
 use nusadb_core::engine::{ColumnDef, ColumnType, StorageEngine, TableDef};
@@ -599,6 +600,26 @@ pub fn resolve_session(
     Ok((resolved.effective, resolved.superuser))
 }
 
+/// What one session may do to the columns of one table with one privilege, decided from one read
+/// of the owner and grant catalogs.
+#[derive(Debug)]
+struct ColumnAccess {
+    /// Ownership or a table-wide grant, which covers every column.
+    table_wide: bool,
+    /// The columns a column-scoped grant covers.
+    columns: HashSet<String>,
+}
+
+impl ColumnAccess {
+    /// Whether the session may access `column`.
+    fn covers(&self, column: &str) -> bool {
+        self.table_wide || self.columns.contains(column)
+    }
+}
+
+/// The column decisions a session has read, per transaction, table and privilege.
+type ColumnAccessReads = HashMap<(TxnId, String, Privilege), ColumnAccess>;
+
 /// A session resolved to the roles it effectively holds and whether it is a superuser — the two
 /// facts every privilege question turns on, computed once from the role and membership catalogs.
 ///
@@ -618,6 +639,11 @@ pub struct ResolvedSession {
     assumable: BTreeSet<String>,
     /// Whether any of the effective roles carries the superuser attribute.
     superuser: bool,
+    /// The column decisions read so far, shared with this session's clones. A statement that
+    /// checks every column of a table, or the same columns again under each partition of a parent,
+    /// then reads the catalogs once rather than once per check. As with the roles above, a holder
+    /// keeps a session for one statement, so a grant or revoke reaches the next statement.
+    column_access: Arc<Mutex<ColumnAccessReads>>,
 }
 
 impl ResolvedSession {
@@ -633,6 +659,7 @@ impl ResolvedSession {
                 assumable: effective.clone(),
                 effective,
                 superuser: true,
+                column_access: Arc::default(),
             });
         }
         let memberships = all_memberships(engine, txn)?;
@@ -646,6 +673,7 @@ impl ResolvedSession {
             effective,
             assumable,
             superuser,
+            column_access: Arc::default(),
         })
     }
 
@@ -719,36 +747,43 @@ impl ResolvedSession {
             && !builtin_grant_revoked(engine, txn, kind, object, privilege)?)
     }
 
-    /// Column-scoped decision over pre-fetched grants: a table-wide privilege on the object grants
-    /// every column, else a column grant on this specific column to an effective role (or `PUBLIC`).
-    fn decide_column(
+    /// Read the session's access to the columns of `object`: a table-wide privilege on the object
+    /// grants every column, else each column grant to an effective role (or `PUBLIC`) grants its
+    /// column.
+    fn read_column_access(
         &self,
-        owner: &str,
-        table_grants: &[GrantRecord],
-        column_grants: &[ColumnGrantRecord],
+        engine: &dyn StorageEngine,
+        txn: TxnId,
         object: &str,
-        column: &str,
         privilege: Privilege,
-    ) -> bool {
-        // A table-wide grant (or ownership / superuser, via `decide`) covers every column.
-        if self.decide(
-            owner,
-            table_grants,
+    ) -> Result<ColumnAccess, Error> {
+        let owner = object_owner(engine, txn, ObjectKind::Table, object)?;
+        let table_grants = all_grants(engine, txn)?;
+        let column_grants = all_column_grants(engine, txn)?;
+        // A table-wide grant (or ownership, via `decide`) covers every column.
+        let table_wide = self.decide(
+            &owner,
+            &table_grants,
             ObjectKind::Table,
             object,
             privilege,
             false,
-        ) {
-            return true;
-        }
-        column_grants.iter().any(|g| {
-            g.object == object
-                && g.column == column
-                && g.privilege == privilege
-                && match &g.grantee {
-                    Grantee::Public => true,
-                    Grantee::Role(name) => self.effective.contains(name),
-                }
+        );
+        let columns = column_grants
+            .into_iter()
+            .filter(|g| {
+                g.object == object
+                    && g.privilege == privilege
+                    && match &g.grantee {
+                        Grantee::Public => true,
+                        Grantee::Role(name) => self.effective.contains(name),
+                    }
+            })
+            .map(|g| g.column)
+            .collect();
+        Ok(ColumnAccess {
+            table_wide,
+            columns,
         })
     }
 
@@ -768,18 +803,22 @@ impl ResolvedSession {
         if self.superuser {
             return Ok(true);
         }
-        let owner = object_owner(engine, txn, ObjectKind::Table, object)?;
-        let table_grants = all_grants(engine, txn)?;
-        let column_grants = all_column_grants(engine, txn)?;
-        let decision = self.decide_column(
-            &owner,
-            &table_grants,
-            &column_grants,
-            object,
-            column,
-            privilege,
-        );
-        Ok(decision)
+        let key = (txn, object.to_owned(), privilege);
+        let known = self.column_reads().get(&key).map(|a| a.covers(column));
+        if let Some(covered) = known {
+            return Ok(covered);
+        }
+        let access = self.read_column_access(engine, txn, object, privilege)?;
+        let covered = access.covers(column);
+        self.column_reads().insert(key, access);
+        Ok(covered)
+    }
+
+    /// The column decisions read so far.
+    fn column_reads(&self) -> MutexGuard<'_, ColumnAccessReads> {
+        self.column_access
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Whether the session may access *at least one* column of table `object` with `privilege` — the

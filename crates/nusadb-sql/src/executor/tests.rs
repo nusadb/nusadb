@@ -42,6 +42,8 @@ struct MockState {
     lock_outcomes: HashMap<Tid, Option<nusadb_core::engine::LockedRow>>,
     /// The isolation level `txn_isolation` reports (the engine default when unset).
     isolation: Option<IsolationLevel>,
+    /// How many scans each table has had, so a test can count the catalog reads of a statement.
+    scans: HashMap<TableId, u32>,
 }
 
 struct MockTable {
@@ -67,6 +69,7 @@ impl MockEngine {
                 rollback_count: 0,
                 lock_outcomes: HashMap::new(),
                 isolation: None,
+                scans: HashMap::new(),
             }),
         }
     }
@@ -76,6 +79,16 @@ impl MockEngine {
     /// [`rollback_count`](Self::rollback_count).
     fn set_failing_commit(&self, fail: bool) {
         self.state.lock().unwrap().fail_commit = fail;
+    }
+
+    /// How many scans the table `name` has had.
+    fn scans_of(&self, name: &str) -> u32 {
+        let s = self.state.lock().unwrap();
+        s.tables_by_name
+            .get(name)
+            .and_then(|id| s.scans.get(id))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// How many times `rollback` has been called on the engine.
@@ -269,7 +282,8 @@ impl StorageEngine for MockEngine {
     }
 
     fn scan(&self, _txn: TxnId, table: TableId) -> CoreResult<Box<dyn TupleScan>> {
-        let s = self.state.lock().unwrap();
+        let mut s = self.state.lock().unwrap();
+        *s.scans.entry(table).or_default() += 1;
         let t = s
             .tables_by_id
             .get(&table)
@@ -4737,4 +4751,143 @@ fn reindex_repairs_partial_index_membership() {
         read("COMMIT");
         assert_eq!(ids(read(top)), vec![Value::Int(1)], "{reindex}");
     }
+}
+
+// --- Catalog reads of a privilege check -----
+
+/// The scans of the column-grant catalog while `sql` is analyzed as `user`, under one catalog as a
+/// connection builds one per statement.
+fn column_grant_reads(engine: &MockEngine, user: &str, sql: &str) -> u32 {
+    let before = engine.scans_of(crate::rbac::COLUMN_PRIVILEGE_CATALOG);
+    let catalog = super::SessionCatalog::new(
+        engine,
+        TxnId(1),
+        user,
+        crate::search_path_schemas(None),
+        None,
+    );
+    analyze(parse(sql).unwrap(), &catalog).unwrap();
+    engine.scans_of(crate::rbac::COLUMN_PRIVILEGE_CATALOG) - before
+}
+
+/// A table of 50 columns, a parent of 20 partitions and two roles over them: `writer` holds table
+/// privileges and `restricted` column grants that leave most columns out.
+fn grants_fixture() -> MockEngine {
+    let engine = MockEngine::new();
+    let columns: Vec<String> = (1..50).map(|i| format!("c{i} INT")).collect();
+    let mut setup = vec![
+        format!("CREATE TABLE wide (id INT, {})", columns.join(", ")),
+        "CREATE ROLE writer".to_owned(),
+        "CREATE ROLE restricted".to_owned(),
+        "GRANT INSERT, UPDATE, DELETE ON wide TO writer".to_owned(),
+        "GRANT DELETE ON wide TO restricted".to_owned(),
+        "GRANT SELECT (id, c1, c2, c3), UPDATE (c1) ON wide TO restricted".to_owned(),
+        "CREATE TABLE parts (id INT, v INT, w TEXT) PARTITION BY RANGE (id)".to_owned(),
+        "GRANT SELECT (id, v), UPDATE (v) ON parts TO restricted".to_owned(),
+        "GRANT DELETE ON parts TO restricted".to_owned(),
+    ];
+    for i in 0..20 {
+        setup.push(format!(
+            "CREATE TABLE parts_{i} PARTITION OF parts FOR VALUES FROM ({}) TO ({})",
+            i * 10,
+            (i + 1) * 10
+        ));
+    }
+    for sql in setup {
+        run(&sql, &engine).unwrap();
+    }
+    engine
+}
+
+/// Whatever the number of columns a statement checks, the grants are read once per table and
+/// privilege, on one table as under the partitions of a parent.
+#[test]
+fn a_statement_reads_the_column_grants_once_per_table_and_privilege() {
+    let engine = grants_fixture();
+    let reads = [
+        "DELETE FROM wide WHERE id = 1",
+        "UPDATE wide SET c1 = c2 + c3 WHERE id = 1",
+        "DELETE FROM parts WHERE id = 1",
+        "UPDATE parts SET v = v + 1 WHERE id >= 0",
+    ]
+    .map(|sql| column_grant_reads(&engine, "restricted", sql));
+    assert_eq!(reads, [1, 2, 1, 2]);
+}
+
+/// A statement that reads no column of its target asks nothing about SELECT, so it costs what it
+/// cost before columns of the target were checked.
+#[test]
+fn a_statement_that_reads_nothing_of_its_target_reads_no_select_grants() {
+    let engine = grants_fixture();
+    let reads = [
+        "DELETE FROM wide",
+        "UPDATE wide SET c1 = 1",
+        "UPDATE wide SET c1 = DEFAULT",
+        "INSERT INTO wide (id) VALUES (1)",
+    ]
+    .map(|sql| column_grant_reads(&engine, "writer", sql));
+    assert_eq!(reads, [0, 0, 0, 0]);
+}
+
+/// One resolved session reads the grants of a table once, whatever it is asked and however often it
+/// is cloned, and decides each column as a fresh read would; another transaction reads them again.
+#[test]
+fn a_resolved_session_decides_every_column_from_one_read() {
+    use crate::ast::Privilege;
+    use crate::rbac::{COLUMN_PRIVILEGE_CATALOG, ResolvedSession, has_column_privilege};
+
+    let engine = grants_fixture();
+    let txn = TxnId(1);
+    let session = ResolvedSession::resolve(&engine, txn, "restricted").unwrap();
+    let before = engine.scans_of(COLUMN_PRIVILEGE_CATALOG);
+    let mut read = Vec::new();
+    for i in 1..50 {
+        let column = format!("c{i}");
+        read.push(
+            session
+                .clone()
+                .has_column_privilege(&engine, txn, "public.wide", &column, Privilege::Select)
+                .unwrap(),
+        );
+    }
+    assert_eq!(engine.scans_of(COLUMN_PRIVILEGE_CATALOG) - before, 1);
+    assert_eq!(read.iter().filter(|&&granted| granted).count(), 3);
+    for (i, granted) in read.into_iter().enumerate() {
+        let column = format!("c{}", i + 1);
+        let fresh = has_column_privilege(
+            &engine,
+            txn,
+            "restricted",
+            "public.wide",
+            &column,
+            Privilege::Select,
+        )
+        .unwrap();
+        assert_eq!(granted, fresh, "{column}");
+    }
+
+    let before = engine.scans_of(COLUMN_PRIVILEGE_CATALOG);
+    session
+        .has_column_privilege(&engine, TxnId(2), "public.wide", "c1", Privilege::Select)
+        .unwrap();
+    assert_eq!(engine.scans_of(COLUMN_PRIVILEGE_CATALOG) - before, 1);
+}
+
+/// A connection builds a catalog per statement, so a grant taken back inside a transaction reaches
+/// the next statement of that transaction, for a statement that was allowed before.
+#[test]
+fn a_revoke_reaches_the_next_statement_of_the_transaction() {
+    let engine = grants_fixture();
+    let allowed = "UPDATE wide SET c1 = c2 WHERE id = 1";
+    column_grant_reads(&engine, "restricted", allowed);
+    run("REVOKE SELECT (c2) ON wide FROM restricted", &engine).unwrap();
+    let catalog = super::SessionCatalog::new(
+        &engine,
+        TxnId(1),
+        "restricted",
+        crate::search_path_schemas(None),
+        None,
+    );
+    let refused = analyze(parse(allowed).unwrap(), &catalog).unwrap_err();
+    assert!(matches!(refused, Error::PermissionDenied(_)), "{refused:?}");
 }

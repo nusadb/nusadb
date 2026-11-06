@@ -1108,6 +1108,47 @@ fn column_reads_anywhere_in_a_write_need_select_on_the_column() {
     assert!(rows(ok_as(&engine, ROOT, "SELECT a FROM t")).is_empty());
 }
 
+/// A write that reads no column of its target needs no SELECT, and the first thing it reads brings
+/// the check back, wherever the read is: constants are the only values that read nothing.
+#[test]
+fn only_a_write_that_reads_nothing_of_its_target_goes_without_select() {
+    let engine = column_fixture();
+    root(
+        &engine,
+        "GRANT UPDATE (b), INSERT (a), DELETE ON t TO clerk",
+    );
+    for sql in [
+        "UPDATE t SET b = 1",
+        "UPDATE t SET b = DEFAULT",
+        "INSERT INTO t (a) VALUES (2)",
+        "DELETE FROM t",
+    ] {
+        ok_as(&engine, "clerk", sql);
+    }
+    root(&engine, "INSERT INTO t VALUES (1, 2, 99)");
+    for sql in [
+        "UPDATE t SET b = secret",
+        "UPDATE t SET b = -secret",
+        "UPDATE t SET b = COALESCE(secret, 1)",
+        "UPDATE t SET b = (SELECT t.secret)",
+        "UPDATE t SET b = 1 WHERE secret = 99",
+        "UPDATE t SET b = 1 WHERE EXISTS (SELECT 1 WHERE t.secret = 99)",
+        "UPDATE t SET b = 1 RETURNING secret",
+        "UPDATE t SET b = 1 RETURNING *",
+        "DELETE FROM t WHERE secret = 99",
+        "DELETE FROM t RETURNING secret",
+        "DELETE FROM t RETURNING *",
+        "INSERT INTO t (a) VALUES (2) RETURNING secret",
+        "INSERT INTO t (a) VALUES (2) RETURNING *",
+    ] {
+        denied_as(&engine, "clerk", sql);
+    }
+    assert_eq!(
+        rows(ok_as(&engine, ROOT, "SELECT a, b, secret FROM t")),
+        vec![vec![Value::Int(1), Value::Int(2), Value::Int(99)]]
+    );
+}
+
 /// An `INSERT` that reads rows back, through `RETURNING` or an `ON CONFLICT` clause, needs SELECT
 /// on each column it reads, and an `ON CONFLICT DO UPDATE` needs UPDATE on each column it sets.
 #[test]

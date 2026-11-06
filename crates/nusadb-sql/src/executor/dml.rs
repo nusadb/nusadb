@@ -3011,21 +3011,21 @@ fn run_copy_query_to(
     engine: &dyn StorageEngine,
     txn: TxnId,
 ) -> Result<(usize, usize, Vec<u8>), Error> {
-    let catalog = super::SessionCatalog {
+    let catalog = super::SessionCatalog::new(
         engine,
         txn,
         user,
         // Unqualified names resolve in the default namespace; a query needing another schema must
         // qualify it (the COPY entry points carry no session search path).
-        search_path: crate::search_path_schemas(None),
+        crate::search_path_schemas(None),
         // COPY runs outside the statement pipeline: the wire pinned the connection's zone just
         // before this call, so hand that pin back to the analyzer (which re-pins from the
         // catalog) instead of resetting it to UTC.
-        timezone: match super::statement_tz_offset_secs() {
+        match super::statement_tz_offset_secs() {
             0 => None,
             secs => Some(crate::temporal::zone_setting_for_offset(secs)),
         },
-    };
+    );
     let logical = crate::analyze(ast::Statement::Select(query.clone()), &catalog)?;
     let physical = crate::plan(logical);
     // Run it as `user` too: the thread may last have run another connection's statement, and

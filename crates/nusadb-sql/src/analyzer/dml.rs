@@ -44,7 +44,8 @@ pub(super) fn analyze_insert(ins: ast::Insert, catalog: &dyn Catalog) -> Result<
     // A column the statement reads back, through RETURNING or an `ON CONFLICT` clause, needs
     // SELECT on it: RETURNING hands back stored values (a default, a trigger's change, or the
     // existing row an upsert updated), and an arbiter reads the existing rows.
-    let readable = target_readable(&table, &table, catalog)?;
+    let reads_target = !ins.returning.is_empty() || ins.on_conflict.is_some();
+    let readable = target_grants(&table, reads_target, catalog)?;
     // RETURNING projects the inserted rows: resolve it against the table's columns.
     let returning = analyze_returning(&ins.returning, &table, &table.name, &readable, catalog)?;
     // `ON CONFLICT`: `DO NOTHING` skips conflicting rows; `DO UPDATE` upserts the existing
@@ -800,8 +801,13 @@ pub(super) fn analyze_update_stmt(
     parent.only = true;
     let mut plan = analyze_update(parent, catalog, None)?;
     // Each descendant is reached through the parent: its target takes the parent's privileges and
-    // row-level security.
+    // row-level security, so all of them share one lookup of the parent's grants.
     let parent_table = plan.table.clone();
+    let select_grants = target_grants(&parent_table, update_reads_target(&upd), catalog)?;
+    let via = Via {
+        parent: &parent_table,
+        select_grants: &select_grants,
+    };
     for descendant in descendants {
         // The descendant is a schema-qualified edge key, bare for `public`; split it and name the
         // schema explicitly so the sub-plan targets exactly the recorded table. A bare name would
@@ -812,7 +818,7 @@ pub(super) fn analyze_update_stmt(
         sub.only = true;
         sub.schema = Some(sub_schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA).to_owned());
         sub_name.clone_into(&mut sub.table);
-        let mut sub_plan = analyze_update(sub, catalog, Some(&parent_table))?;
+        let mut sub_plan = analyze_update(sub, catalog, Some(&via))?;
         // Reached through the parent: a bound-leaving new image moves to its sibling partition.
         sub_plan.partition_via_parent = true;
         plan.propagate.push(sub_plan);
@@ -835,6 +841,11 @@ pub(super) fn analyze_delete_stmt(
     let mut plan = analyze_delete(parent, catalog, None)?;
     // As in `analyze_update_stmt`: each descendant's target is reached through the parent.
     let parent_table = plan.table.clone();
+    let select_grants = target_grants(&parent_table, delete_reads_target(&del), catalog)?;
+    let via = Via {
+        parent: &parent_table,
+        select_grants: &select_grants,
+    };
     for descendant in descendants {
         // As in `analyze_update_stmt`: split the qualified edge key into the sub-plan's target.
         let (sub_schema, sub_name) = super::split_qualified(&descendant);
@@ -843,28 +854,70 @@ pub(super) fn analyze_delete_stmt(
         sub.schema = Some(sub_schema.unwrap_or(nusadb_core::PUBLIC_SCHEMA).to_owned());
         sub_name.clone_into(&mut sub.table);
         plan.propagate
-            .push(analyze_delete(sub, catalog, Some(&parent_table))?);
+            .push(analyze_delete(sub, catalog, Some(&via))?);
     }
     Ok(plan)
 }
 
-/// Whether the session may read each column of `table`, the target of a write whose privileges are
-/// those of `access` (the target itself, or the parent it is reached through), parallel to
-/// `table.columns`: a column is readable with SELECT on the column of `access` of the same name.
-fn target_readable(
+/// The parent a write's target is reached through, for a sub-plan of a statement on that parent.
+pub(super) struct Via<'a> {
+    /// The table the statement names.
+    parent: &'a TableSchema,
+    /// The session's SELECT on the parent's columns, parallel to them.
+    select_grants: &'a [bool],
+}
+
+/// Whether a statement can read a column of its target: only a `WHERE`, a `RETURNING` or a `SET`
+/// value that is not a constant can.
+fn update_reads_target(upd: &ast::Update) -> bool {
+    upd.filter.is_some()
+        || !upd.returning.is_empty()
+        || !upd
+            .assignments
+            .iter()
+            .all(|a| matches!(a.value, None | Some(ast::Expr::Literal(_))))
+}
+
+/// [`update_reads_target`] for a `DELETE`.
+const fn delete_reads_target(del: &ast::Delete) -> bool {
+    del.filter.is_some() || !del.returning.is_empty()
+}
+
+/// The session's SELECT on each column of `table`, parallel to its columns. A statement that
+/// `reads_target` needs them looked up; any other reaches no check that consults them, so it pays
+/// for no lookup and they say unreadable in case one ever does.
+fn target_grants(
     table: &TableSchema,
-    access: &TableSchema,
+    reads_target: bool,
     catalog: &dyn Catalog,
 ) -> Result<Vec<bool>, Error> {
-    let grants = super::column_select_grants(access, catalog)?;
+    if reads_target {
+        super::column_select_grants(table, catalog)
+    } else {
+        Ok(vec![false; table.columns.len()])
+    }
+}
+
+/// Whether the session may read each column of `table`, the target of a write, parallel to
+/// `table.columns`. Without `via` these are the grants on `table`; a target reached through a parent
+/// takes the parent's, a column being readable with SELECT on the parent's column of the same name.
+fn target_readable(
+    table: &TableSchema,
+    via: Option<&Via<'_>>,
+    reads_target: bool,
+    catalog: &dyn Catalog,
+) -> Result<Vec<bool>, Error> {
+    let Some(via) = via else {
+        return target_grants(table, reads_target, catalog);
+    };
     Ok(table
         .columns
         .iter()
         .map(|c| {
-            access
+            via.parent
                 .columns
                 .iter()
-                .zip(&grants)
+                .zip(via.select_grants)
                 .any(|(a, &granted)| granted && a.name == c.name)
         })
         .collect())
@@ -904,7 +957,7 @@ fn reject_repeated_qualifier(target: &str, source: &str) -> Result<(), Error> {
 pub(super) fn analyze_update(
     upd: ast::Update,
     catalog: &dyn Catalog,
-    via: Option<&TableSchema>,
+    via: Option<&Via<'_>>,
 ) -> Result<UpdatePlan, Error> {
     // The system-catalog namespace is reserved: a user UPDATE of e.g. `nusadb_policies`
     // could widen a policy's USING predicate and bypass RLS.
@@ -927,7 +980,7 @@ pub(super) fn analyze_update(
         catalog,
     )?;
     // The table whose privileges and row-level security govern the target.
-    let access = via.unwrap_or(&table).clone();
+    let access = via.map_or(&table, |v| v.parent).clone();
     // UPDATE needs the privilege on the table, or a column-scoped UPDATE grant on each SET column.
     let update_columns: Vec<&str> = upd.assignments.iter().map(|a| a.column.as_str()).collect();
     super::dcl::require_column_privilege(
@@ -940,7 +993,7 @@ pub(super) fn analyze_update(
     // correlated subquery, needs SELECT on it (table-wide or on the column). An unconditional
     // `UPDATE t SET c = 1` reads nothing and needs only UPDATE, which keeps a write-only role
     // write-only.
-    let readable = target_readable(&table, &access, catalog)?;
+    let readable = target_readable(&table, via, update_reads_target(&upd), catalog)?;
     // The statement names the target by its alias, else by the table it names: the parent, for a
     // sub-plan reached through it.
     let target_qual = upd.alias.clone().unwrap_or_else(|| access.name.clone());
@@ -1092,7 +1145,7 @@ fn aux_scope(table: &TableSchema, qualifier: &str, readable: &[bool]) -> Vec<Sco
 pub(super) fn analyze_delete(
     del: ast::Delete,
     catalog: &dyn Catalog,
-    via: Option<&TableSchema>,
+    via: Option<&Via<'_>>,
 ) -> Result<DeletePlan, Error> {
     // The system-catalog namespace is reserved: a user DELETE on e.g. `nusadb_rls` would
     // switch row-level security off for the affected tables.
@@ -1116,10 +1169,10 @@ pub(super) fn analyze_delete(
         catalog,
     )?;
     // The table whose privileges and row-level security govern the target.
-    let access = via.unwrap_or(&table).clone();
+    let access = via.map_or(&table, |v| v.parent).clone();
     super::dcl::require_table_privilege(catalog, &access, ast::Privilege::Delete)?;
     // As for UPDATE: every column of the target the statement reads needs SELECT on it.
-    let readable = target_readable(&table, &access, catalog)?;
+    let readable = target_readable(&table, via, delete_reads_target(&del), catalog)?;
     // As for UPDATE: the target goes by its alias, else by the table the statement names.
     let target_qual = del.alias.clone().unwrap_or_else(|| access.name.clone());
     // RETURNING projects the deleted rows, resolved against the table's columns.
