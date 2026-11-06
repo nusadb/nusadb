@@ -879,3 +879,171 @@ fn a_parent_reaches_its_own_partitions_whatever_the_search_path() {
     );
     assert_eq!(ids(ok_in("SELECT g_id FROM g ORDER BY g_id")), vec![1, 2]);
 }
+
+/// The column names and the rows, sorted, of a `RETURNING` result.
+fn returned(result: ExecutionResult) -> (Vec<String>, Vec<Vec<Value>>) {
+    match result {
+        ExecutionResult::Rows {
+            columns, mut rows, ..
+        } => {
+            rows.sort_by_key(|row| format!("{row:?}"));
+            (columns, rows)
+        },
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// Rows of integers.
+fn ints(rows: &[&[i64]]) -> Vec<Vec<Value>> {
+    rows.iter()
+        .map(|row| row.iter().map(|&v| Value::Int(v)).collect())
+        .collect()
+}
+
+/// An inheritance parent `ip (id, v)` whose child adds `extra`, a partitioned `pp (id, v)`, each
+/// holding two rows, and two roles on both: `whole` with table privileges, `narrow` with column
+/// grants on the parent's columns only. Neither holds anything on the child or the partitions.
+fn returning_fixture() -> BtreeEngine {
+    let engine = BtreeEngine::new();
+    for sql in [
+        "CREATE TABLE ip (id INT, v INT)",
+        "CREATE TABLE ic (extra TEXT) INHERITS (ip)",
+        "INSERT INTO ip VALUES (1, 10)",
+        "INSERT INTO ic VALUES (2, 20, 'secret')",
+        "CREATE TABLE pp (id INT, v INT) PARTITION BY RANGE (id)",
+        "CREATE TABLE pp1 PARTITION OF pp FOR VALUES FROM (0) TO (10)",
+        "CREATE TABLE pp2 PARTITION OF pp FOR VALUES FROM (10) TO (20)",
+        "INSERT INTO pp VALUES (1, 10), (11, 110)",
+        "CREATE ROLE whole LOGIN",
+        "CREATE ROLE narrow LOGIN",
+        "GRANT SELECT, UPDATE, DELETE ON ip TO whole",
+        "GRANT SELECT, UPDATE, DELETE ON pp TO whole",
+        "GRANT SELECT (id, v), UPDATE (v), DELETE ON ip TO narrow",
+        "GRANT SELECT (id, v), UPDATE (v), DELETE ON pp TO narrow",
+    ] {
+        root(&engine, sql);
+    }
+    engine
+}
+
+/// `RETURNING *` and `RETURNING t.*` through a parent stand for the parent's columns on every row,
+/// whatever columns the table holding the row adds, for table and column grants alike.
+#[test]
+fn a_wildcard_returning_through_a_parent_is_the_parents_columns() {
+    type Ints = &'static [&'static [i64]];
+    let id_v = vec!["id".to_owned(), "v".to_owned()];
+    let topologies: [(&str, Ints, Ints); 2] = [
+        ("ip", &[&[1, 10], &[2, 20]], &[&[1, 11], &[2, 21]]),
+        ("pp", &[&[1, 10], &[11, 110]], &[&[1, 11], &[11, 111]]),
+    ];
+    for (parent, before, after) in topologies {
+        for user in [ROOT, "whole", "narrow"] {
+            for (sql, expected) in [
+                (format!("UPDATE {parent} SET v = v + 1 RETURNING *"), after),
+                (
+                    format!("UPDATE {parent} AS t SET v = v + 1 RETURNING t.*"),
+                    after,
+                ),
+                (
+                    format!("UPDATE {parent} SET v = v + 1 RETURNING {parent}.*"),
+                    after,
+                ),
+                (format!("DELETE FROM {parent} RETURNING *"), before),
+                (format!("DELETE FROM {parent} AS t RETURNING t.*"), before),
+            ] {
+                let engine = returning_fixture();
+                assert_eq!(
+                    returned(ok_as(&engine, user, &sql)),
+                    (id_v.clone(), ints(expected)),
+                    "`{sql}` as {user}"
+                );
+            }
+        }
+    }
+}
+
+/// A wildcard through a parent still needs SELECT on each of the parent's columns, and a column
+/// only the child has is not reachable by name, as a column the parent lacks.
+#[test]
+fn a_wildcard_returning_through_a_parent_needs_select_on_its_columns() {
+    for parent in ["ip", "pp"] {
+        let engine = returning_fixture();
+        root(
+            &engine,
+            &format!("REVOKE SELECT (v) ON {parent} FROM narrow"),
+        );
+        for sql in [
+            format!("UPDATE {parent} SET v = 5 RETURNING *"),
+            format!("UPDATE {parent} AS t SET v = 5 RETURNING t.*"),
+            format!("DELETE FROM {parent} RETURNING *"),
+        ] {
+            denied_as(&engine, "narrow", &sql, "`v`");
+        }
+        let (columns, returned_rows) = returned(ok_as(
+            &engine,
+            "narrow",
+            &format!("UPDATE {parent} SET v = 5 RETURNING id"),
+        ));
+        assert_eq!(columns, vec!["id".to_owned()]);
+        assert_eq!(returned_rows.len(), 2);
+    }
+    let engine = returning_fixture();
+    for user in [ROOT, "whole", "narrow"] {
+        for sql in [
+            "UPDATE ip SET v = 5 RETURNING extra",
+            "UPDATE ip AS t SET v = 5 RETURNING t.extra",
+            "DELETE FROM ip RETURNING extra",
+        ] {
+            let refused = as_role(&engine, user, sql).expect_err(sql);
+            assert!(refused.contains("extra"), "`{sql}` as {user}: {refused}");
+        }
+    }
+}
+
+/// The wildcard follows the parent by column name: a column added to the parent lands after the
+/// child's own in the child's rows, and is read from there.
+#[test]
+fn a_wildcard_returning_through_a_parent_matches_columns_by_name() {
+    let engine = returning_fixture();
+    root(&engine, "CREATE TABLE ig (more TEXT) INHERITS (ic)");
+    root(&engine, "INSERT INTO ig VALUES (3, 30, 'hidden', 'also')");
+    root(&engine, "ALTER TABLE ip ADD COLUMN z INT DEFAULT 7");
+    let columns: Vec<String> = ["id", "v", "z"].map(str::to_owned).to_vec();
+    assert_eq!(
+        returned(ok_as(&engine, "whole", "UPDATE ip SET v = 0 RETURNING *")),
+        (columns, ints(&[&[1, 0, 7], &[2, 0, 7], &[3, 0, 7]]))
+    );
+}
+
+/// Only a statement through a parent narrows the wildcard: `ONLY` the parent and the child named
+/// directly return their own columns, and a writable `WITH` hands on what the statement returned.
+#[test]
+fn a_wildcard_returning_keeps_the_columns_of_the_table_named() {
+    let engine = returning_fixture();
+    assert_eq!(
+        returned(ok_as(&engine, ROOT, "UPDATE ONLY ip SET v = 1 RETURNING *")),
+        (vec!["id".to_owned(), "v".to_owned()], ints(&[&[1, 1]]))
+    );
+    assert_eq!(
+        returned(ok_as(&engine, ROOT, "UPDATE ic SET v = 2 RETURNING *")),
+        (
+            vec!["id".to_owned(), "v".to_owned(), "extra".to_owned()],
+            vec![vec![
+                Value::Int(2),
+                Value::Int(2),
+                Value::Text("secret".to_owned())
+            ]]
+        )
+    );
+    assert_eq!(
+        returned(ok_as(
+            &engine,
+            "whole",
+            "WITH u AS (UPDATE ip SET v = 3 RETURNING *) SELECT * FROM u"
+        )),
+        (
+            vec!["id".to_owned(), "v".to_owned()],
+            ints(&[&[1, 3], &[2, 3]])
+        )
+    );
+}

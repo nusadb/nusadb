@@ -3,6 +3,8 @@
 //! Split verbatim out of `analyzer/mod.rs` (ADR 007). Siblings resolve via `use super::*`.
 #![allow(clippy::wildcard_imports)]
 
+use std::borrow::Cow;
+
 use super::*;
 
 // === INSERT ===============================================================
@@ -923,6 +925,42 @@ fn target_readable(
         .collect())
 }
 
+/// The `RETURNING` items of a write on a target named `qualifier`. Through a parent, the statement
+/// returns the columns of the table it names: a wildcard stands for the parent's columns, by name
+/// and in the parent's order, whatever columns the target holding the row adds or where it holds
+/// them. Each is then a reference to its column, checked and resolved like one written out.
+fn returning_of_target<'a>(
+    returning: &'a [ast::SelectItem],
+    via: Option<&Via<'_>>,
+    qualifier: &str,
+) -> Cow<'a, [ast::SelectItem]> {
+    let Some(via) = via else {
+        return Cow::Borrowed(returning);
+    };
+    let column_item = |expr| ast::SelectItem::Expr { expr, alias: None };
+    let columns = via.parent.columns.iter();
+    let mut items = Vec::with_capacity(returning.len());
+    for item in returning {
+        match item {
+            ast::SelectItem::Wildcard => items.extend(
+                columns
+                    .clone()
+                    .map(|c| column_item(ast::Expr::Column(c.name.clone()))),
+            ),
+            ast::SelectItem::QualifiedWildcard(table) if table == qualifier => {
+                items.extend(columns.clone().map(|c| {
+                    column_item(ast::Expr::QualifiedColumn {
+                        table: table.clone(),
+                        column: c.name.clone(),
+                    })
+                }));
+            },
+            other => items.push(other.clone()),
+        }
+    }
+    Cow::Owned(items)
+}
+
 /// Mark each column of a write target's scope readable as far as `readable` (parallel to the
 /// target's columns, which lead the scope) allows, so a reference to a column the session may not
 /// `SELECT` is refused wherever the statement reads it: a `SET` expression, the `WHERE`, `RETURNING`
@@ -998,7 +1036,8 @@ pub(super) fn analyze_update(
     // sub-plan reached through it.
     let target_qual = upd.alias.clone().unwrap_or_else(|| access.name.clone());
     // RETURNING projects the updated rows, resolved against the table's (post-update) columns.
-    let returning = analyze_returning(&upd.returning, &table, &target_qual, &readable, catalog)?;
+    let returning_items = returning_of_target(&upd.returning, via, &target_qual);
+    let returning = analyze_returning(&returning_items, &table, &target_qual, &readable, catalog)?;
     // UPDATE ... FROM: resolve a single named FROM table and extend the scope with it, so the
     // SET values and WHERE may reference its columns (at ordinals `target_width + j` of the
     // concatenated `target ++ from` row the executor evaluates against).
@@ -1176,7 +1215,8 @@ pub(super) fn analyze_delete(
     // As for UPDATE: the target goes by its alias, else by the table the statement names.
     let target_qual = del.alias.clone().unwrap_or_else(|| access.name.clone());
     // RETURNING projects the deleted rows, resolved against the table's columns.
-    let returning = analyze_returning(&del.returning, &table, &target_qual, &readable, catalog)?;
+    let returning_items = returning_of_target(&del.returning, via, &target_qual);
+    let returning = analyze_returning(&returning_items, &table, &target_qual, &readable, catalog)?;
     // DELETE ... USING: resolve a single named source table and extend the scope, so the
     // WHERE may reference its columns (at ordinals `target_width + j` of `target ++ using`). Reuses
     // the same single-named-table resolution as UPDATE ... FROM.

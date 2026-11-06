@@ -1054,6 +1054,7 @@ SELECT name FROM ONLY cities;                 -- Bandung
 UPDATE cities SET pop = pop + 1;              -- reaches capitals too
 UPDATE ONLY cities SET pop = 0;               -- just the parent's own rows
 DELETE FROM cities WHERE pop = 0;             -- likewise propagates; ONLY restricts
+UPDATE cities SET pop = 1 RETURNING *;        -- name, pop for every row, capitals included
 TRUNCATE cities;                              -- empties capitals too
 TRUNCATE ONLY cities;                         -- just the parent's own rows
 ```
