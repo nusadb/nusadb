@@ -437,3 +437,27 @@ async fn an_insert_reads_no_whole_row_without_select_on_every_column() {
     }
     assert_eq!(table_t(&mut root).await, before);
 }
+
+/// A temporary table is a table of the session, and still no way to add a child to a parent of
+/// another role.
+#[tokio::test]
+async fn a_temporary_table_adds_no_child_to_a_parent_of_another_role() {
+    let (engine, mut root) = whole_row_fixture().await;
+    for sql in [
+        "CREATE TABLE p (id INT, v TEXT) PARTITION BY RANGE (id)",
+        "CREATE TABLE plain (id INT, v TEXT)",
+    ] {
+        ok(&mut root, sql).await;
+    }
+    let mut clerk = open(&engine, "clerk").await;
+    denied(
+        &mut clerk,
+        "CREATE TEMPORARY TABLE stolen PARTITION OF p FOR VALUES FROM (0) TO (10)",
+    )
+    .await;
+    denied(
+        &mut clerk,
+        "CREATE TEMPORARY TABLE stolen (extra INT) INHERITS (plain)",
+    )
+    .await;
+}

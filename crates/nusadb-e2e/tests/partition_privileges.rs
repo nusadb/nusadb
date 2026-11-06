@@ -1138,3 +1138,141 @@ fn a_whole_row_through_a_parent_needs_select_on_its_columns() {
         denied_as(&engine, "blind", sql, "SELECT on column `v`");
     }
 }
+
+/// A table `victim` owned by the superuser, partitioned, with a partition holding a row, a plain
+/// inheritance parent `base`, a table `loose` of the same shape, and a role `mallory` that may create
+/// tables in the schema and holds nothing on any of them.
+fn linking_fixture() -> BtreeEngine {
+    let engine = BtreeEngine::new();
+    for sql in [
+        "CREATE TABLE victim (id INT, v TEXT) PARTITION BY RANGE (id)",
+        "CREATE TABLE victim_low PARTITION OF victim FOR VALUES FROM (0) TO (10)",
+        "INSERT INTO victim VALUES (1, 'kept')",
+        "CREATE TABLE base (id INT, v TEXT)",
+        "CREATE TABLE loose (id INT, v TEXT)",
+        "INSERT INTO loose VALUES (50, 'loose')",
+        "CREATE ROLE mallory LOGIN",
+        "CREATE ROLE owner LOGIN",
+        "GRANT CREATE ON SCHEMA public TO mallory",
+        "GRANT CREATE ON SCHEMA public TO owner",
+    ] {
+        root(&engine, sql);
+    }
+    engine
+}
+
+/// The tables below `parent`.
+fn children_of(engine: &BtreeEngine, parent: &str) -> Vec<String> {
+    RoleCatalog {
+        engine,
+        user: ROOT,
+        path: &[],
+    }
+    .inheritance_descendants(parent)
+    .unwrap()
+}
+
+/// Whether no table `name` exists.
+fn table_is_absent(engine: &BtreeEngine, name: &str) -> bool {
+    engine.lookup_table(name).unwrap().is_none()
+}
+
+#[test]
+fn only_the_owner_of_a_parent_may_add_a_child_to_it() {
+    let engine = linking_fixture();
+    for sql in [
+        "CREATE TABLE stolen PARTITION OF victim FOR VALUES FROM (10) TO (20)",
+        "CREATE TABLE stolen PARTITION OF victim_low FOR VALUES FROM (0) TO (5)",
+        "CREATE TABLE IF NOT EXISTS stolen PARTITION OF victim FOR VALUES FROM (10) TO (20)",
+        "CREATE TABLE stolen (extra INT) INHERITS (base)",
+        "CREATE TABLE stolen (extra INT) INHERITS (victim)",
+    ] {
+        denied_as(&engine, "mallory", sql, "owner");
+    }
+    assert!(table_is_absent(&engine, "stolen"));
+    assert!(children_of(&engine, "base").is_empty());
+    assert_eq!(children_of(&engine, "victim"), ["victim_low"]);
+    // A second parent is no way around the first: every parent must be the role's own.
+    ok_as(&engine, "mallory", "CREATE TABLE mine (id INT, v TEXT)");
+    denied_as(
+        &engine,
+        "mallory",
+        "CREATE TABLE stolen (extra INT) INHERITS (mine, base)",
+        "base",
+    );
+    assert!(table_is_absent(&engine, "stolen"));
+    // Holding every privilege on the parent is not owning it.
+    root(&engine, "GRANT ALL ON base TO mallory");
+    root(&engine, "GRANT ALL ON victim TO mallory");
+    denied_as(
+        &engine,
+        "mallory",
+        "CREATE TABLE stolen (extra INT) INHERITS (base)",
+        "base",
+    );
+    denied_as(
+        &engine,
+        "mallory",
+        "CREATE TABLE stolen PARTITION OF victim FOR VALUES FROM (10) TO (20)",
+        "victim",
+    );
+}
+
+#[test]
+fn a_foreign_child_never_receives_or_shows_the_rows_of_a_parent() {
+    let engine = linking_fixture();
+    root(&engine, "GRANT SELECT, INSERT ON victim TO mallory");
+    ok_as(
+        &engine,
+        "mallory",
+        "CREATE TABLE mine (id INT, v TEXT) PARTITION BY RANGE (id)",
+    );
+    ok_as(&engine, "mallory", "CREATE TABLE trap (id INT, v TEXT)");
+    // Neither direction of ATTACH works without owning both tables.
+    for sql in [
+        "ALTER TABLE victim ATTACH PARTITION trap FOR VALUES FROM (10) TO (20)",
+        "ALTER TABLE mine ATTACH PARTITION victim_low FOR VALUES FROM (0) TO (10)",
+        "ALTER TABLE mine ATTACH PARTITION loose FOR VALUES FROM (0) TO (100)",
+    ] {
+        denied_as(&engine, "mallory", sql, "owner");
+    }
+    root(&engine, "INSERT INTO victim VALUES (2, 'still kept')");
+    assert_eq!(
+        rows(root(&engine, "SELECT id FROM victim_low ORDER BY id")).len(),
+        2
+    );
+    assert!(rows(ok_as(&engine, "mallory", "SELECT id FROM trap")).is_empty());
+    assert_eq!(rows(root(&engine, "SELECT id FROM loose")).len(), 1);
+    assert_eq!(children_of(&engine, "victim"), ["victim_low"]);
+    assert!(children_of(&engine, "mine").is_empty());
+}
+
+#[test]
+fn the_owner_of_a_parent_links_its_own_tables_only() {
+    let engine = linking_fixture();
+    for sql in [
+        "CREATE TABLE top (id INT, v TEXT) PARTITION BY RANGE (id)",
+        "CREATE TABLE lower_part PARTITION OF top FOR VALUES FROM (0) TO (10)",
+        "CREATE TABLE plain (id INT, v TEXT)",
+        "CREATE TABLE sub (extra INT) INHERITS (plain)",
+        "CREATE TABLE free (id INT, v TEXT)",
+        "ALTER TABLE top ATTACH PARTITION free FOR VALUES FROM (10) TO (20)",
+        "ALTER TABLE top DETACH PARTITION free",
+    ] {
+        ok_as(&engine, "owner", sql);
+    }
+    // The parent's owner takes no table of another role through an ATTACH.
+    denied_as(
+        &engine,
+        "owner",
+        "ALTER TABLE top ATTACH PARTITION loose FOR VALUES FROM (40) TO (60)",
+        "loose",
+    );
+    assert_eq!(children_of(&engine, "top"), ["lower_part"]);
+    // A superuser links what it does not own.
+    root(
+        &engine,
+        "ALTER TABLE top ATTACH PARTITION loose FOR VALUES FROM (40) TO (60)",
+    );
+    assert_eq!(children_of(&engine, "top"), ["lower_part", "loose"]);
+}

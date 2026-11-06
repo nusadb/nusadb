@@ -867,6 +867,9 @@ Worth knowing:
   on the partitions. Naming a partition directly, anywhere in a statement, checks the partition's
   own grants: a grant on the parent does not open its partitions to direct access, and a grant on a
   partition does not open the parent.
+- A partition takes the rows routed to its range and the parent's readers read it, so adding one is
+  the owner's right: `PARTITION OF` needs ownership of the parent, and `ATTACH PARTITION` ownership
+  of both tables (`42501`). No grant confers it.
 - Row-level security works the same way: a statement on the parent applies the parent's policies to
   the rows of every partition, and a partition's own policies apply only when the partition is
   named directly. That includes a partition named inside a statement on the parent, such as in a
@@ -1039,7 +1042,8 @@ its own columns, and a `FOREIGN KEY` that references a partitioned table.
 ### Inherited tables
 
 `INHERITS` gives a table its parents' columns in front of its own, and a query on the parent also
-reads every descendant. `ONLY` reads just the named table.
+reads every descendant. `ONLY` reads just the named table. Inheriting from a table needs ownership
+of it (`42501`), since the parent's readers read the child's rows.
 
 ```sql
 CREATE TABLE cities   (name TEXT, pop INT);

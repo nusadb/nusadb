@@ -199,8 +199,10 @@ fn resolve_partition_by(
     Ok(Some(pb.clone()))
 }
 
-/// Resolve a `PARTITION OF parent FOR VALUES ...`: the parent must exist, the partition declares no
-/// columns of its own (it takes the parent's), and range/list bound values must be constant literals.
+/// Resolve a `PARTITION OF parent FOR VALUES ...`: the parent must exist and be the session's own (a
+/// partition takes the rows routed to its range, and the parent's readers read it), the partition
+/// declares no columns of its own (it takes the parent's), and range/list bound values must be
+/// constant literals.
 /// Sets `ct.columns` to the parent's columns and returns the resolved bound (its kind is checked
 /// against the parent's strategy by the executor, which reads the recorded strategy).
 fn resolve_partition_of(
@@ -222,6 +224,7 @@ fn resolve_partition_of(
                 name: super::qualified_display_opt(po.schema.as_deref(), &po.parent),
             }
         })?;
+    super::dcl::require_table_ownership(catalog, &parent, "create a partition of")?;
     ct.columns = parent
         .columns
         .iter()
@@ -307,7 +310,8 @@ fn const_bound_value(expr: &ast::Expr) -> Result<ast::Value, Error> {
 /// Apply `INHERITS (parent, ...)`: prepend the parents' columns (in written order, deduped across
 /// parents by name) ahead of the child's own, then merge the child's own columns by name — a
 /// redeclared inherited column merges (its type must match) and the child's own definition wins,
-/// while a new column is appended. Returns the resolved parent table names (empty for a
+/// while a new column is appended. Each parent must be the session's own: a child adds its rows to
+/// what the parent's readers read. Returns the resolved parent table names (empty for a
 /// non-inheriting table) for the executor to record as inheritance edges. `NOT NULL` is the OR of the
 /// merged columns (a column is nullable only if every merged copy is).
 fn merge_inherited_columns(
@@ -340,6 +344,7 @@ fn merge_inherited_columns(
             .ok_or_else(|| Error::TableNotFound {
                 name: parent_name.clone(),
             })?;
+        super::dcl::require_table_ownership(catalog, &parent, "inherit from")?;
         for col in &parent.columns {
             if let Some(slot) = merged.iter_mut().find(|c| c.name == col.name) {
                 if slot.ty != col.ty {
@@ -1225,9 +1230,10 @@ pub(super) fn analyze_alter_table(
 }
 
 /// Resolve `ALTER TABLE parent ATTACH PARTITION child FOR VALUES <bound>`. The parent must be a
-/// partitioned parent and the child an existing table whose columns match the parent's (name + type +
-/// order); the executor then validates the bound against the parent's strategy and that every existing
-/// child row falls within it.
+/// partitioned parent (the caller checked it is the session's own) and the child an existing table of
+/// the session's own, since the parent's readers then read its rows, whose columns match the
+/// parent's (name + type + order); the executor then validates the bound against the parent's
+/// strategy and that every existing child row falls within it.
 fn analyze_attach_partition(
     parent: TableSchema,
     partition_schema: Option<&str>,
@@ -1251,6 +1257,7 @@ fn analyze_attach_partition(
                 name: super::qualified_display_opt(partition_schema, partition),
             }
         })?;
+    super::dcl::require_table_ownership(catalog, &child, "attach")?;
     // The child's columns must line up with the parent's (same names, types, and order).
     let columns_match = child.columns.len() == parent.columns.len()
         && child
