@@ -225,17 +225,17 @@ async fn a_revoke_reaches_the_next_execution_of_a_prepared_statement() {
     for (name, sql) in [
         ("write", "UPDATE t SET v = s"),
         ("read", "SELECT s FROM t"),
-        ("whole", "UPDATE t SET v = 1 WHERE s = 3 RETURNING id, s"),
+        ("back", "UPDATE t SET v = 1 WHERE s = 3 RETURNING id, s"),
     ] {
         parse(&mut clerk, name, sql).await;
     }
     send(&mut clerk, FrontendMessage::Sync).await;
     assert_eq!(outcome(&mut clerk).await, Outcome::Rows(Vec::new()));
-    for name in ["write", "read", "whole"] {
+    for name in ["write", "read", "back"] {
         assert!(matches!(execute(&mut clerk, name).await, Outcome::Rows(_)));
     }
     ok(&mut root, "REVOKE SELECT (s) ON t FROM clerk").await;
-    for name in ["write", "read", "whole"] {
+    for name in ["write", "read", "back"] {
         assert_eq!(
             execute(&mut clerk, name).await,
             Outcome::Refused("42501".to_owned()),
@@ -243,9 +243,82 @@ async fn a_revoke_reaches_the_next_execution_of_a_prepared_statement() {
         );
     }
     ok(&mut root, "GRANT SELECT (s) ON t TO clerk").await;
-    for name in ["write", "read", "whole"] {
+    for name in ["write", "read", "back"] {
         assert!(matches!(execute(&mut clerk, name).await, Outcome::Rows(_)));
     }
+}
+
+/// A whole row names no column, and a revoke of any one of them reaches it all the same.
+#[tokio::test]
+async fn a_revoke_reaches_the_next_execution_of_a_prepared_whole_row_read() {
+    let (engine, mut root) = fixture().await;
+    ok(&mut root, "GRANT SELECT (v) ON t TO clerk").await;
+    let mut clerk = open(&engine, "clerk").await;
+    let statements = [
+        ("object", "SELECT row_to_json(t) FROM t"),
+        ("star", "SELECT * FROM t"),
+        ("written", "UPDATE t SET v = 2 RETURNING row_to_json(t)"),
+        ("all", "UPDATE t SET v = 2 RETURNING *"),
+    ];
+    for (name, sql) in statements {
+        parse(&mut clerk, name, sql).await;
+    }
+    send(&mut clerk, FrontendMessage::Sync).await;
+    assert_eq!(outcome(&mut clerk).await, Outcome::Rows(Vec::new()));
+    for (name, _) in statements {
+        let outcome = execute(&mut clerk, name).await;
+        assert!(
+            matches!(outcome, Outcome::Rows(ref rows) if rows.len() == 1),
+            "{name}: {outcome:?}"
+        );
+    }
+    ok(&mut root, "REVOKE SELECT (v) ON t FROM clerk").await;
+    for (name, _) in statements {
+        assert_eq!(
+            execute(&mut clerk, name).await,
+            Outcome::Refused("42501".to_owned()),
+            "{name}"
+        );
+    }
+    ok(&mut root, "GRANT SELECT (v) ON t TO clerk").await;
+    for (name, _) in statements {
+        assert!(
+            matches!(execute(&mut clerk, name).await, Outcome::Rows(_)),
+            "{name}"
+        );
+    }
+}
+
+/// A name that is no key of the table does not exist, whatever the session may read of the table,
+/// and a real key whose columns the session may not read is still a privilege it lacks.
+#[tokio::test]
+async fn an_arbiter_name_that_is_no_key_is_undefined_for_every_session() {
+    let (engine, mut root) = fixture().await;
+    for sql in [
+        "CREATE TABLE oc (id INT, k INT, w TEXT, CONSTRAINT oc_k UNIQUE (k))",
+        "CREATE UNIQUE INDEX oc_e ON oc ((k + id))",
+        "CREATE UNIQUE INDEX oc_i ON oc (id)",
+        "GRANT INSERT ON oc TO clerk",
+        "GRANT SELECT (id) ON oc TO clerk",
+    ] {
+        ok(&mut root, sql).await;
+    }
+    let mut clerk = open(&engine, "clerk").await;
+    let insert = |name: &str| {
+        format!("INSERT INTO oc VALUES (1, 1, 'x') ON CONFLICT ON CONSTRAINT {name} DO NOTHING")
+    };
+    for name in ["no_such_key", "oc_e", "oc_i"] {
+        for conn in [&mut root, &mut clerk] {
+            assert_eq!(
+                run(conn, &insert(name)).await,
+                Outcome::Refused("42704".to_owned()),
+                "{name}"
+            );
+        }
+    }
+    denied_both(&mut clerk, &insert("oc_k")).await;
+    ok(&mut root, "GRANT SELECT (k) ON oc TO clerk").await;
+    ok(&mut clerk, &insert("oc_k")).await;
 }
 
 #[tokio::test]

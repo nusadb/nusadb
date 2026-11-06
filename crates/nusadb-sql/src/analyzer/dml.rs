@@ -270,8 +270,10 @@ fn analyze_on_conflict(
 ///
 /// The arbiter reads the existing rows to find a conflict, so it needs SELECT on the columns it
 /// compares: the target's columns and the columns its `WHERE` reads, or the key of the named
-/// constraint (every column of the table when the name is not a key the catalog lists). This is the
-/// whole of what a `DO NOTHING` reads of the table.
+/// constraint. A name that is not a key the catalog lists must pass the check for every column of
+/// the table to reach the executor, which decides whether it names a constraint; a session that
+/// cannot is told the name does not exist. This is the whole of what a `DO NOTHING` reads of the
+/// table.
 fn resolve_conflict_target(
     target: Option<ast::ConflictTarget>,
     table: &TableSchema,
@@ -333,7 +335,21 @@ fn resolve_conflict_target(
                 .filter(|(_, c)| key.as_ref().is_none_or(|k| k.columns.contains(&c.name)))
                 .map(|(i, _)| i)
                 .collect();
-            require_read(&read)?;
+            match require_read(&read) {
+                // A name that is no key of this table names nothing a privilege could be missing
+                // on, so the session hears what any other session hears from the executor. The
+                // statement is refused either way.
+                Err(Error::PermissionDenied(_)) if key.is_none() => {
+                    return Err(Error::Coded {
+                        message: format!(
+                            "constraint \"{name}\" for table \"{}\" does not exist",
+                            table.name
+                        ),
+                        sqlstate: "42704", // undefined_object
+                    });
+                },
+                checked => checked?,
+            }
             Ok(Some(ConflictArbiter::Constraint(name)))
         },
     }
@@ -371,9 +387,9 @@ fn reject_conflict_subquery(expr: &TypedExpr) -> Result<(), Error> {
 /// Resolve a `RETURNING` clause against the affected table's columns. The scope is the
 /// affected row (every column of `table`, in table order), so `RETURNING *` and `RETURNING col`
 /// resolve like a single-table projection; `target_cols` (parallel to the columns) says which of
-/// them the session may `SELECT`, and a reference to any other is refused. Aggregates are not meaningful
-/// over a per-row `RETURNING` and are rejected. An empty clause yields an empty projection (the
-/// caller returns a row count).
+/// them the session may `SELECT`, and a reference to any other is refused. Aggregates are not
+/// meaningful over a per-row `RETURNING` and are rejected. An empty clause yields an empty
+/// projection (the caller returns a row count).
 pub(super) fn analyze_returning(
     returning: &[ast::SelectItem],
     table: &TableSchema,
