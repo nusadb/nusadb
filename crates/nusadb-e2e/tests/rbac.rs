@@ -53,6 +53,14 @@ impl Catalog for RbacCatalog<'_> {
             .map_err(Into::into)
     }
 
+    fn list_indexes_in(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Vec<nusadb_sql::IndexInfo>, nusadb_sql::Error> {
+        self.with_txn(|txn| nusadb_sql::catalog_list_indexes_in(self.engine, txn, schema, name))
+    }
+
     fn is_superuser(&self) -> bool {
         self.with_txn(|txn| nusadb_sql::rbac::principal(self.engine, txn, self.user))
             .is_ok_and(|p| p.superuser)
